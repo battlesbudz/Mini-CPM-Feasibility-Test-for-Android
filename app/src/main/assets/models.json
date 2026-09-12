@@ -1,0 +1,51 @@
+{
+  "repository": "openbmb/MiniCPM-o-4_5-gguf",
+  "revision": "db25077c33951fe163b42986fba0132e279872a2",
+  "files": [
+    {
+      "path": "MiniCPM-o-4_5-Q4_K_M.gguf",
+      "size": 5026714400,
+      "sha256": "1237a97ee081b8abebc47aa7dad565701e8f5f904cdc92f6723ac4281bbc0932"
+    },
+    {
+      "path": "audio/MiniCPM-o-4_5-audio-F16.gguf",
+      "size": 660167904,
+      "sha256": "d5b188ac7feaf98e17175c3f9bd14bf269301bfd187439fdaa3e3a494fc32ef7"
+    },
+    {
+      "path": "token2wav-gguf/encoder.gguf",
+      "size": 151339008,
+      "sha256": "7f8d265da594eaf5e1de2db8f5f1867dbcb0bb75ef5878fadf2952347116f4d0"
+    },
+    {
+      "path": "token2wav-gguf/flow_extra.gguf",
+      "size": 13663328,
+      "sha256": "c67611aa7d02500fe395a7798bf0bfdfb55c74d37ba93934ca74d82b4e63f78d"
+    },
+    {
+      "path": "token2wav-gguf/flow_matching.gguf",
+      "size": 458250240,
+      "sha256": "eda6069f3edeb5dd3a87fbf2aedb2ddd1b46f3273926c4fcf09b24476a39cab8"
+    },
+    {
+      "path": "token2wav-gguf/hifigan2.gguf",
+      "size": 83242816,
+      "sha256": "1b8b3bf5d8d3066aeee4324fdcdd41aefce170d0ee907645858de408d82835c2"
+    },
+    {
+      "path": "token2wav-gguf/prompt_cache.gguf",
+      "size": 211613152,
+      "sha256": "81fe6f541ebe0b67db06a1e395df928da47991dc9637c2cf47d6c59d5b979f2c"
+    },
+    {
+      "path": "tts/MiniCPM-o-4_5-projector-F16.gguf",
+      "size": 14948640,
+      "sha256": "4b1b5b377358a5e594a304ff6ea5d52df606a9ba7d886c4299d232f0c67dd1fd"
+    },
+    {
+      "path": "tts/MiniCPM-o-4_5-tts-F16.gguf",
+      "size": 1157244416,
+      "sha256": "c7be3748a863dd6966ae7eed42600b7f41ca67affb03729ff245247f0e5ea088"
+    }
+  ]
+}
