@@ -21,7 +21,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmtest_NativeBenc
     auto method=env->GetMethodID(cls,"onEvent","(Ljava/lang/String;)V");
     auto emit=[&](const std::string& s){jstring js=env->NewStringUTF(s.c_str());env->CallVoidMethod(listener,method,js);env->DeleteLocalRef(js);};
     json report={{"schemaVersion",1},{"backend","cpu"},{"runtimeCommit","64d092c60db4b4ee45768476bd752f03fdcc98ea"},
-        {"framesExpected",frames},{"threads",4},{"contextTokens",4096},{"visionEnabled",false},
+        {"framesExpected",frames},{"threads",4},{"contextTokens",4096},{"batchTokens",256},{"microBatchTokens",64},{"profile","cpu-memory-screen-v2"},{"visionEnabled",false},
         {"scope","recorded_audio_compute_screen_not_acoustic_duplex"}};
     omni_context* ctx=nullptr;
     common_params params;
@@ -37,7 +37,9 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmtest_NativeBenc
         params.model.path=root+"/MiniCPM-o-4_5-Q4_K_M.gguf";
         params.apm_model=root+"/audio/MiniCPM-o-4_5-audio-F16.gguf";
         params.tts_model=root+"/tts/MiniCPM-o-4_5-tts-F16.gguf";
-        params.n_ctx=4096;params.n_gpu_layers=0;
+        // Bound prompt compute buffers for both LLM and TTS contexts. Keep the
+        // duplex context headroom required by upstream sliding-window logic.
+        params.n_ctx=4096;params.n_batch=256;params.n_ubatch=64;params.n_gpu_layers=0;
         params.cpuparams.n_threads=4;params.cpuparams_batch.n_threads=4;
         params.sampling.seed=42;
         common_init();
@@ -49,7 +51,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmtest_NativeBenc
         if(!ctx->token2wav_initialized||ctx->use_python_token2wav)throw std::runtime_error("Native Token2Wav unavailable; refusing a partial benchmark");
         ctx->async=true;ctx->ref_audio_path=root+"/reference.wav";
         if(!pcm)throw std::runtime_error("Cannot create PCM output");
-        emit("Preparing duplex voice prompt");
+        emit("Preparing duplex voice prompt (batch 256 / microbatch 64)");
         if(!omni_duplex_session_begin(ctx,ctx->ref_audio_path,output))throw std::runtime_error("Duplex prompt initialization failed");
         start=Clock::now();
         ctx->audio_output_cb=[&](const float* data,int count,int rate,bool final){

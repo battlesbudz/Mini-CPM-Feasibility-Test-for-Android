@@ -73,12 +73,33 @@ public final class MainActivity extends Activity {
     }
     private boolean workerAlive(){var list=getSystemService(ActivityManager.class).getRunningAppProcesses();if(list!=null)for(var p:list)if(p.uid==android.os.Process.myUid()&&p.processName.equals(getPackageName()+":benchmark"))return true;return false;}
     private String read(String name){try{return Io.read(new File(getFilesDir(),name).toPath());}catch(IOException e){return "";}}
-    private String diagnostics(){String s=read("status.json"),r=read("report.json"),failure=read("last-run/native_failure.json"),exit="";
-        if(Build.VERSION.SDK_INT>=30){var list=getSystemService(ActivityManager.class).getHistoricalProcessExitReasons(getPackageName(),0,4);for(var e:list)if(e.getProcessName().endsWith(":benchmark"))exit+="\nWorker exit: reason="+e.getReason()+" status="+e.getStatus()+" time="+e.getTimestamp()+" description="+e.getDescription();}
-        return "MiniCPM Feasibility "+BuildConfig.VERSION_NAME+"\n"+Build.MANUFACTURER+" "+Build.MODEL+"\n"+local+"\n"+s+"\n"+r+"\n"+failure+exit;
+    private JSONObject reconciledState()throws JSONException{
+        String raw=read("status.json");JSONObject saved=raw.isEmpty()?new JSONObject():new JSONObject(raw);
+        if(!"RUNNING".equals(saved.optString("status"))||workerAlive())return saved;
+        if(Build.VERSION.SDK_INT>=30){
+            int pid=saved.optInt("pid",-1);long began=saved.optLong("startedAtMs",saved.optLong("updatedAtMs"));
+            if(pid>0)for(var e:getSystemService(ActivityManager.class).getHistoricalProcessExitReasons(getPackageName(),pid,16)){
+                if(e.getProcessName().equals(getPackageName()+":benchmark")&&ExitMatch.matches(pid,began,e.getPid(),e.getTimestamp())){
+                    saved.put("lastCheckpointPhase",saved.optString("phase")).put("exitReason",e.getReason()).put("exitStatus",e.getStatus())
+                        .put("exitAtMs",e.getTimestamp()).put("exitPssKb",e.getPss()).put("exitRssKb",e.getRss());
+                    boolean low=e.getReason()==ApplicationExitInfo.REASON_LOW_MEMORY;
+                    saved.put("status",low?"KILLED_LOW_MEMORY":"WORKER_EXITED")
+                        .put("phase",low?"Android killed the worker under memory pressure. Test did not finish.":"Worker exited before completing the test.");
+                    return saved;
+                }
+            }
+        }
+        // Exit history can arrive after process removal. Do not persist a guessed reason.
+        return saved.put("status","WORKER_NOT_RUNNING").put("lastCheckpointPhase",saved.optString("phase"))
+            .put("phase","Worker not running; waiting for Android exit details.");
+    }
+    private String diagnostics(){String s;try{s=reconciledState().toString(2);}catch(JSONException error){s=read("status.json");}String r=read("report.json"),failure=read("last-run/native_failure.json"),exit="";
+        if(Build.VERSION.SDK_INT>=30){var list=getSystemService(ActivityManager.class).getHistoricalProcessExitReasons(getPackageName(),0,4);for(var e:list)if(e.getProcessName().endsWith(":benchmark"))exit+="\nWorker exit: pid="+e.getPid()+" pssKb="+e.getPss()+" rssKb="+e.getRss()+" reason="+e.getReason()+" status="+e.getStatus()+" time="+e.getTimestamp()+" description="+e.getDescription();}
+        return "MiniCPM Feasibility "+BuildConfig.VERSION_NAME+"\n"+Build.MANUFACTURER+" "+Build.MODEL+"\n"+local+"\n"+s+"\n"+r+"\n"+failure+"\nLast persisted memory sample:\n"+read("last-run/memory.json")+exit;
     }
     private void refresh(){if(destroyed||status==null)return;boolean running=workerAlive();for(Button b:controls)b.setEnabled(!busy&&!running);duration.setEnabled(!busy&&!running);String text=local;
-        if(!busy)try{String raw=read("status.json");if(!raw.isEmpty()){JSONObject s=new JSONObject(raw);text=s.optString("status")+"\n"+s.optString("phase");if(s.optString("status").equals("RUNNING")&&!running)text="WORKER EXITED — test did not finish. Copy diagnostics for the exit reason.";}
+        if(!busy)try{String raw=read("status.json");if(!raw.isEmpty()){JSONObject s=reconciledState();text=s.optString("status")+"\n"+s.optString("phase");if(s.optString("status").equals("RUNNING")&&!running)text="WORKER EXITED — test did not finish. Copy diagnostics for the exit reason.";}
+            String memory=read("last-run/memory.json");if(!memory.isEmpty()){JSONObject m=new JSONObject(memory);text+="\nLast sampled worker memory: "+m.optInt("workerPssKb")/1024+" MB; peak: "+m.optInt("peakWorkerPssKb")/1024+" MB\nSystem available: "+m.optLong("systemAvailableBytes")/1048576+" MB";}
             String rawReport=read("report.json");if(!rawReport.isEmpty()){JSONObject r=new JSONObject(rawReport);text+="\n\n"+r.optString("verdict")+"\nDecision p95: "+r.opt("decisionP95Ms")+" ms\nPCM supply gaps: "+r.opt("estimatedPcmSupplyGapMs")+" ms\nWorker peak PSS: "+r.optInt("peakWorkerPssKb")/1024+" MB\nPeak thermal status: "+r.optInt("peakThermalStatus")+"\n"+r.optString("error");}
         }catch(Exception e){text+="\nReading diagnostics: "+e.getMessage();}status.setText(text);
     }

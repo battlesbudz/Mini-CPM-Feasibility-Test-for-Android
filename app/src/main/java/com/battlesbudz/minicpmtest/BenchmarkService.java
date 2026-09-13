@@ -15,13 +15,17 @@ public final class BenchmarkService extends Service {
     private File run;
     private JSONObject state;
     private int chargeStart;
+    private volatile String currentPhase="Starting";
     @Override public IBinder onBind(Intent intent){return null;}
     private synchronized void state(String phase,String status){
+        currentPhase=phase;
         try{state.put("phase",phase).put("status",status).put("updatedAtMs",System.currentTimeMillis()).put("pid",android.os.Process.myPid());write(new File(getFilesDir(),"status.json"),state.toString(2));}
         catch(Exception ignored){} // Retain the previous checkpoint on I/O failure.
     }
     static void write(File target,String value)throws IOException{
-        File temp=new File(target+".tmp");Io.write(temp.toPath(),value);Files.move(temp.toPath(),target.toPath(),StandardCopyOption.REPLACE_EXISTING);
+        File temp=new File(target+".tmp");
+        try(FileOutputStream out=new FileOutputStream(temp)){out.write(value.getBytes(java.nio.charset.StandardCharsets.UTF_8));out.getFD().sync();}
+        Files.move(temp.toPath(),target.toPath(),StandardCopyOption.REPLACE_EXISTING);
     }
     @Override public int onStartCommand(Intent intent,int flags,int startId){
         if(intent!=null&&"STOP".equals(intent.getAction())){if(state!=null)state("Stopped by user","CANCELLED");retire();return START_NOT_STICKY;}
@@ -36,12 +40,25 @@ public final class BenchmarkService extends Service {
         heartbeat=SystemClock.elapsedRealtime();
         int frames=intent==null?60:intent.getIntExtra("frames",60);if(frames!=60&&frames!=300&&frames!=1800)frames=60;
         run=new File(getFilesDir(),"last-run");run.mkdirs();state=new JSONObject();
-        try{state.put("build",BuildConfig.VERSION_NAME).put("sourceCommit",BuildConfig.SOURCE_COMMIT).put("device",Build.MANUFACTURER+" "+Build.MODEL).put("sdk",Build.VERSION.SDK_INT);}catch(Exception ignored){}
+        try{state.put("startedAtMs",System.currentTimeMillis()).put("profile","cpu-memory-screen-v2").put("contextTokens",4096).put("batchTokens",256).put("microBatchTokens",64).put("build",BuildConfig.VERSION_NAME).put("sourceCommit",BuildConfig.SOURCE_COMMIT).put("device",Build.MANUFACTURER+" "+Build.MODEL).put("sdk",Build.VERSION.SDK_INT);}catch(Exception ignored){}
         state("Starting","RUNNING");
         chargeStart=getSystemService(BatteryManager.class).getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER);
         final long began=SystemClock.elapsedRealtime(),wallBudgetMs=12*60*1000L+frames*1500L;
         timers.scheduleWithFixedDelay(()->{
-            android.os.Debug.MemoryInfo memory=new android.os.Debug.MemoryInfo();android.os.Debug.getMemoryInfo(memory);peakPssKb=Math.max(peakPssKb,memory.getTotalPss());peakThermal=Math.max(peakThermal,pm.getCurrentThermalStatus());
+            try{
+                android.os.Debug.MemoryInfo memory=new android.os.Debug.MemoryInfo();android.os.Debug.getMemoryInfo(memory);
+                peakPssKb=Math.max(peakPssKb,memory.getTotalPss());peakThermal=Math.max(peakThermal,pm.getCurrentThermalStatus());
+                ActivityManager.MemoryInfo system=new ActivityManager.MemoryInfo();getSystemService(ActivityManager.class).getMemoryInfo(system);
+                JSONObject sample=new JSONObject().put("pid",android.os.Process.myPid()).put("updatedAtMs",System.currentTimeMillis())
+                    .put("phase",currentPhase).put("workerPssKb",memory.getTotalPss()).put("peakWorkerPssKb",peakPssKb)
+                    .put("systemAvailableBytes",system.availMem).put("systemTotalBytes",system.totalMem)
+                    .put("systemLowMemoryThresholdBytes",system.threshold).put("systemLowMemory",system.lowMemory)
+                    .put("thermalStatus",pm.getCurrentThermalStatus()).put("peakThermalStatus",peakThermal);
+                write(new File(run,"memory.json"),sample.toString(2));
+                try(FileOutputStream out=new FileOutputStream(new File(run,"memory-history.jsonl"),true)){
+                    out.write((sample.toString()+"\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));out.getFD().sync();
+                }
+            }catch(Exception error){android.util.Log.w("MiniCPM","Memory checkpoint failed",error);}
             if(SystemClock.elapsedRealtime()-began>wallBudgetMs){state("Test exceeded its wall-clock budget","TIMEOUT");retire();}
             else if(SystemClock.elapsedRealtime()-heartbeat>10*60*1000L){state("Native worker stopped responding","TIMEOUT");retire();}
         },0,1,TimeUnit.SECONDS);
