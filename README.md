@@ -60,3 +60,7 @@ The initial local project built and passed nine tests, but workspace maintenance
 Build 1 on SM-F956U recorded Android low-memory worker exits during duplex voice-prompt preparation. No throughput result was obtained. The next test retains the same model pack, signing key and 4,096-token context, but reduces logical prompt batch from 2,048 to 256 and physical microbatch from 512 to 64 for both LLM and TTS. This reduces compute-buffer pressure; device fit is not yet established. The upstream duplex sliding-window code reserves 2,048 tokens, so blindly shrinking context to that size is not a safe independent optimization.
 
 Run the 60-second smoke test first. Existing downloaded models are reused. Memory PSS, sampled peak, system available/total memory and thermal status are persisted every second with file synchronization, separately from the final report. The complete sample history stays in last-run/memory-history.jsonl; Copy diagnostics includes the latest sample. Android exit records are matched by worker PID and run start time; a matched low-memory exit replaces stale RUNNING in the displayed/copied diagnostics. Android exit PSS/RSS may be zero when unavailable; sampled peaks can miss brief allocation spikes.
+
+## Liquid voice benchmark
+
+The separate `liquid` app benchmarks the smaller LFM2.5-Audio-1.5B Q4 voice stack. See [setup and test scope](docs/liquid-benchmark.md). MiniCPM results and releases remain available.

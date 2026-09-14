@@ -1,8 +1,8 @@
-name: Android APK
+name: Liquid Voice APK
 on:
   push:
     branches: [main]
-    paths: ["app/**", "scripts/prepare_native.py", ".github/workflows/android.yml"]
+    paths: ["liquid/**", "scripts/prepare_liquid.py", "settings.gradle.kts", ".github/workflows/liquid.yml"]
   pull_request:
   workflow_dispatch:
 permissions:
@@ -23,22 +23,22 @@ jobs:
       - name: Install pinned Android tools
         run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
       - name: Fetch pinned native runtime
-        run: python3 scripts/prepare_native.py
+        run: python3 scripts/prepare_liquid.py
       - name: Test and build
-        run: ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleRelease :app:lintRelease
+        run: ./gradlew --no-daemon :liquid:testDebugUnitTest :liquid:assembleRelease :liquid:lintRelease
       - name: Preserve test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: validation-results
+          name: liquid-validation-results
           path: |
-            app/build/reports/tests/
-            app/build/reports/lint-results-release.*
+            liquid/build/reports/tests/
+            liquid/build/reports/lint-results-release.*
       - name: Publish direct APK release asset
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          apk="MiniCPM-Feasibility-Android-build-${GITHUB_RUN_NUMBER}.apk"
-          cp app/build/outputs/apk/release/app-release.apk "$apk"
-          gh release create "build-${GITHUB_RUN_NUMBER}" "$apk" --target "$GITHUB_SHA" --title "Android feasibility build ${GITHUB_RUN_NUMBER}" --notes 'Experimental CPU voice benchmark. Download the APK asset directly. See README for model setup and test limitations.'
+          apk="Liquid-Voice-Feasibility-build-${GITHUB_RUN_NUMBER}.apk"
+          cp liquid/build/outputs/apk/release/liquid-release.apk "$apk"
+          gh release create "liquid-build-${GITHUB_RUN_NUMBER}" "$apk" --target "$GITHUB_SHA" --title "Liquid voice feasibility build ${GITHUB_RUN_NUMBER}" --notes 'Recorded-question Liquid Q4 CPU smoke test. Install alongside MiniCPM. See docs/liquid-benchmark.md for instructions and limitations.'
