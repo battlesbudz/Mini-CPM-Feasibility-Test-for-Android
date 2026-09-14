@@ -38,10 +38,14 @@ public final class BenchmarkService extends Service {
         PowerManager pm=getSystemService(PowerManager.class);
         wake=pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"Liquid Voice:benchmark");wake.acquire(60*60*1000L);
         heartbeat=SystemClock.elapsedRealtime();
-        int frames=intent==null?60:intent.getIntExtra("frames",60);if(frames!=60&&frames!=300&&frames!=1800)frames=60;
+        int profile=intent==null?1:intent.getIntExtra("profile",1);
+        int voice=intent==null?0:intent.getIntExtra("voice",0);
+        if(profile<0||profile>4)profile=1;if(voice<0||voice>2)voice=0;
         run=new File(getFilesDir(),"last-run");run.mkdirs();state=new JSONObject();
-        try{state.put("startedAtMs",System.currentTimeMillis()).put("profile","liquid-q4-cpu-smoke-v1").put("contextTokens",4096).put("batchTokens",256).put("microBatchTokens",64).put("build",BuildConfig.VERSION_NAME).put("sourceCommit",BuildConfig.SOURCE_COMMIT).put("device",Build.MANUFACTURER+" "+Build.MODEL).put("sdk",Build.VERSION.SDK_INT);}catch(Exception ignored){}
+        try{state.put("startedAtMs",System.currentTimeMillis()).put("profile","liquid-hardware-compare-v2").put("contextTokens",4096).put("batchTokens",256).put("microBatchTokens",64).put("build",BuildConfig.VERSION_NAME).put("sourceCommit",BuildConfig.SOURCE_COMMIT).put("device",Build.MANUFACTURER+" "+Build.MODEL).put("sdk",Build.VERSION.SDK_INT);}catch(Exception ignored){}
         state("Starting","RUNNING");
+        try{state.put("profileIndex",profile).put("voiceIndex",voice).put("initialThermalStatus",pm.getCurrentThermalStatus());}catch(Exception ignored){}
+        state("Starting selected configuration","RUNNING");
         chargeStart=getSystemService(BatteryManager.class).getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER);
         final long began=SystemClock.elapsedRealtime(),wallBudgetMs=3*60*1000L;
         timers.scheduleWithFixedDelay(()->{
@@ -62,19 +66,22 @@ public final class BenchmarkService extends Service {
             if(SystemClock.elapsedRealtime()-began>wallBudgetMs){state("Test exceeded its wall-clock budget","TIMEOUT");retire();}
             else if(SystemClock.elapsedRealtime()-heartbeat>3*60*1000L){state("Native worker stopped responding","TIMEOUT");retire();}
         },0,1,TimeUnit.SECONDS);
-        final int total=frames;new Thread(()->execute(total),"native-benchmark").start();return START_NOT_STICKY;
+        final int selected=profile,selectedVoice=voice;new Thread(()->execute(selected,selectedVoice),"native-benchmark").start();return START_NOT_STICKY;
     }
-    private void execute(int frames){
+    private void execute(int profile,int voice){
         try{
             ModelStore models=new ModelStore(this);if(!models.ready())throw new IOException("Model pack is not verified");
             File chunks=new File(getCacheDir(),"input");
-            if(!new File(chunks,"question.wav").isFile())throw new IOException("Record a test question first");
-            JSONObject report=new JSONObject(NativeBench.run(models.root.getPath(),chunks.getPath(),run.getPath(),frames,message->{heartbeat=SystemClock.elapsedRealtime();state(message,"RUNNING");}));
+            if(voice!=2&&!new File(chunks,"question.wav").isFile())throw new IOException("Record a test question first");
+            JSONObject report=new JSONObject(NativeBench.run(models.root.getPath(),chunks.getPath(),run.getPath(),profile,voice,message->{heartbeat=SystemClock.elapsedRealtime();state(message,"RUNNING");}));
             String verdict=LiquidVerdict.classify(report.has("error"),report.optLong("audioSamples"),report.optDouble("audioRms",0),report.optString("text"));
             report.put("verdict",verdict).put("peakWorkerPssKb",peakPssKb).put("peakThermalStatus",peakThermal)
                 .put("build",BuildConfig.VERSION_NAME).put("sourceCommit",BuildConfig.SOURCE_COMMIT).put("device",Build.MODEL)
                 .put("batteryChargeChangeUah",getSystemService(BatteryManager.class).getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)-chargeStart)
                 .put("limitations","Recorded-question smoke test. First PCM is callback latency after submission, excluding recording, model load and playback. Output needs human review. EOS versus generation cap is not exposed by upstream. No live interruption, multi-turn or tools tested.");
+            report.put("initialThermalStatus",state.optInt("initialThermalStatus")).put("startedAtMs",state.optLong("startedAtMs"));
+            JSONObject summary=new JSONObject(report.toString());summary.remove("audioChunks");
+            try(FileOutputStream out=new FileOutputStream(new File(getFilesDir(),"comparison.jsonl"),true)){out.write((summary.toString()+"\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));out.getFD().sync();}
             write(new File(getFilesDir(),"report.json"),report.toString(2));state(verdict,verdict);
         }catch(Throwable error){state(error.getClass().getSimpleName()+": "+error.getMessage(),"ERROR");}
         finally{retire();}

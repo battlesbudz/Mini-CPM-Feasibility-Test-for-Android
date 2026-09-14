@@ -19,7 +19,7 @@ public final class MainActivity extends Activity {
     private volatile boolean busy,destroyed;
     private Future<?> task;
     private TextView status;
-    private Spinner duration;
+    private Spinner duration,voice;
     private final ArrayList<Button> controls=new ArrayList<>();
     private volatile String local="Download or import the voice pack, then record a test question.";
     private final Runnable poll=new Runnable(){public void run(){refresh();ui.postDelayed(this,1000);}};
@@ -28,16 +28,17 @@ public final class MainActivity extends Activity {
         LinearLayout column=new LinearLayout(this);column.setOrientation(LinearLayout.VERTICAL);column.setPadding(32,24,32,24);
         ScrollView scroll=new ScrollView(this);scroll.setFitsSystemWindows(true);scroll.addView(column);setContentView(scroll);
         TextView title=new TextView(this);title.setText("Liquid Voice Feasibility Test\n"+BuildConfig.VERSION_NAME);title.setTextSize(24);column.addView(title);
-        TextView scope=new TextView(this);scope.setText("CPU voice benchmark • Fully local after setup\n\nThis tests recorded audio through the complete Liquid LFM2.5-Audio-1.5B voice stack. It does not yet test live interruption or tools. A CPU failure does not rule out GPU acceleration.\n");column.addView(scope);
+        TextView scope=new TextView(this);scope.setText("CPU / Vulkan voice benchmark • Fully local after setup\n\nThis tests recorded audio through the complete Liquid LFM2.5-Audio-1.5B voice stack. It does not yet test live interruption or tools. A CPU failure does not rule out GPU acceleration.\n");column.addView(scope);
         button(column,"Download voice pack · 1.07 GB",()->new AlertDialog.Builder(this).setTitle("Download model files?").setMessage("Downloads 1.07 GB from Hugging Face. Allow at least 2 GB free storage. Keep this screen open during setup; interrupted downloads can resume. Benchmarking then works offline.").setPositiveButton("Download",(d,w)->install(null)).setNegativeButton("Cancel",null).show());
         button(column,"Import existing model folder",()->startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION),10));
         button(column,"Record a question · 10 seconds",()->{if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED)requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},11);else record();});
-        duration=new Spinner(this);duration.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"One-question voice smoke test"}));column.addView(duration);
-        button(column,"Run offline CPU benchmark",this::startRun);
+        duration=new Spinner(this);duration.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"CPU · 2 threads","CPU · 4 threads (baseline)","CPU · 6 threads","Vulkan · main model","Vulkan · main + audio"}));column.addView(duration);duration.setSelection(1);
+        voice=new Spinner(this);voice.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"Default conversation voice","UK male conversation · experimental","UK male TTS · fixed sample"}));column.addView(voice);
+        button(column,"Run selected benchmark",this::startRun);
         Button stop=new Button(this);stop.setText("Stop current operation");column.addView(stop);stop.setOnClickListener(v->{if(task!=null)task.cancel(true);if(workerAlive())startService(new Intent(this,BenchmarkService.class).setAction("STOP"));local="Stop requested.";refresh();});
         button(column,"Play generated speech",this::play);
         Button copy=new Button(this);copy.setText("Copy diagnostics");column.addView(copy);copy.setOnClickListener(v->{getSystemService(ClipboardManager.class).setPrimaryClip(ClipData.newPlainText("Liquid Voice diagnostics",diagnostics()));Toast.makeText(this,"Diagnostics copied",Toast.LENGTH_SHORT).show();});
-        button(column,"Delete recording and test output",()->{delete(new File(getCacheDir(),"input"));delete(new File(getFilesDir(),"last-run"));new File(getFilesDir(),"report.json").delete();new File(getFilesDir(),"status.json").delete();local="Recording and test output deleted. Model pack retained.";refresh();});
+        button(column,"Delete recording and test output",()->{delete(new File(getCacheDir(),"input"));delete(new File(getFilesDir(),"last-run"));new File(getFilesDir(),"report.json").delete();new File(getFilesDir(),"status.json").delete();new File(getFilesDir(),"comparison.jsonl").delete();local="Recording and test output deleted. Model pack retained.";refresh();});
         status=new TextView(this);status.setTextIsSelectable(true);status.setPadding(0,24,0,24);column.addView(status);ui.post(poll);
         if(Build.VERSION.SDK_INT>=33&&checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED)requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},12);
     }
@@ -68,9 +69,9 @@ public final class MainActivity extends Activity {
         local="Question recorded. The test uses your 10-second question once. Recording stays on this device until deleted.";
     });}
     private void startRun(){
-        try{if(!new ModelStore(this).ready())throw new IOException("Install and verify the complete voice pack first.");if(!new File(getCacheDir(),"input/question.wav").isFile())throw new IOException("Record a question first.");
+        try{if(!new ModelStore(this).ready())throw new IOException("Install and verify the complete voice pack first.");if(voice.getSelectedItemPosition()!=2&&!new File(getCacheDir(),"input/question.wav").isFile())throw new IOException("Record a question first.");
             new File(getFilesDir(),"report.json").delete();new File(getFilesDir(),"status.json").delete();delete(new File(getFilesDir(),"last-run"));
-            startForegroundService(new Intent(this,BenchmarkService.class).putExtra("frames",60));local="Starting benchmark worker…";
+            startForegroundService(new Intent(this,BenchmarkService.class).putExtra("profile",duration.getSelectedItemPosition()).putExtra("voice",voice.getSelectedItemPosition()));local="Starting benchmark worker…";
         }catch(Exception e){local=e.getMessage();}refresh();
     }
     private boolean workerAlive(){var list=getSystemService(ActivityManager.class).getRunningAppProcesses();if(list!=null)for(var p:list)if(p.uid==android.os.Process.myUid()&&p.processName.equals(getPackageName()+":benchmark"))return true;return false;}
@@ -97,9 +98,9 @@ public final class MainActivity extends Activity {
     }
     private String diagnostics(){String s;try{s=reconciledState().toString(2);}catch(JSONException error){s=read("status.json");}String r=read("report.json"),failure=read("last-run/native.log"),exit="";if(failure.length()>10000)failure=failure.substring(failure.length()-10000);
         if(Build.VERSION.SDK_INT>=30){var list=getSystemService(ActivityManager.class).getHistoricalProcessExitReasons(getPackageName(),0,4);for(var e:list)if(e.getProcessName().endsWith(":benchmark"))exit+="\nWorker exit: pid="+e.getPid()+" pssKb="+e.getPss()+" rssKb="+e.getRss()+" reason="+e.getReason()+" status="+e.getStatus()+" time="+e.getTimestamp()+" description="+e.getDescription();}
-        return "Liquid Voice Feasibility "+BuildConfig.VERSION_NAME+"\n"+Build.MANUFACTURER+" "+Build.MODEL+"\n"+local+"\n"+s+"\n"+r+"\n"+failure+"\nLast persisted memory sample:\n"+read("last-run/memory.json")+exit;
+        return "Liquid Voice Feasibility "+BuildConfig.VERSION_NAME+"\n"+Build.MANUFACTURER+" "+Build.MODEL+"\n"+local+"\n"+s+"\n"+r+"\n"+failure+"\nLast persisted memory sample:\n"+read("last-run/memory.json")+"\nComparison history:\n"+read("comparison.jsonl")+exit;
     }
-    private void refresh(){if(destroyed||status==null)return;boolean running=workerAlive();for(Button b:controls)b.setEnabled(!busy&&!running);duration.setEnabled(!busy&&!running);String text=local;
+    private void refresh(){if(destroyed||status==null)return;boolean running=workerAlive();for(Button b:controls)b.setEnabled(!busy&&!running);duration.setEnabled(!busy&&!running);voice.setEnabled(!busy&&!running);String text=local;
         if(!busy)try{String raw=read("status.json");if(!raw.isEmpty()){JSONObject s=reconciledState();text=s.optString("status")+"\n"+s.optString("phase");if(s.optString("status").equals("RUNNING")&&!running)text="WORKER EXITED — test did not finish. Copy diagnostics for the exit reason.";}
             String memory=read("last-run/memory.json");if(!memory.isEmpty()){JSONObject m=new JSONObject(memory);text+="\nLast sampled worker memory: "+m.optInt("workerPssKb")/1024+" MB; peak: "+m.optInt("peakWorkerPssKb")/1024+" MB\nSystem available: "+m.optLong("systemAvailableBytes")/1048576+" MB";}
             String rawReport=read("report.json");if(!rawReport.isEmpty()){JSONObject r=new JSONObject(rawReport);text+="\n\n"+r.optString("verdict")+"\nFirst PCM after submission: "+r.opt("firstPcmMs")+" ms\nGeneration: "+r.opt("generationMs")+" ms\nWorker peak PSS: "+r.optInt("peakWorkerPssKb")/1024+" MB\nAnswer: "+r.optString("text")+"\n"+r.optString("error");}

@@ -34,3 +34,11 @@ The result includes model load time, first text and first PCM callback times aft
 - Live mic overlap, echo rejection, stop latency and retention of the interruption. Interleaved text/audio output does not prove native full duplex.
 - Simulated tool selection and arguments before connecting real device actions.
 - Compare all metrics and answer quality to V2 before replacing any voice engine.
+
+## Hardware comparison update
+
+Select CPU 2/4/6 threads, Vulkan main model, or Vulkan main + audio. Reuse the same recording and default voice for hardware comparisons. Run each separately after cooling; initial/peak thermal status and comparison history are included in copied diagnostics. GPU discovery is logged; inspect native layer/buffer placement for actual offload. An unavailable GPU is an error, not a silent CPU comparison. All runs currently reload the model; warm resident-session tests remain a later step.
+
+Voice selector: default conversation preserves the baseline. UK male conversation adds a voice instruction experimentally; it is not a guaranteed speaker control. UK male TTS uses the runtime's explicit TTS prompt on a fixed sample without needing a recording. Do not compare TTS-only latency directly with a recorded question. Listen to verify the voice; no automatic gender/accent verdict is made.
+
+The benchmark compiles an app-local copy of audio-decoder.cpp with explicit detokenizer GPU/thread selection, retaining the pinned upstream checkout unchanged. Vulkan headers use SDK tag 1.4.328.1. Vulkan may increase memory or be slower on this device; measure rather than assume. Comparison history retains result summaries until Delete recording and test output is used.
