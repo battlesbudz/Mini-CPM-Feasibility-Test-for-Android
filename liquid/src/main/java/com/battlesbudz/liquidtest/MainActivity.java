@@ -69,7 +69,7 @@ public final class MainActivity extends Activity {
         local="Question recorded. The test uses your 10-second question once. Recording stays on this device until deleted.";
     });}
     private void startRun(){
-        try{if(getSystemService(PowerManager.class).getCurrentThermalStatus()>=PowerManager.THERMAL_STATUS_CRITICAL)throw new IOException("Phone reports critical thermal status. Let it cool before starting another benchmark.");if(!new ModelStore(this).ready())throw new IOException("Install and verify the complete voice pack first.");if(voice.getSelectedItemPosition()!=2&&!new File(getCacheDir(),"input/question.wav").isFile())throw new IOException("Record a question first.");
+        try{if(!new ModelStore(this).ready())throw new IOException("Install and verify the complete voice pack first.");if(voice.getSelectedItemPosition()!=2&&!new File(getCacheDir(),"input/question.wav").isFile())throw new IOException("Record a question first.");
             new File(getFilesDir(),"report.json").delete();new File(getFilesDir(),"status.json").delete();delete(new File(getFilesDir(),"last-run"));
             startForegroundService(new Intent(this,BenchmarkService.class).putExtra("profile",duration.getSelectedItemPosition()).putExtra("voice",voice.getSelectedItemPosition()));local="Starting benchmark worker…";
         }catch(Exception e){local=e.getMessage();Toast.makeText(this,local,Toast.LENGTH_LONG).show();}refresh();
