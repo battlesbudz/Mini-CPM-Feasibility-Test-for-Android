@@ -95,7 +95,7 @@ public final class MainActivity extends Activity {
         return saved.put("status","WORKER_NOT_RUNNING").put("lastCheckpointPhase",saved.optString("phase"))
             .put("phase","Worker not running; waiting for Android exit details.");
     }
-    private String diagnostics(){String s;try{s=reconciledState().toString(2);}catch(JSONException error){s=read("status.json");}String r=read("report.json"),failure=read("last-run/native_failure.json"),exit="";
+    private String diagnostics(){String s;try{s=reconciledState().toString(2);}catch(JSONException error){s=read("status.json");}String r=read("report.json"),failure=read("last-run/native.log"),exit="";if(failure.length()>10000)failure=failure.substring(failure.length()-10000);
         if(Build.VERSION.SDK_INT>=30){var list=getSystemService(ActivityManager.class).getHistoricalProcessExitReasons(getPackageName(),0,4);for(var e:list)if(e.getProcessName().endsWith(":benchmark"))exit+="\nWorker exit: pid="+e.getPid()+" pssKb="+e.getPss()+" rssKb="+e.getRss()+" reason="+e.getReason()+" status="+e.getStatus()+" time="+e.getTimestamp()+" description="+e.getDescription();}
         return "Liquid Voice Feasibility "+BuildConfig.VERSION_NAME+"\n"+Build.MANUFACTURER+" "+Build.MODEL+"\n"+local+"\n"+s+"\n"+r+"\n"+failure+"\nLast persisted memory sample:\n"+read("last-run/memory.json")+exit;
     }
