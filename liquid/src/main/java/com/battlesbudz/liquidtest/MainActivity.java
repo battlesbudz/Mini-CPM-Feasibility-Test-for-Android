@@ -69,10 +69,10 @@ public final class MainActivity extends Activity {
         local="Question recorded. The test uses your 10-second question once. Recording stays on this device until deleted.";
     });}
     private void startRun(){
-        try{if(!new ModelStore(this).ready())throw new IOException("Install and verify the complete voice pack first.");if(voice.getSelectedItemPosition()!=2&&!new File(getCacheDir(),"input/question.wav").isFile())throw new IOException("Record a question first.");
+        try{if(getSystemService(PowerManager.class).getCurrentThermalStatus()>=PowerManager.THERMAL_STATUS_CRITICAL)throw new IOException("Phone reports critical thermal status. Let it cool before starting another benchmark.");if(!new ModelStore(this).ready())throw new IOException("Install and verify the complete voice pack first.");if(voice.getSelectedItemPosition()!=2&&!new File(getCacheDir(),"input/question.wav").isFile())throw new IOException("Record a question first.");
             new File(getFilesDir(),"report.json").delete();new File(getFilesDir(),"status.json").delete();delete(new File(getFilesDir(),"last-run"));
             startForegroundService(new Intent(this,BenchmarkService.class).putExtra("profile",duration.getSelectedItemPosition()).putExtra("voice",voice.getSelectedItemPosition()));local="Starting benchmark worker…";
-        }catch(Exception e){local=e.getMessage();}refresh();
+        }catch(Exception e){local=e.getMessage();Toast.makeText(this,local,Toast.LENGTH_LONG).show();}refresh();
     }
     private boolean workerAlive(){var list=getSystemService(ActivityManager.class).getRunningAppProcesses();if(list!=null)for(var p:list)if(p.uid==android.os.Process.myUid()&&p.processName.equals(getPackageName()+":benchmark"))return true;return false;}
     private String read(String name){try{return Io.read(new File(getFilesDir(),name).toPath());}catch(IOException e){return "";}}
@@ -98,7 +98,7 @@ public final class MainActivity extends Activity {
     }
     private String diagnostics(){String s;try{s=reconciledState().toString(2);}catch(JSONException error){s=read("status.json");}String r=read("report.json"),failure=read("last-run/native.log"),exit="";if(failure.length()>10000)failure=failure.substring(failure.length()-10000);
         if(Build.VERSION.SDK_INT>=30){var list=getSystemService(ActivityManager.class).getHistoricalProcessExitReasons(getPackageName(),0,4);for(var e:list)if(e.getProcessName().endsWith(":benchmark"))exit+="\nWorker exit: pid="+e.getPid()+" pssKb="+e.getPss()+" rssKb="+e.getRss()+" reason="+e.getReason()+" status="+e.getStatus()+" time="+e.getTimestamp()+" description="+e.getDescription();}
-        return "Liquid Voice Feasibility "+BuildConfig.VERSION_NAME+"\n"+Build.MANUFACTURER+" "+Build.MODEL+"\n"+local+"\n"+s+"\n"+r+"\n"+failure+"\nLast persisted memory sample:\n"+read("last-run/memory.json")+"\nComparison history:\n"+read("comparison.jsonl")+exit;
+        return "Liquid Voice Feasibility "+BuildConfig.VERSION_NAME+"\n"+Build.MANUFACTURER+" "+Build.MODEL+"\n"+local+"\n"+s+"\n"+r+"\n"+failure+"\nLast persisted memory sample:\n"+read("last-run/memory.json")+"\nSaved partial output:\n"+read("last-run/partial.json")+"\nComparison history:\n"+read("comparison.jsonl")+exit;
     }
     private void refresh(){if(destroyed||status==null)return;boolean running=workerAlive();for(Button b:controls)b.setEnabled(!busy&&!running);duration.setEnabled(!busy&&!running);voice.setEnabled(!busy&&!running);String text=local;
         if(!busy)try{String raw=read("status.json");if(!raw.isEmpty()){JSONObject s=reconciledState();text=s.optString("status")+"\n"+s.optString("phase");if(s.optString("status").equals("RUNNING")&&!running)text="WORKER EXITED — test did not finish. Copy diagnostics for the exit reason.";}
@@ -107,7 +107,7 @@ public final class MainActivity extends Activity {
         }catch(Exception e){text+="\nReading diagnostics: "+e.getMessage();}status.setText(text);
     }
     private void play(){launch(()->{
-        File pcm=new File(getFilesDir(),"last-run/generated.pcm");if(!pcm.isFile())throw new IOException("No generated speech yet");JSONObject report=new JSONObject(read("report.json"));int rate=report.optInt("sampleRate",24000);
+        File pcm=new File(getFilesDir(),"last-run/generated.pcm");if(!pcm.isFile())throw new IOException("No generated speech yet");String metadata=read("report.json");if(metadata.isEmpty())metadata=read("last-run/partial.json");JSONObject report=metadata.isEmpty()?new JSONObject():new JSONObject(metadata);int rate=report.optInt("sampleRate",24000);
         int buffer=AudioTrack.getMinBufferSize(rate,AudioFormat.CHANNEL_OUT_MONO,AudioFormat.ENCODING_PCM_16BIT);if(buffer<=0)throw new IOException("Unsupported output sample rate");
         AudioTrack player=new AudioTrack.Builder().setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()).setAudioFormat(new AudioFormat.Builder().setSampleRate(rate).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build()).setBufferSizeInBytes(Math.max(buffer,8192)).setTransferMode(AudioTrack.MODE_STREAM).build();local="Playing generated speech.";
         try(InputStream in=new FileInputStream(pcm)){player.play();byte[] b=new byte[4096];int n;long written=0;while((n=in.read(b))!=-1){if(Thread.currentThread().isInterrupted())throw new InterruptedIOException();int off=0;while(off<n){int count=player.write(b,off,n-off);if(count<=0)throw new IOException("Playback failed");off+=count;written+=count;}}

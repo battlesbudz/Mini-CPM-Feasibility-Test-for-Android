@@ -52,16 +52,24 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_liquidtest_NativeBench
   const std::string sample="Good afternoon. The sky looks blue because molecules in the air scatter blue light more strongly than red light. Shall we explore that in a little more detail?";
   std::vector<liquid::audio::Runner::Message> messages={{"system",prompt,{}},{"user",voice==2?sample:mtmd_default_marker(),std::move(wav)}};
   std::ofstream pcm(output+"/generated.pcm",std::ios::binary);if(!pcm)throw std::runtime_error("Cannot create PCM output");
-  std::string text;long long samples=0;double energy=0,firstPcm=-1,firstText=-1;json audio=json::array();
+  std::string text;long long samples=0;double energy=0,firstPcm=-1,firstText=-1;json audio=json::array();double lastCheckpoint=-1000;
   emit("Processing recorded question and generating speech");began=Clock::now();
-  auto textCb=[&](const std::string& piece){if(!piece.empty()&&firstText<0)firstText=ms(began);text+=piece;};
+  auto checkpoint=[&](){
+   double elapsed=ms(began);if(elapsed-lastCheckpoint<1000)return;lastCheckpoint=elapsed;
+   pcm.flush();json partial={{"partial",true},{"sampleRate",rate},{"audioSamples",samples},{"audioMs",1000.0*samples/rate},{"elapsedMs",elapsed},{"text",text},{"firstPcmMs",firstPcm},{"voiceIndex",voice}};
+   auto path=output+"/partial.json";{std::ofstream f(path+".tmp");f<<partial.dump();}std::rename((path+".tmp").c_str(),path.c_str());
+   emit("Generating: "+std::to_string(int(elapsed/1000))+" s elapsed; "+std::to_string(samples*1000/rate)+" ms audio saved");
+  };
+  auto textCb=[&](const std::string& piece){if(!piece.empty()&&firstText<0)firstText=ms(began);text+=piece;checkpoint();};
   auto audioCb=[&](const std::vector<int16_t>& data){
    if(data.empty())return;double at=ms(began);if(firstPcm<0){firstPcm=at;emit("First speech produced; continuing answer");}
    audio.push_back({{"atMs",at},{"samples",data.size()}});
    pcm.write(reinterpret_cast<const char*>(data.data()),data.size()*sizeof(int16_t));
-   for(auto x:data){double value=double(x)/32768.0;energy+=value*value;}samples+=data.size();
+   for(auto x:data){double value=double(x)/32768.0;energy+=value*value;}samples+=data.size();checkpoint();
   };
-  int result=runner.generate(messages,2048,textCb,audioCb,{MTMD_OUTPUT_MODALITY_AUDIO,MTMD_OUTPUT_MODALITY_TEXT});
+  const std::vector<mtmd_output_modality> modalities=voice==2?std::vector<mtmd_output_modality>{MTMD_OUTPUT_MODALITY_AUDIO}:std::vector<mtmd_output_modality>{MTMD_OUTPUT_MODALITY_AUDIO,MTMD_OUTPUT_MODALITY_TEXT};
+  report["outputMode"]=voice==2?"audio_only":"interleaved";
+  int result=runner.generate(messages,2048,textCb,audioCb,modalities);
   report["generationMs"]=ms(began);pcm.flush();
   if(voice==2){report["ttsInputText"]=sample;if(text.empty())text=sample;}
   report["text"]=text;report["audioSamples"]=samples;report["audioRms"]=samples?std::sqrt(energy/samples):0;
