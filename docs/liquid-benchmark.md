@@ -45,3 +45,6 @@ The benchmark compiles an app-local copy of audio-decoder.cpp with explicit deto
 
 ## Build 4 correction
 UK male fixed TTS now requests AUDIO only, matching the pinned runner CLI. Conversational trials continue to request AUDIO+TEXT. Once per second of callback activity the worker flushes PCM, atomically checkpoints partial metadata, and reports elapsed time/audio duration. After cancellation or timeout, Play uses partial metadata when a final report is absent; this is unfinished audio, not a completed benchmark. Build 5 removes the app-level thermal start restriction at the user’s request. Thermal status remains diagnostic only; the app does not gate tests on temperature. Android’s own thermal management is unchanged.
+
+## Integrated GPU detection correction
+Build 7 accepts both GGML GPU and IGPU device types. Adreno 750 was discovered as Vulkan0 in Build 6 but rejected by the dedicated-GPU-only preflight check before model loading. Devices now report raw type and integrated status. Actual offloading and performance still require a phone run.

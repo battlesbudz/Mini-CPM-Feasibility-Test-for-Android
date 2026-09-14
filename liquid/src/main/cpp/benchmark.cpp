@@ -33,7 +33,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_liquidtest_NativeBench
   params.cpuparams.n_threads=threads;params.cpuparams_batch.n_threads=threads;params.sampling.seed=42;
   if(!gpu)setenv("GGML_VK_VISIBLE_DEVICES","",1);
   common_init();ggml_backend_load_all();json devices=json::array();bool foundGpu=false;
-  for(size_t i=0;i<ggml_backend_dev_count();i++){auto dev=ggml_backend_dev_get(i);bool isGpu=ggml_backend_dev_type(dev)==GGML_BACKEND_DEVICE_TYPE_GPU;foundGpu|=isGpu;devices.push_back({{"name",ggml_backend_dev_name(dev)},{"description",ggml_backend_dev_description(dev)},{"gpu",isGpu}});}
+  for(size_t i=0;i<ggml_backend_dev_count();i++){auto dev=ggml_backend_dev_get(i);auto type=ggml_backend_dev_type(dev);bool isGpu=type==GGML_BACKEND_DEVICE_TYPE_GPU||type==GGML_BACKEND_DEVICE_TYPE_IGPU;foundGpu|=isGpu;devices.push_back({{"name",ggml_backend_dev_name(dev)},{"description",ggml_backend_dev_description(dev)},{"gpu",isGpu},{"integrated",type==GGML_BACKEND_DEVICE_TYPE_IGPU},{"deviceType",int(type)}});}
   report["availableDevices"]=devices;report["offloadEvidence"]="Inspect native log for actual layer and buffer placement; GPU discovery alone is not proof";
   if(gpu&&!foundGpu)throw std::runtime_error("Vulkan GPU unavailable; no CPU fallback benchmark recorded");
   liquid::audio::Runner runner;
