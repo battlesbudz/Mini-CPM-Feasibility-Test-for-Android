@@ -31,6 +31,20 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_liquidtest_NativeBench
   params.vocoder.speaker_file=root+"/tokenizer-LFM2.5-Audio-1.5B-Q4_0.gguf";
   params.n_ctx=4096;params.n_batch=256;params.n_ubatch=64;params.n_gpu_layers=gpu?99:0;params.mmproj_use_gpu=audioGpu;
   params.cpuparams.n_threads=threads;params.cpuparams_batch.n_threads=threads;params.sampling.seed=42;
+  if(gpu){
+   // Conservative Vulkan baseline for the Adreno compiler crash in build 8.
+   // Set before backend discovery: features are cached during device creation.
+   const char* flags[]={"GGML_VK_DISABLE_F16","GGML_VK_DISABLE_COOPMAT",
+     "GGML_VK_DISABLE_COOPMAT2","GGML_VK_DISABLE_INTEGER_DOT_PRODUCT",
+     "GGML_VK_DISABLE_FUSION","GGML_VK_DISABLE_GRAPH_OPTIMIZE"};
+   for(const char* flag:flags){setenv(flag,"1",1);fprintf(stderr,"vulkan_compat %s=1\n",flag);}
+   params.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_DISABLED;
+   report["vulkanCompatibility"]="adreno-conservative-v1";
+   report["vulkanDisabledFeatures"]=json::array();for(const char* flag:flags)report["vulkanDisabledFeatures"].push_back(flag);
+   report["flashAttentionRequested"]="disabled";
+   report["pipelineCompilation"]="serialized_with_flushed_trace";
+   fprintf(stderr,"vulkan_compat policy=adreno-conservative-v1 flashAttention=disabled pipelineCompilation=serialized\n");fflush(stderr);
+  }
   if(!gpu)setenv("GGML_VK_VISIBLE_DEVICES","",1);
   common_init();ggml_backend_load_all();json devices=json::array();bool foundGpu=false;
   for(size_t i=0;i<ggml_backend_dev_count();i++){auto dev=ggml_backend_dev_get(i);auto type=ggml_backend_dev_type(dev);bool isGpu=type==GGML_BACKEND_DEVICE_TYPE_GPU||type==GGML_BACKEND_DEVICE_TYPE_IGPU;foundGpu|=isGpu;devices.push_back({{"name",ggml_backend_dev_name(dev)},{"description",ggml_backend_dev_description(dev)},{"gpu",isGpu},{"integrated",type==GGML_BACKEND_DEVICE_TYPE_IGPU},{"deviceType",int(type)}});}

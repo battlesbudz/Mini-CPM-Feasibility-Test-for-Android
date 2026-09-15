@@ -22,6 +22,39 @@ set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 set(GGML_CPU_KLEIDIAI OFF CACHE BOOL "" FORCE)
 set(GGML_LLAMAFILE OFF CACHE BOOL "" FORCE)
 add_subdirectory("${LIQUID_ROOT}" upstream EXCLUDE_FROM_ALL)
+# App-local Vulkan integration: serialize the vendor compiler and record pipeline
+# names before entering driver code (a SIGSEGV cannot be caught as vk::SystemError).
+file(READ "${LIQUID_ROOT}/ggml/src/ggml-vulkan/ggml-vulkan.cpp" VULKAN_SOURCE)
+set(VK_START_ANCHOR "    vk::ShaderModuleCreateInfo shader_module_create_info({}, spv_size, reinterpret_cast<const uint32_t *>(spv_data));")
+set(VK_END_ANCHOR "    pipeline->compiled = true;")
+foreach(ANCHOR IN ITEMS "${VK_START_ANCHOR}" "${VK_END_ANCHOR}")
+ string(FIND "${VULKAN_SOURCE}" "${ANCHOR}" ANCHOR_INDEX)
+ if(ANCHOR_INDEX EQUAL -1)
+  message(FATAL_ERROR "Pinned Vulkan integration anchor missing")
+ endif()
+endforeach()
+string(REPLACE "${VK_START_ANCHOR}" [=[
+    static std::mutex android_pipeline_compile_mutex;
+    std::lock_guard<std::mutex> android_pipeline_compile_lock(android_pipeline_compile_mutex);
+    fprintf(stderr, "vulkan_pipeline_begin name=%s bytes=%zu subgroup=%u\n", pipeline->name.c_str(), spv_size, required_subgroup_size);
+    fflush(stderr);
+    vk::ShaderModuleCreateInfo shader_module_create_info({}, spv_size, reinterpret_cast<const uint32_t *>(spv_data));
+]=] VULKAN_SOURCE "${VULKAN_SOURCE}")
+string(REPLACE "${VK_END_ANCHOR}" [=[
+    pipeline->compiled = true;
+    fprintf(stderr, "vulkan_pipeline_end name=%s\n", pipeline->name.c_str());
+    fflush(stderr);
+]=] VULKAN_SOURCE "${VULKAN_SOURCE}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-android.cpp" "// App-local compiler compatibility and diagnostics.\n${VULKAN_SOURCE}")
+get_target_property(VK_SOURCES ggml-vulkan SOURCES)
+list(FIND VK_SOURCES "ggml-vulkan.cpp" VK_SOURCE_INDEX)
+if(VK_SOURCE_INDEX EQUAL -1)
+ message(FATAL_ERROR "Pinned Vulkan source list changed")
+endif()
+list(REMOVE_ITEM VK_SOURCES ggml-vulkan.cpp)
+list(APPEND VK_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-android.cpp")
+set_property(TARGET ggml-vulkan PROPERTY SOURCES "${VK_SOURCES}")
+target_include_directories(ggml-vulkan PRIVATE "${LIQUID_ROOT}/ggml/src/ggml-vulkan")
 set(LLAMA_INSTALL_VERSION "0.0.0")
 add_subdirectory("${LIQUID_ROOT}/tools/mtmd" mtmd EXCLUDE_FROM_ALL)
 # App-local integration copy: explicitly control the detokenizer's device and threads.

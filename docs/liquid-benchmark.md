@@ -63,3 +63,23 @@ After a native crash, use **Save native crash trace** and attach the exported
 Android tombstone protobuf (.pb), alongside **Copy diagnostics**. Export matches
 the current worker PID and run start time; Android may return no trace or provide
 it later. Export runs off the UI thread. No thermal test blocker is added.
+
+
+## Build 9: Adreno compiler compatibility baseline
+The build 8 tombstone (PID 560 / TID 802) reports SIGSEGV at address 0x2d0
+inside Qualcomm libllvm-qgl.so through CreateQGLCProgram and
+vkCreateComputePipelines. CPU isolation worked, but did not eliminate this crash.
+The exact shader was not logged and the proprietary compiler frames are unnamed.
+
+Vulkan profiles now disable shader FP16, cooperative matrices, integer dot-product
+extensions, fusion, graph optimization and main-model flash attention. We retain
+Q4 model weights and request GPU layer offload; this is not CPU fallback.
+Pipeline creation is serialized in an app-local copy of the pinned Vulkan source,
+and flushed begin/end records name the shader being compiled. The dependency
+checkout remains unmodified. This intentionally conservative baseline can be
+slower and does not establish which feature caused the original crash.
+
+Validation: build/test/lint in CI; on-device success remains pending. Retry
+Vulkan main model with default conversation voice and the same recording.
+If it fails, send copied diagnostics and Save native crash trace output again.
+No thermal blocker has been added. CPU profiles retain their previous settings.
