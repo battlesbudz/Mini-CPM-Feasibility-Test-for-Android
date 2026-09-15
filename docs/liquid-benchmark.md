@@ -83,3 +83,19 @@ Validation: build/test/lint in CI; on-device success remains pending. Retry
 Vulkan main model with default conversation voice and the same recording.
 If it fails, send copied diagnostics and Save native crash trace output again.
 No thermal blocker has been added. CPU profiles retain their previous settings.
+
+
+## Build 10: bypass the identified Q4 matvec pipeline
+Build 9's serialized log ends at mul_mat_vec_q4_0_f32_f32 (subgroup=64),
+with the same Qualcomm compiler SIGSEGV. Several general matmul pipelines had
+already compiled, and thermal status was 0 throughout the run.
+
+The app-local Vulkan dispatch now routes Qualcomm Q4_0 x F32 small-column
+multiplications through the existing general GPU matmul implementation.
+This includes N=1; it retains the same tensors, strides, output shape, and
+general dispatch bounds handling. Other vendors/types retain their old route.
+The workaround requires an explicit app environment flag and no fused follow-on
+operations; the compatibility profile still disables fusion.
+A once-per-process vulkan_q4_route message confirms the branch was taken.
+Weights remain Q4 and the operation remains on GPU. No CPU fallback is labelled
+as GPU success. Retest required for output correctness, stability, and speed.

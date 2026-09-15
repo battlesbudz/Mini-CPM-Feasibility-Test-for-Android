@@ -45,6 +45,28 @@ string(REPLACE "${VK_END_ANCHOR}" [=[
     fprintf(stderr, "vulkan_pipeline_end name=%s\n", pipeline->name.c_str());
     fflush(stderr);
 ]=] VULKAN_SOURCE "${VULKAN_SOURCE}")
+# Bypass the exact Q4/F32 matvec shader that crashes Qualcomm's compiler.
+# Reuse the existing general matmul dispatch, including N=1 and its bounds checks.
+set(Q4_ROUTE_ANCHOR "        ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);")
+string(FIND "${VULKAN_SOURCE}" "${Q4_ROUTE_ANCHOR}" Q4_ROUTE_INDEX)
+if(Q4_ROUTE_INDEX EQUAL -1)
+ message(FATAL_ERROR "Pinned Q4 matvec dispatch anchor missing")
+endif()
+string(REPLACE "${Q4_ROUTE_ANCHOR}" [=[
+        if (ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM &&
+            src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_F32 &&
+            ctx->num_additional_fused_ops == 0 &&
+            getenv("LIQUID_VK_Q4_MATVEC_VIA_MATMUL") != nullptr) {
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true)) {
+                fprintf(stderr, "vulkan_q4_route original=mul_mat_vec_q4_0_f32_f32 replacement=general_matmul device=qualcomm\n");
+                fflush(stderr);
+            }
+            ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
+        } else {
+            ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
+        }
+]=] VULKAN_SOURCE "${VULKAN_SOURCE}")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-android.cpp" "// App-local compiler compatibility and diagnostics.\n${VULKAN_SOURCE}")
 get_target_property(VK_SOURCES ggml-vulkan SOURCES)
 list(FIND VK_SOURCES "ggml-vulkan.cpp" VK_SOURCE_INDEX)
