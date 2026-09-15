@@ -99,3 +99,18 @@ operations; the compatibility profile still disables fusion.
 A once-per-process vulkan_q4_route message confirms the branch was taken.
 Weights remain Q4 and the operation remains on GPU. No CPU fallback is labelled
 as GPU success. Retest required for output correctness, stability, and speed.
+
+### Build 11: streamed text encoding
+Build 10 progressed beyond the previous native shader compilation crash, then
+aborted at a JSON checkpoint on an unfinished UTF-8 character (0xC4). The runtime
+returns token byte pieces, which need not end at character boundaries. Checkpoints
+now publish only complete characters; the remaining bytes stay in the accumulated
+text for the next callback. Invalid sequences are replaced in displayed text and
+counted explicitly. Raw bytes are retained in generated-text.bin. Final diagnostics
+use ASCII-escaped JSON for the JNI boundary and tolerate malformed error messages.
+Tests cover split two-, three-, and four-byte characters, truncated final output,
+invalid encodings, and embedded NULs. No GPU arithmetic changes in this build.
+
+The partial output " circrose" does not establish correct GPU inference. This
+build removes the reporting failure so output can be reviewed; it does not certify
+GPU correctness, speed, voice identity, or live duplex operation.

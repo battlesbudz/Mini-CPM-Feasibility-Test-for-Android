@@ -22,6 +22,10 @@ jobs:
       - uses: android-actions/setup-android@v3
         with:
           packages: platform-tools
+      - name: Test streamed UTF-8 snapshots
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -Iliquid/src/main/cpp liquid/src/test/cpp/utf8_snapshot_test.cpp -o /tmp/liquid-utf8-test
+          /tmp/liquid-utf8-test
       - name: Install pinned Android tools
         run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
       - name: Install Vulkan shader compiler

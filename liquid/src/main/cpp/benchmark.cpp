@@ -9,6 +9,7 @@
 #include "mtmd.h"
 #include "common.h"
 #include "nlohmann/json.hpp"
+#include "utf8_snapshot.h"
 using Clock=std::chrono::steady_clock;
 using json=nlohmann::ordered_json;
 static double ms(Clock::time_point a){return std::chrono::duration<double,std::milli>(Clock::now()-a).count();}
@@ -68,15 +69,18 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_liquidtest_NativeBench
   const std::string sample="Good afternoon. The sky looks blue because molecules in the air scatter blue light more strongly than red light. Shall we explore that in a little more detail?";
   std::vector<liquid::audio::Runner::Message> messages={{"system",prompt,{}},{"user",voice==2?sample:mtmd_default_marker(),std::move(wav)}};
   std::ofstream pcm(output+"/generated.pcm",std::ios::binary);if(!pcm)throw std::runtime_error("Cannot create PCM output");
+  std::ofstream rawText(output+"/generated-text.bin",std::ios::binary);
+  if(!rawText)throw std::runtime_error("Cannot create raw text output");
+  report["textEncodingPolicy"]="buffer_incomplete_utf8_record_invalid_bytes";
   std::string text;long long samples=0;double energy=0,firstPcm=-1,firstText=-1;json audio=json::array();double lastCheckpoint=-1000;
   emit("Processing recorded question and generating speech");began=Clock::now();
   auto checkpoint=[&](){
    double elapsed=ms(began);if(elapsed-lastCheckpoint<1000)return;lastCheckpoint=elapsed;
-   pcm.flush();json partial={{"partial",true},{"sampleRate",rate},{"audioSamples",samples},{"audioMs",1000.0*samples/rate},{"elapsedMs",elapsed},{"text",text},{"firstPcmMs",firstPcm},{"voiceIndex",voice}};
-   auto path=output+"/partial.json";{std::ofstream f(path+".tmp");f<<partial.dump();}std::rename((path+".tmp").c_str(),path.c_str());
+   pcm.flush();rawText.flush();auto snapshot=utf8Snapshot(text);json partial={{"partial",true},{"sampleRate",rate},{"audioSamples",samples},{"audioMs",1000.0*samples/rate},{"elapsedMs",elapsed},{"text",snapshot.text},{"pendingUtf8Bytes",snapshot.pendingBytes},{"invalidUtf8Bytes",snapshot.invalidBytes},{"firstPcmMs",firstPcm},{"voiceIndex",voice}};
+   auto path=output+"/partial.json";{std::ofstream f(path+".tmp");f<<partial.dump(-1,' ',true,json::error_handler_t::replace);}std::rename((path+".tmp").c_str(),path.c_str());
    emit("Generating: "+std::to_string(int(elapsed/1000))+" s elapsed; "+std::to_string(samples*1000/rate)+" ms audio saved");
   };
-  auto textCb=[&](const std::string& piece){if(!piece.empty()&&firstText<0)firstText=ms(began);text+=piece;checkpoint();};
+  auto textCb=[&](const std::string& piece){if(!piece.empty()&&firstText<0)firstText=ms(began);text+=piece;rawText.write(piece.data(),piece.size());checkpoint();};
   auto audioCb=[&](const std::vector<int16_t>& data){
    if(data.empty())return;double at=ms(began);if(firstPcm<0){firstPcm=at;emit("First speech produced; continuing answer");}
    audio.push_back({{"atMs",at},{"samples",data.size()}});
@@ -88,7 +92,12 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_liquidtest_NativeBench
   int result=runner.generate(messages,2048,textCb,audioCb,modalities);
   report["generationMs"]=ms(began);pcm.flush();
   if(voice==2){report["ttsInputText"]=sample;if(text.empty())text=sample;}
-  report["text"]=text;report["audioSamples"]=samples;report["audioRms"]=samples?std::sqrt(energy/samples):0;
+  auto finalText=utf8Snapshot(text,true);
+  report["text"]=finalText.text;report["invalidUtf8Bytes"]=finalText.invalidBytes;
+  report["outputQualityVerified"]=false;
+  if(finalText.invalidBytes)report["textEncodingWarning"]="Malformed or unfinished UTF-8; inspect generated-text.bin and review output correctness";
+  if(!rawText)report["error"]="Raw text write failed";
+  report["textBytes"]=text.size();report["audioSamples"]=samples;report["audioRms"]=samples?std::sqrt(energy/samples):0;
   report["sampleRate"]=rate;report["audioMs"]=1000.0*samples/rate;report["audioChunks"]=audio;
   report["firstPcmMs"]=firstPcm<0?json(nullptr):json(firstPcm);report["firstTextMs"]=firstText<0?json(nullptr):json(firstText);
   if(result!=0)report["error"]=std::string(runner.get_last_error()?runner.get_last_error():"Generation failed");
@@ -96,6 +105,6 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_liquidtest_NativeBench
   if(samples>0){report["totalRealtimeFactor"]=ms(began)/(1000.0*samples/rate);report["postFirstPcmRealtimeFactor"]=(ms(began)-firstPcm)/(1000.0*samples/rate);}
   emit("Saving voice output and diagnostics");
  }catch(const std::exception& error){report["error"]=error.what();}
- std::ofstream(output+"/native_report.json")<<report.dump(2);
- return env->NewStringUTF(report.dump().c_str());
+ std::ofstream(output+"/native_report.json")<<report.dump(2,' ',true,json::error_handler_t::replace);
+ return env->NewStringUTF(report.dump(-1,' ',true,json::error_handler_t::replace).c_str());
 }
