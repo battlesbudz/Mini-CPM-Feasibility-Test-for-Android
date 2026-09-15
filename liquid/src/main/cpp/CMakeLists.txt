@@ -27,7 +27,11 @@ add_subdirectory("${LIQUID_ROOT}/tools/mtmd" mtmd EXCLUDE_FROM_ALL)
 # App-local integration copy: explicitly control the detokenizer's device and threads.
 # Preserve the pinned dependency checkout unchanged.
 file(READ "${LIQUID_ROOT}/tools/mtmd/audio-decoder.cpp" DECODER_SOURCE)
-string(REPLACE "common_params params_audio_tokenizer;" "common_params params_audio_tokenizer;\n        params_audio_tokenizer.n_gpu_layers = use_gpu ? 99 : 0;\n        params_audio_tokenizer.cpuparams.n_threads = n_threads;\n        params_audio_tokenizer.cpuparams_batch.n_threads = n_threads;" DECODER_SOURCE "${DECODER_SOURCE}")
+string(FIND "${DECODER_SOURCE}" "common_params params_audio_tokenizer;" DECODER_ANCHOR)
+if(DECODER_ANCHOR EQUAL -1)
+ message(FATAL_ERROR "Audio detokenizer integration anchor missing")
+endif()
+string(REPLACE "common_params params_audio_tokenizer;" "common_params params_audio_tokenizer;\n        params_audio_tokenizer.n_gpu_layers = use_gpu ? 99 : 0;\n        params_audio_tokenizer.no_op_offload = !use_gpu;\n        params_audio_tokenizer.no_kv_offload = !use_gpu;\n        if (!use_gpu) params_audio_tokenizer.devices = {nullptr};\n        params_audio_tokenizer.cpuparams.n_threads = n_threads;\n        params_audio_tokenizer.cpuparams_batch.n_threads = n_threads;" DECODER_SOURCE "${DECODER_SOURCE}")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/audio-decoder-android.cpp" "// Modified for Android benchmark device/thread selection.\n${DECODER_SOURCE}")
 get_target_property(MTMD_SOURCES mtmd SOURCES)
 list(REMOVE_ITEM MTMD_SOURCES audio-decoder.cpp)

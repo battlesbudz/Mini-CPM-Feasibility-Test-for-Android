@@ -38,6 +38,7 @@ public final class MainActivity extends Activity {
         Button stop=new Button(this);stop.setText("Stop current operation");column.addView(stop);stop.setOnClickListener(v->{if(task!=null)task.cancel(true);if(workerAlive())startService(new Intent(this,BenchmarkService.class).setAction("STOP"));local="Stop requested.";refresh();});
         button(column,"Play generated speech",this::play);
         Button copy=new Button(this);copy.setText("Copy diagnostics");column.addView(copy);copy.setOnClickListener(v->{getSystemService(ClipboardManager.class).setPrimaryClip(ClipData.newPlainText("Liquid Voice diagnostics",diagnostics()));Toast.makeText(this,"Diagnostics copied",Toast.LENGTH_SHORT).show();});
+        button(column,"Save native crash trace",()->startActivityForResult(new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("application/octet-stream").addCategory(Intent.CATEGORY_OPENABLE).putExtra(Intent.EXTRA_TITLE,"liquid-native-crash.pb"),13));
         button(column,"Delete recording and test output",()->{delete(new File(getCacheDir(),"input"));delete(new File(getFilesDir(),"last-run"));new File(getFilesDir(),"report.json").delete();new File(getFilesDir(),"status.json").delete();new File(getFilesDir(),"comparison.jsonl").delete();local="Recording and test output deleted. Model pack retained.";refresh();});
         status=new TextView(this);status.setTextIsSelectable(true);status.setPadding(0,24,0,24);column.addView(status);ui.post(poll);
         if(Build.VERSION.SDK_INT>=33&&checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED)requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},12);
@@ -46,7 +47,7 @@ public final class MainActivity extends Activity {
     private interface Job {void run()throws Exception;}
     private void launch(Job job){busy=true;refresh();task=work.submit(()->{try{job.run();}catch(Exception e){local=e.getClass().getSimpleName()+": "+e.getMessage();}finally{busy=false;if(!destroyed)ui.post(this::refresh);}});}
     private void install(Uri folder){launch(()->new ModelStore(this).install(folder,message->{local=message;if(!destroyed)ui.post(this::refresh);}));}
-    @Override protected void onActivityResult(int request,int result,Intent data){super.onActivityResult(request,result,data);if(request==10&&result==RESULT_OK&&data!=null){Uri uri=data.getData();if(uri!=null){getContentResolver().takePersistableUriPermission(uri,Intent.FLAG_GRANT_READ_URI_PERMISSION);install(uri);}}}
+    @Override protected void onActivityResult(int request,int result,Intent data){super.onActivityResult(request,result,data);if(request==13&&result==RESULT_OK&&data!=null&&data.getData()!=null){Uri destination=data.getData();launch(()->saveCrashTrace(destination));return;}if(request==10&&result==RESULT_OK&&data!=null){Uri uri=data.getData();if(uri!=null){getContentResolver().takePersistableUriPermission(uri,Intent.FLAG_GRANT_READ_URI_PERMISSION);install(uri);}}}
     @Override public void onRequestPermissionsResult(int request,String[] names,int[] grants){super.onRequestPermissionsResult(request,names,grants);if(request==11&&grants.length>0&&grants[0]==PackageManager.PERMISSION_GRANTED)record();}
     private void record(){launch(()->{
         if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED)throw new IOException("Microphone permission required");
@@ -86,6 +87,7 @@ public final class MainActivity extends Activity {
                     saved.put("lastCheckpointPhase",saved.optString("phase")).put("exitReason",e.getReason()).put("exitStatus",e.getStatus())
                         .put("exitAtMs",e.getTimestamp()).put("exitPssKb",e.getPss()).put("exitRssKb",e.getRss());
                     boolean low=e.getReason()==ApplicationExitInfo.REASON_LOW_MEMORY;
+                    if(e.getReason()==ApplicationExitInfo.REASON_CRASH_NATIVE)saved.put("nativeCrash",true).put("crashTraceInstructions","Save native crash trace to export Android’s binary tombstone, if available.");
                     saved.put("status",low?"KILLED_LOW_MEMORY":"WORKER_EXITED")
                         .put("phase",low?"Android killed the worker under memory pressure. Test did not finish.":"Worker exited before completing the test.");
                     return saved;
@@ -95,6 +97,24 @@ public final class MainActivity extends Activity {
         // Exit history can arrive after process removal. Do not persist a guessed reason.
         return saved.put("status","WORKER_NOT_RUNNING").put("lastCheckpointPhase",saved.optString("phase"))
             .put("phase","Worker not running; waiting for Android exit details.");
+    }
+    private void saveCrashTrace(Uri destination)throws Exception{
+        if(Build.VERSION.SDK_INT<31)throw new IOException("Native crash traces require Android 12 or newer.");
+        JSONObject saved=new JSONObject(read("status.json"));int pid=saved.optInt("pid",-1);
+        long began=saved.optLong("startedAtMs",saved.optLong("updatedAtMs"));
+        if(pid<=0)throw new IOException("No benchmark process recorded.");
+        for(var e:getSystemService(ActivityManager.class).getHistoricalProcessExitReasons(getPackageName(),pid,16)){
+            if(!e.getProcessName().equals(getPackageName()+":benchmark")||!ExitMatch.matches(pid,began,e.getPid(),e.getTimestamp())||e.getReason()!=ApplicationExitInfo.REASON_CRASH_NATIVE)continue;
+            try(InputStream in=e.getTraceInputStream()){
+                if(in==null)throw new IOException("Android has not provided a trace for this crash. Try again shortly.");
+                try(OutputStream out=getContentResolver().openOutputStream(destination,"wt")){
+                    if(out==null)throw new IOException("Cannot open crash trace destination.");
+                    byte[] bytes=new byte[8192];int n;while((n=in.read(bytes))!=-1){if(Thread.currentThread().isInterrupted())throw new InterruptedIOException("Export cancelled");out.write(bytes,0,n);}
+                }
+            }
+            local="Native crash trace saved. Attach the .pb file with the copied diagnostics.";return;
+        }
+        throw new IOException("No native crash found for the current benchmark.");
     }
     private String diagnostics(){String s;try{s=reconciledState().toString(2);}catch(JSONException error){s=read("status.json");}String r=read("report.json"),failure=read("last-run/native.log"),exit="";if(failure.length()>10000)failure=failure.substring(failure.length()-10000);
         if(Build.VERSION.SDK_INT>=30){var list=getSystemService(ActivityManager.class).getHistoricalProcessExitReasons(getPackageName(),0,4);for(var e:list)if(e.getProcessName().endsWith(":benchmark"))exit+="\nWorker exit: pid="+e.getPid()+" pssKb="+e.getPss()+" rssKb="+e.getRss()+" reason="+e.getReason()+" status="+e.getStatus()+" time="+e.getTimestamp()+" description="+e.getDescription();}

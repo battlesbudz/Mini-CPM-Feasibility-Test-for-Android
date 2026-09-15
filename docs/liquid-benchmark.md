@@ -48,3 +48,18 @@ UK male fixed TTS now requests AUDIO only, matching the pinned runner CLI. Conve
 
 ## Integrated GPU detection correction
 Build 7 accepts both GGML GPU and IGPU device types. Adreno 750 was discovered as Vulkan0 in Build 6 but rejected by the dedicated-GPU-only preflight check before model loading. Devices now report raw type and integrated status. Actual offloading and performance still require a phone run.
+
+
+## Build 8: isolate CPU audio operations and export crash traces
+Build 7 detected the Adreno 750, but the main-model Vulkan run crashed with native
+signal 11 after audio prompt evaluation. Its detokenizer had zero GPU layers yet
+allocated Vulkan compute buffers. Zero layers alone does not disable automatic
+operation offload. CPU audio now uses an explicit empty device list and disables
+both operation and KV offload. The main model keeps Vulkan enabled; the all-audio
+GPU profile remains separately selectable. This corrects placement, but does not
+prove the signal 11 cause without an on-device retest/backtrace.
+
+After a native crash, use **Save native crash trace** and attach the exported
+Android tombstone protobuf (.pb), alongside **Copy diagnostics**. Export matches
+the current worker PID and run start time; Android may return no trace or provide
+it later. Export runs off the UI thread. No thermal test blocker is added.
