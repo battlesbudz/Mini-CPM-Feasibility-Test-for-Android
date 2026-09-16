@@ -136,3 +136,22 @@ the active case/backend are persisted in partial.json before each backend call.
 CORRECTNESS_PASS only validates these operations/shapes. Recurrent state,
 attention, noncontiguous tensors, complete model logits and audio still require
 further isolation if this suite passes. No thermal blocker was introduced.
+
+### Build 13: Q4 dequantization followed by F16 GPU multiplication
+Build 12 phone results: all 12 F32/F16 cases passed, all six Q4 GPU cases failed
+(relative L2 0.90–1.08); all CPU cases passed. This implicates the current native
+Q4 GPU multiplication path, not ordinary quantization error.
+
+On Qualcomm, Q4/F32 matrix multiplication now forces the runtime's existing
+GPU Q4-to-F16 conversion and F16/F32 multiplication fallback. It covers batched
+inputs as well as the single-column path routed around the previous compiler
+crash. The existing buffer allocation, synchronization, strides and split-K
+handling remain in use. Disk weights remain Q4. Converted weights require a
+reusable temporary GPU buffer; no entire-model F16 copy is stored.
+
+Run CPU vs Vulkan correctness first. It uses the same inputs and thresholds as
+Build 12, so the Q4 cases now measure conversion plus multiplication against the
+CPU and scalar references. Look for vulkan_q4_dequant in native logs. A pass is
+required evidence before retrying voice, but does not certify the full model.
+GPU conversion may itself have compatibility problems; phone results are required.
+This change has no thermal gate and no CPU fallback disguised as GPU execution.

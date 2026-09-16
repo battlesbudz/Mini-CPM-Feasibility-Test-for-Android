@@ -67,6 +67,27 @@ string(REPLACE "${Q4_ROUTE_ANCHOR}" [=[
             ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
         }
 ]=] VULKAN_SOURCE "${VULKAN_SOURCE}")
+# Build 12 isolated incorrect native Q4 matmul for both N=1 and batched inputs.
+# Force the existing two-stage GPU dequantization + F16/F32 matmul fallback.
+set(Q4_DEQUANT_ANCHOR "    const bool qx_needs_dequant = mmp == nullptr || x_non_contig;")
+string(FIND "${VULKAN_SOURCE}" "${Q4_DEQUANT_ANCHOR}" Q4_DEQUANT_INDEX)
+if(Q4_DEQUANT_INDEX EQUAL -1)
+ message(FATAL_ERROR "Pinned Q4 dequantization selection anchor missing")
+endif()
+string(REPLACE "${Q4_DEQUANT_ANCHOR}" [=[
+    if (ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM &&
+        src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_F32 &&
+        getenv("LIQUID_VK_Q4_DEQUANT_F16") != nullptr) {
+        mmp = nullptr;
+        quantize_y = false;
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            fprintf(stderr, "vulkan_q4_dequant route=q4_to_f16_then_f16_f32_matmul device=qualcomm conversion=gpu\n");
+            fflush(stderr);
+        }
+    }
+    const bool qx_needs_dequant = mmp == nullptr || x_non_contig;
+]=] VULKAN_SOURCE "${VULKAN_SOURCE}")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-android.cpp" "// App-local compiler compatibility and diagnostics.\n${VULKAN_SOURCE}")
 get_target_property(VK_SOURCES ggml-vulkan SOURCES)
 list(FIND VK_SOURCES "ggml-vulkan.cpp" VK_SOURCE_INDEX)

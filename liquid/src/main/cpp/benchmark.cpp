@@ -41,13 +41,14 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_liquidtest_NativeBench
      "GGML_VK_DISABLE_FUSION","GGML_VK_DISABLE_GRAPH_OPTIMIZE"};
    for(const char* flag:flags){setenv(flag,"1",1);fprintf(stderr,"vulkan_compat %s=1\n",flag);}
    setenv("LIQUID_VK_Q4_MATVEC_VIA_MATMUL","1",1);
-   report["q4MatvecWorkaround"]="qualcomm_q4_f32_via_general_gpu_matmul";
+   setenv("LIQUID_VK_Q4_DEQUANT_F16","1",1);
+   report["q4MatvecWorkaround"]="qualcomm_q4_to_f16_then_gpu_matmul";
    params.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_DISABLED;
-   report["vulkanCompatibility"]="adreno-q4-matmul-v2";
+   report["vulkanCompatibility"]="adreno-q4-dequant-f16-v3";
    report["vulkanDisabledFeatures"]=json::array();for(const char* flag:flags)report["vulkanDisabledFeatures"].push_back(flag);
    report["flashAttentionRequested"]="disabled";
    report["pipelineCompilation"]="serialized_with_flushed_trace";
-   fprintf(stderr,"vulkan_compat policy=adreno-q4-matmul-v2 flashAttention=disabled pipelineCompilation=serialized\n");fflush(stderr);
+   fprintf(stderr,"vulkan_compat policy=adreno-q4-dequant-f16-v3 flashAttention=disabled pipelineCompilation=serialized\n");fflush(stderr);
   }
   if(!gpu)setenv("GGML_VK_VISIBLE_DEVICES","",1);
   common_init();ggml_backend_load_all();json devices=json::array();bool foundGpu=false;
