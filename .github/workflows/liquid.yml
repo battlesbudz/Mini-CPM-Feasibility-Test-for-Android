@@ -35,6 +35,10 @@ jobs:
           git clone --depth 1 --branch vulkan-sdk-1.4.328.1 https://github.com/KhronosGroup/Vulkan-Headers.git vendor/Vulkan-Headers
       - name: Fetch pinned native runtime
         run: python3 scripts/prepare_liquid.py
+      - name: Test numerical comparison checks
+        run: |
+          c++ -std=c++17 -Iliquid/src/main/cpp -Ivendor/llama.cpp-liquid/ggml/include -Ivendor/llama.cpp-liquid/vendor liquid/src/test/cpp/correctness_test.cpp -o /tmp/liquid-correctness-test
+          /tmp/liquid-correctness-test
       - name: Test and build
         run: ./gradlew --no-daemon :liquid:testDebugUnitTest :liquid:assembleRelease :liquid:lintRelease
       - name: Preserve test results

@@ -32,7 +32,7 @@ public final class MainActivity extends Activity {
         button(column,"Download voice pack · 1.07 GB",()->new AlertDialog.Builder(this).setTitle("Download model files?").setMessage("Downloads 1.07 GB from Hugging Face. Allow at least 2 GB free storage. Keep this screen open during setup; interrupted downloads can resume. Benchmarking then works offline.").setPositiveButton("Download",(d,w)->install(null)).setNegativeButton("Cancel",null).show());
         button(column,"Import existing model folder",()->startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION),10));
         button(column,"Record a question · 10 seconds",()->{if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED)requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},11);else record();});
-        duration=new Spinner(this);duration.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"CPU · 2 threads","CPU · 4 threads (baseline)","CPU · 6 threads","Vulkan · main model","Vulkan · main + audio"}));column.addView(duration);duration.setSelection(1);
+        duration=new Spinner(this);duration.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"CPU · 2 threads","CPU · 4 threads (baseline)","CPU · 6 threads","Vulkan · main model","Vulkan · main + audio","CPU vs Vulkan · correctness (no speech)"}));column.addView(duration);duration.setSelection(1);
         voice=new Spinner(this);voice.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"Default conversation voice","UK male conversation · experimental","UK male TTS · fixed sample"}));column.addView(voice);
         button(column,"Run selected benchmark",this::startRun);
         Button stop=new Button(this);stop.setText("Stop current operation");column.addView(stop);stop.setOnClickListener(v->{if(task!=null)task.cancel(true);if(workerAlive())startService(new Intent(this,BenchmarkService.class).setAction("STOP"));local="Stop requested.";refresh();});
@@ -70,7 +70,7 @@ public final class MainActivity extends Activity {
         local="Question recorded. The test uses your 10-second question once. Recording stays on this device until deleted.";
     });}
     private void startRun(){
-        try{if(!new ModelStore(this).ready())throw new IOException("Install and verify the complete voice pack first.");if(voice.getSelectedItemPosition()!=2&&!new File(getCacheDir(),"input/question.wav").isFile())throw new IOException("Record a question first.");
+        try{if(duration.getSelectedItemPosition()!=5&&!new ModelStore(this).ready())throw new IOException("Install and verify the complete voice pack first.");if(duration.getSelectedItemPosition()!=5&&voice.getSelectedItemPosition()!=2&&!new File(getCacheDir(),"input/question.wav").isFile())throw new IOException("Record a question first.");
             new File(getFilesDir(),"report.json").delete();new File(getFilesDir(),"status.json").delete();delete(new File(getFilesDir(),"last-run"));
             startForegroundService(new Intent(this,BenchmarkService.class).putExtra("profile",duration.getSelectedItemPosition()).putExtra("voice",voice.getSelectedItemPosition()));local="Starting benchmark worker…";
         }catch(Exception e){local=e.getMessage();Toast.makeText(this,local,Toast.LENGTH_LONG).show();}refresh();

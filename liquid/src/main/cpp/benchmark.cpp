@@ -10,6 +10,7 @@
 #include "common.h"
 #include "nlohmann/json.hpp"
 #include "utf8_snapshot.h"
+#include "correctness.h"
 using Clock=std::chrono::steady_clock;
 using json=nlohmann::ordered_json;
 static double ms(Clock::time_point a){return std::chrono::duration<double,std::milli>(Clock::now()-a).count();}
@@ -53,6 +54,12 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_liquidtest_NativeBench
   for(size_t i=0;i<ggml_backend_dev_count();i++){auto dev=ggml_backend_dev_get(i);auto type=ggml_backend_dev_type(dev);bool isGpu=type==GGML_BACKEND_DEVICE_TYPE_GPU||type==GGML_BACKEND_DEVICE_TYPE_IGPU;foundGpu|=isGpu;devices.push_back({{"name",ggml_backend_dev_name(dev)},{"description",ggml_backend_dev_description(dev)},{"gpu",isGpu},{"integrated",type==GGML_BACKEND_DEVICE_TYPE_IGPU},{"deviceType",int(type)}});}
   report["availableDevices"]=devices;report["offloadEvidence"]="Inspect native log for actual layer and buffer placement; GPU discovery alone is not proof";
   if(gpu&&!foundGpu)throw std::runtime_error("Vulkan GPU unavailable; no CPU fallback benchmark recorded");
+  if(profile==5){
+   auto save=[&](){auto path=output+"/partial.json";{std::ofstream f(path+".tmp");f<<report.dump(2,' ',true,json::error_handler_t::replace);}std::rename((path+".tmp").c_str(),path.c_str());};
+   liquid_check::run(report,emit,save);
+   std::ofstream(output+"/native_report.json")<<report.dump(2,' ',true,json::error_handler_t::replace);
+   return env->NewStringUTF(report.dump(-1,' ',true,json::error_handler_t::replace).c_str());
+  }
   liquid::audio::Runner runner;
   emit("Loading selected Liquid Q4 hardware configuration");auto began=Clock::now();
   if(runner.init(params)!=0)throw std::runtime_error("Liquid initialization failed; see native log");

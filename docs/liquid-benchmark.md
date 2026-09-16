@@ -114,3 +114,25 @@ invalid encodings, and embedded NULs. No GPU arithmetic changes in this build.
 The partial output " circrose" does not establish correct GPU inference. This
 build removes the reporting failure so output can be reviewed; it does not certify
 GPU correctness, speed, voice identity, or live duplex operation.
+
+### Build 12: CPU/Vulkan correctness isolation
+Select **CPU vs Vulkan · correctness (no speech)**, then Run selected benchmark.
+No recording or model pack is required. Voice selection is ignored. Copy diagnostics
+when complete; if the worker crashes, also export its native crash trace.
+
+This runs 18 deterministic contiguous matrix multiplication cases: F32, F16,
+Q4_0 weights; K=256/2048, M=64, N=1/16/126. Both backends receive identical encoded
+weights and F32 inputs. A scalar double-accumulation reference uses the decoded
+weights (so Q4 quantization itself is not counted as GPU error). Each case reports
+CPU/reference, GPU/reference, GPU/CPU relative L2, maximum absolute error,
+nonfinite counts and initial output values. Tolerances are 2% relative L2 and
+0.02 + 2% of reference maximum for absolute error; these are diagnostic thresholds,
+not a guarantee of model-level accuracy. CPU quantized dot products can themselves
+introduce approximation, which is why the scalar reference is included.
+
+Both backends execute directly, without scheduler CPU fallback. Vulkan retains
+Build 10 compatibility settings and Q4 dispatch workaround. Completed cases and
+the active case/backend are persisted in partial.json before each backend call.
+CORRECTNESS_PASS only validates these operations/shapes. Recurrent state,
+attention, noncontiguous tensors, complete model logits and audio still require
+further isolation if this suite passes. No thermal blocker was introduced.
