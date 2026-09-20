@@ -4,3 +4,5 @@ rootProject.name = "Mini CPM Feasibility Test for Android"
 include(":app")
 
 include(":liquid")
+
+include(":moshi")

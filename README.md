@@ -64,3 +64,7 @@ Run the 60-second smoke test first. Existing downloaded models are reused. Memor
 ## Liquid voice benchmark
 
 The separate `liquid` app benchmarks the smaller LFM2.5-Audio-1.5B Q4 voice stack. See [setup and test scope](docs/liquid-benchmark.md). MiniCPM results and releases remain available.
+
+## Moshi voice experiment
+
+The separate `moshi` module adds a first CPU/Vulkan Android test of Moshi speech-to-speech inference. See [Moshi setup, test sequence and limitations](docs/moshi-benchmark.md). It installs alongside the existing benchmark apps.

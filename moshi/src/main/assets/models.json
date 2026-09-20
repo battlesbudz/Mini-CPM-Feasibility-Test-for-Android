@@ -1,0 +1,28 @@
+{
+  "files": [
+    {
+      "path": "model-q4_k.gguf",
+      "size": 4325341344,
+      "sha256": "db334ee3b86136fadc05bdce4ff9f956d7b819f74b7920e34dbcdd2334c95248",
+      "repository": "Codes4Fun/moshika-q4_k-GGUF",
+      "revision": "ef0b8d55ea51706e5285fded849218f81ff637dc",
+      "codecOnly": false
+    },
+    {
+      "path": "mimi-e351c8d8-125.gguf",
+      "size": 347236032,
+      "sha256": "7e0c9ced83cbd035f70b82f1c5602673083fcccec006ea29f48d2e32c60ec697",
+      "repository": "Codes4Fun/moshi-common",
+      "revision": "a39d64307b971321140a67dc1bc4a8b0e43e4e6b",
+      "codecOnly": true
+    },
+    {
+      "path": "tokenizer_spm_32k_3.model",
+      "size": 552778,
+      "sha256": "78d4336533ddc26f9acf7250d7fb83492152196c6ea4212c841df76933f18d2d",
+      "repository": "Codes4Fun/moshi-common",
+      "revision": "a39d64307b971321140a67dc1bc4a8b0e43e4e6b",
+      "codecOnly": false
+    }
+  ]
+}
