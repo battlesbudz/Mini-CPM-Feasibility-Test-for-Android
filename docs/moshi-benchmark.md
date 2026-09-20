@@ -81,3 +81,44 @@ This test exercises 20 tone/silence frames, validates token ranges and finite no
 - Verified during development: Android ARM64 native compilation and host CPU Mimi encode/decode/reset smoke test with the pinned codec checksum.
 - Pending device evidence: APK installation on Fold6; codec CPU/Vulkan output; full model load; coherent full replay; actual memory and throughput.
 - Later gates: deterministic official-reference parity, sustained ten-minute inference, OpenCL comparison if justified, then live duplex and echo-control integration.
+
+## Build 3: first-frame tensor tracing
+
+Build 2 on SM-F956U completed all four routes. The CPU PCM matched build 1 byte
+for byte. All 1,000 GPU encoder tokens differed from CPU; each GPU codebook
+repeated one token across all 125 frames. GPU decoding collapsed with either
+CPU or GPU tokens. This establishes separate encoder and decoder path failures,
+not a particular faulty kernel.
+
+Select **5. Trace CPU/GPU operations · first frame** (the new default). Keep the
+existing verified Mimi model and recording. The backend selection is automatic.
+The test runs a normal CPU reference, a normal Vulkan reference, then a fresh
+Vulkan codec with verified uploads and operation-by-operation CPU comparison.
+Only the first 80 ms frame is used because the failure already appears there.
+Decoder tests always consume identical CPU tokens. Allow a few minutes and export
+the diagnostic ZIP. There is no new model download and no playable full response
+from this diagnostic mode.
+
+Exported `tensor-trace.jsonl` records each operation before execution, then its
+shape, strides, type, sampled CPU/tested RMS, error and nonfinite counts. It also
+records pre-dispatch input comparisons for the first divergent operation in each
+stage, including initialization. `tensor-summary.json` contains first divergences
+by stage, byte-for-byte upload verification counts, token agreement and normal vs
+traced output metrics. `trace-tokens.csv` contains all eight first-frame tokens.
+
+The trace wraps the existing GGML graph-copy API, executes matching one-node graph
+views on CPU and Vulkan, and checks compute statuses. Complete explicit uploads
+(weights, inputs, state writes and cross-backend copies) are read back in 1 MiB
+chunks and compared byte-for-byte. Numerical comparison samples at most 4,096
+logical elements per tensor with stride-aware F32/F16/BF16/I32 decoding, absolute
+tolerance 1e-4 plus relative tolerance 1e-3, and an explicit skip for tensors over
+64 MiB or other types. Execution is capped at 64 graphs / 20,000 nodes in addition
+to the service watchdog. Regular replay modes use the unchanged whole-graph path.
+
+Interpretation: each CPU graph clone starts from the tested graph's current data.
+Earlier state divergence can therefore carry into both copies; examine the earliest
+initialization/encoder/decoder difference and upload checks. Splitting graphs also
+changes GPU fusion/synchronization. A difference that disappears under tracing is
+useful evidence of that sensitivity, not proof of correctness. Sampling and numeric
+tolerances identify candidate operations; this is not official-runtime parity or a
+throughput benchmark. No GPU kernel fix is claimed in build 3.

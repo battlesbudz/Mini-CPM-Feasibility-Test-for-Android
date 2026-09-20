@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <functional>
 #include "audio_metrics.h"
+#include "tensor_trace.h"
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -112,6 +113,7 @@ struct Stats {
     }
 };
 #include "codec_comparison.h"
+#include "codec_trace.h"
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -120,7 +122,7 @@ Java_com_battlesbudz_moshitest_NativeBench_run(JNIEnv* env, jclass, jstring mode
     Stats stats; auto started=Clock::now(); double replayWall=0;
     try {
         const std::string root=utf(env,modelsArg), inputPath=utf(env,inputArg), outDir=utf(env,outputArg);
-        if(mode<0 || mode>3 || backend<0 || backend>2 || (context!=750 && context!=1000 && context!=3000))
+        if(mode<0 || mode>4 || backend<0 || backend>2 || (context!=750 && context!=1000 && context!=3000))
             throw std::runtime_error("Invalid benchmark configuration");
         if(!freopen((outDir+"/native.log").c_str(),"w",stderr)) throw std::runtime_error("Cannot open native log");
         setvbuf(stderr,nullptr,_IONBF,0);
@@ -135,6 +137,7 @@ Java_com_battlesbudz_moshitest_NativeBench_run(JNIEnv* env, jclass, jstring mode
         };
         std::vector<float> input;
         if(mode!=1) input=readInput(inputPath);
+        if(mode==4) return javaString(env,traceCodec(root,input,outDir,event));
         if(mode==3) return javaString(env,compareCodec(root,input,outDir,event));
         if(!input.empty()){double energy=0;for(float x:input)energy+=double(x)*x;stats.inputRms=std::sqrt(energy/input.size());}
         event("Initializing selected backend");

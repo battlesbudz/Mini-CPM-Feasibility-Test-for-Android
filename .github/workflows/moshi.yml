@@ -30,6 +30,11 @@ jobs:
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror -Imoshi/src/main/cpp moshi/src/test/cpp/audio_metrics_test.cpp -o /tmp/moshi-metrics-test
           /tmp/moshi-metrics-test
+      - name: Check tensor sampling and difference detection
+        run: |
+          cmake -S moshi/src/main/cpp -B /tmp/moshi-host-tests -DMOSHI_HOST_SMOKE=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/moshi-host-tests --target moshi_trace_test -j4
+          /tmp/moshi-host-tests/moshi_trace_test
       - name: Build and lint release
         run: ./gradlew --no-daemon :moshi:assembleRelease :moshi:lintRelease
       - name: Upload release APK

@@ -68,6 +68,13 @@ def main():
     }
 
     ggml_tensor * fill( NE ne, float value )''')
+    # Opt-in tracing is implemented in the app; normal runs retain whole-graph execution.
+    for source in ("context.h", "loader.h", "torch.h", "moshi/models/compression.h", "moshi/models/tts.h", "replay_ops.h"):
+        path = adapted / "src" / source
+        text = '#include "tensor_trace.h"\n' + path.read_text().replace("ggml_backend_tensor_set(", "moshi_trace_tensor_set(")
+        if source == "context.h":
+            text = text.replace("ggml_backend_graph_compute(backend, gf)", "moshi_trace_compute(backend, gf)")
+        path.write_text(text)
     assets = ROOT / "moshi/src/main/assets"
     for name in PINS:
         license_file = VENDOR / name / "LICENSE"

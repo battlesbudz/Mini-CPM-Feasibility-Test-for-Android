@@ -1,5 +1,8 @@
 // Exercise actual codec state, encoding and decoding with the pinned Mimi weights.
 #include <moshi/moshi.h>
+#include "tensor_trace.h"
+#include <filesystem>
+#include <unistd.h>
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
@@ -11,12 +14,20 @@ int main(int argc,char** argv) {
     ggml_backend_cpu_set_n_threads(backend,4);
     try {
         unref_ptr<moshi_context_t> context=moshi_alloc(backend,backend);
+        std::string initPath="/tmp/moshi-trace-init-"+std::to_string(getpid());
+        std::filesystem::create_directories(initPath);
+        auto initTrace=std::make_unique<TensorTrace>(initPath,backend,backend,[](const std::string&){});
+        initTrace->stage("CPU initialization self comparison");
         unref_ptr<mimi_codec_t> codec=mimi_alloc(context,argv[1],8);
         if(mimi_frame_size(codec)!=1920) throw std::runtime_error("frame size");
         unref_ptr<mimi_encode_context_t> encoder=mimi_encode_alloc_context(codec);
         unref_ptr<mimi_decode_context_t> decoder=mimi_decode_alloc_context(codec);
         unref_ptr<mimi_encode_context_t> secondEncoder=mimi_encode_alloc_context(codec);
         unref_ptr<mimi_decode_context_t> secondDecoder=mimi_decode_alloc_context(codec);
+        auto initSummary=initTrace->summary();
+        if(initSummary.find("\"differentNodes\":0")==std::string::npos||initSummary.find("\"skippedComparisons\":0")==std::string::npos)
+            throw std::runtime_error("CPU initialization self comparison failed: "+initSummary);
+        printf("INIT TRACE %s\n",initSummary.c_str());initTrace.reset();
         std::vector<float> input(1920),output(1920);
         std::vector<float> secondOutput(1920);
         std::vector<int16_t> tokens(8);
@@ -25,11 +36,24 @@ int main(int argc,char** argv) {
         for(int frame=0;frame<20;++frame) {
             for(int i=0;i<1920;++i) input[i]=frame<10?0.1f*std::sin(2*3.141592653589793*440*(frame*1920+i)/24000):0.f;
             mimi_encode_send(encoder,input.data());mimi_encode_receive(encoder,tokens.data());
+            std::unique_ptr<TensorTrace> trace;
+            if(frame==0){
+                std::string path="/tmp/moshi-trace-smoke-"+std::to_string(getpid());
+                std::filesystem::create_directories(path);
+                trace=std::make_unique<TensorTrace>(path,backend,backend,[](const std::string&){});
+                trace->stage("CPU encoder self comparison");
+            }
             mimi_encode_send(secondEncoder,input.data());mimi_encode_receive(secondEncoder,secondTokens.data());
             if(tokens!=secondTokens) throw std::runtime_error("independent encoder histories differ");
             for(auto t:tokens) if(t<0||t>=2048) throw std::runtime_error("invalid token");
             mimi_decode_send(decoder,tokens.data());mimi_decode_receive(decoder,output.data());
             mimi_decode_send(secondDecoder,secondTokens.data());mimi_decode_receive(secondDecoder,secondOutput.data());
+            if(trace){
+                auto summary=trace->summary();
+                if(summary.find("\"differentNodes\":0")==std::string::npos||summary.find("\"skippedComparisons\":0")==std::string::npos)
+                    throw std::runtime_error("CPU tensor self comparison differs or skipped tensors: "+summary);
+                printf("TRACE %s\n",summary.c_str());trace.reset();
+            }
             if(output!=secondOutput) throw std::runtime_error("independent decoder histories differ");
             for(float x:output) {if(!std::isfinite(x)) throw std::runtime_error("nonfinite audio");energy+=x*x;}
         }
