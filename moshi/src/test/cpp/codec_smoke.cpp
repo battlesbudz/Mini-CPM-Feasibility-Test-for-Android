@@ -36,6 +36,7 @@ int main(int argc,char** argv) {
         for(int frame=0;frame<20;++frame) {
             for(int i=0;i<1920;++i) input[i]=frame<10?0.1f*std::sin(2*3.141592653589793*440*(frame*1920+i)/24000):0.f;
             mimi_encode_send(encoder,input.data());mimi_encode_receive(encoder,tokens.data());
+            mimi_decode_send(decoder,tokens.data());mimi_decode_receive(decoder,output.data());
             std::unique_ptr<TensorTrace> trace;
             if(frame==0){
                 std::string path="/tmp/moshi-trace-smoke-"+std::to_string(getpid());
@@ -46,7 +47,6 @@ int main(int argc,char** argv) {
             mimi_encode_send(secondEncoder,input.data());mimi_encode_receive(secondEncoder,secondTokens.data());
             if(tokens!=secondTokens) throw std::runtime_error("independent encoder histories differ");
             for(auto t:tokens) if(t<0||t>=2048) throw std::runtime_error("invalid token");
-            mimi_decode_send(decoder,tokens.data());mimi_decode_receive(decoder,output.data());
             mimi_decode_send(secondDecoder,secondTokens.data());mimi_decode_receive(secondDecoder,secondOutput.data());
             if(trace){
                 auto summary=trace->summary();
