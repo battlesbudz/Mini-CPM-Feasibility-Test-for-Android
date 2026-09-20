@@ -4,6 +4,20 @@ Separate application ID: `com.battlesbudz.moshitest`. Installs alongside Jarvis,
 
 ## First phone test
 
+### Build 2: isolate the observed Vulkan audio failure
+
+Install build 2 over build 1 to retain the downloaded codec and recording. Select **4. Compare CPU/GPU codec · all four routes** and run once; it ignores the backend selector and performs the complete comparison automatically. It needs only the existing 347 MB Mimi file, not the full model. Allow a few minutes, then export one ZIP. Four playback buttons select the reference and each comparison recording.
+
+The run encodes identical PCM on CPU and GPU, then decodes both token streams on both backends using four independent decoder states. `tokens.csv` contains each codebook's CPU/GPU tokens. `comparison.json` includes token agreement, first disagreement, per-codebook mismatches, waveform normalized RMSE, signal-level ratios, correlation, clipping counts and component timing. `comparison-frames.csv` records component timings for each frame.
+
+For **CPU encoder → GPU decoder**, the tokens are exactly those used by the CPU reference; waveform divergence therefore isolates a decoder/backend problem independently of GPU encoding. **GPU encoder → CPU decoder** shows how GPU token differences affect CPU reconstruction. Token differences alone can result from rounding and are not automatically labeled an encoding bug. A waveform NRMSE over 0.1 is flagged for investigation; it is a diagnostic threshold, not an official model tolerance. A reference RMS below 0.01 is reported as inconclusive. These four-route timings must not be treated as single-pipeline throughput.
+
+Codec replay now reports `AUDIO_LEVEL_FAILURE` if a non-quiet input produces output more than 100 times quieter. Full-model near-silence is labeled `QUIET_OUTPUT_REVIEW`, since a conversational model can legitimately choose silence. The comparison saves its final status to both its report and partial checkpoint.
+
+Observed build-1 Fold6 evidence: identical ten-second input; CPU 6.06 fps and RMS 0.182, Vulkan 4.15 fps and RMS 0.000117, with normal reported thermal status. Build 2 instruments this unresolved issue; it does not claim to fix the GPU kernels.
+
+### Original smoke tests
+
 1. Install the Moshi APK and choose **Download Mimi codec only · 347 MB**. Keep the screen open during setup. Downloads resume and are verified by SHA-256.
 2. Record a ten-second question. Choose **CPU · 4 threads** and **1. Mimi codec replay**, then run it. Play the output: this test reconstructs your recording; it does not answer the question.
 3. Export the diagnostics/audio ZIP. Optionally repeat codec replay with **Vulkan model + codec** to test the GPU codec path. The middle backend option keeps the codec on CPU.

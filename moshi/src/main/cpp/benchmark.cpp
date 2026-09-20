@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include <functional>
+#include "audio_metrics.h"
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -79,7 +81,7 @@ struct Backends {
 };
 struct Stats {
     std::vector<double> frames;
-    double encode=0, model=0, decode=0, load=0, firstPcm=-1, sumSquares=0;
+    double encode=0, model=0, decode=0, load=0, firstPcm=-1, sumSquares=0, inputRms=0;
     int outputFrames=0, slowFrames=0; int64_t samples=0;
     std::string text, backendName, codecBackendName, error;
     double percentile(double q) const {
@@ -95,6 +97,7 @@ struct Stats {
             << ",\"contextFrames\":" << context << ",\"sampleRate\":24000,\"frameSamples\":1920"
             << ",\"inputFrames\":" << frames.size() << ",\"outputFrames\":" << outputFrames
             << ",\"audioSamples\":" << samples << ",\"audioRms\":" << (samples?std::sqrt(sumSquares/samples):0)
+            << ",\"inputRms\":" << inputRms
             << ",\"loadMs\":" << load << ",\"firstPcmMs\":" << firstPcm
             << ",\"processingMs\":" << total << ",\"replayWallMs\":" << wall
             << ",\"processingFps\":" << (total>0?frames.size()*1000.0/total:0)
@@ -108,6 +111,7 @@ struct Stats {
         out << "}"; return out.str();
     }
 };
+#include "codec_comparison.h"
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -116,7 +120,7 @@ Java_com_battlesbudz_moshitest_NativeBench_run(JNIEnv* env, jclass, jstring mode
     Stats stats; auto started=Clock::now(); double replayWall=0;
     try {
         const std::string root=utf(env,modelsArg), inputPath=utf(env,inputArg), outDir=utf(env,outputArg);
-        if(mode<0 || mode>2 || backend<0 || backend>2 || (context!=750 && context!=1000 && context!=3000))
+        if(mode<0 || mode>3 || backend<0 || backend>2 || (context!=750 && context!=1000 && context!=3000))
             throw std::runtime_error("Invalid benchmark configuration");
         if(!freopen((outDir+"/native.log").c_str(),"w",stderr)) throw std::runtime_error("Cannot open native log");
         setvbuf(stderr,nullptr,_IONBF,0);
@@ -131,6 +135,8 @@ Java_com_battlesbudz_moshitest_NativeBench_run(JNIEnv* env, jclass, jstring mode
         };
         std::vector<float> input;
         if(mode!=1) input=readInput(inputPath);
+        if(mode==3) return javaString(env,compareCodec(root,input,outDir,event));
+        if(!input.empty()){double energy=0;for(float x:input)energy+=double(x)*x;stats.inputRms=std::sqrt(energy/input.size());}
         event("Initializing selected backend");
         Backends devices;
         devices.cpu=ggml_backend_cpu_init();
@@ -234,5 +240,15 @@ Java_com_battlesbudz_moshitest_NativeBench_run(JNIEnv* env, jclass, jstring mode
         event("Replay complete; releasing model state");
     } catch(const std::exception& error) { stats.error=error.what(); }
     catch(...) { stats.error="Unknown native exception"; }
-    return javaString(env,stats.json(mode,context,replayWall,stats.error.empty()?"REPLAY_COMPLETE":"ERROR"));
+    std::string status=stats.error.empty()?"REPLAY_COMPLETE":"ERROR";
+    if(stats.error.empty() && stats.samples>0) {
+        double rms=std::sqrt(stats.sumSquares/stats.samples);
+        if(mode==0 && codecLevelFailure(stats.inputRms,rms)) {
+            status="AUDIO_LEVEL_FAILURE";
+            stats.error="Codec output is over 100 times quieter than the non-quiet input; inspect CPU/GPU comparison";
+        } else if(mode==2 && rms<0.001) {
+            status="QUIET_OUTPUT_REVIEW";
+        }
+    }
+    return javaString(env,stats.json(mode,context,replayWall,status));
 }

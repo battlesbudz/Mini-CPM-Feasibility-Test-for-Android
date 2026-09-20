@@ -40,9 +40,9 @@ public final class BenchmarkService extends Service {
         heartbeat=SystemClock.elapsedRealtime();
         int profile=intent==null?1:intent.getIntExtra("profile",1);
         int voice=intent==null?0:intent.getIntExtra("voice",0);
-        if(profile<0||profile>2)profile=1;if(voice<0||voice>2)voice=0;
+        if(profile<0||profile>2)profile=1;if(voice<0||voice>3)voice=0;
         run=new File(getFilesDir(),"last-run");run.mkdirs();state=new JSONObject();
-        try{state.put("startedAtMs",System.currentTimeMillis()).put("profile","moshi-replay-v1").put("contextFrames",750).put("build",BuildConfig.VERSION_NAME).put("sourceCommit",BuildConfig.SOURCE_COMMIT).put("device",Build.MANUFACTURER+" "+Build.MODEL).put("sdk",Build.VERSION.SDK_INT);}catch(Exception ignored){}
+        try{state.put("startedAtMs",System.currentTimeMillis()).put("profile","moshi-replay-v2").put("contextFrames",750).put("build",BuildConfig.VERSION_NAME).put("sourceCommit",BuildConfig.SOURCE_COMMIT).put("device",Build.MANUFACTURER+" "+Build.MODEL).put("sdk",Build.VERSION.SDK_INT);}catch(Exception ignored){}
         state("Starting","RUNNING");
         try{state.put("profileIndex",profile).put("voiceIndex",voice).put("initialThermalStatus",pm.getCurrentThermalStatus());}catch(Exception ignored){}
         state("Starting selected configuration","RUNNING");
@@ -70,7 +70,7 @@ public final class BenchmarkService extends Service {
     }
     private void execute(int profile,int voice){
         try{
-            ModelStore models=new ModelStore(this,voice==0);if(!models.ready())throw new IOException("Required model pack is not verified");
+            ModelStore models=new ModelStore(this,voice==0||voice==3);if(!models.ready())throw new IOException("Required model pack is not verified");
             File input=new File(getCacheDir(),"input/question.wav");
             if(voice!=1&&!input.isFile())throw new IOException("Record a test question first");
             try(InputStream asset=getAssets().open("config.json")){Files.copy(asset,new File(models.root,"config.json").toPath(),StandardCopyOption.REPLACE_EXISTING);}
