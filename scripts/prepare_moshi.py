@@ -34,7 +34,7 @@ def main():
         shutil.rmtree(ggml_adapted)
     shutil.copytree(VENDOR / "ggml-moshi", ggml_adapted, ignore=shutil.ignore_patterns(".git"))
     shader = ggml_adapted / "src/ggml-vulkan/vulkan-shaders/im2col.comp"
-    shutil.copyfile(ROOT / "moshi/src/main/shaders/im2col.comp", shader)
+    shutil.copyfile(ROOT / "moshi/src/main/cpp/shaders/im2col.comp", shader)
     backend = ggml_adapted / "src/ggml-vulkan/ggml-vulkan.cpp"
     # IM2COL 1D/2D alone uses descriptor writes with fixed 64-thread dispatch.
     # Leave IM2COL_3D and all unrelated BDA pipelines untouched.
