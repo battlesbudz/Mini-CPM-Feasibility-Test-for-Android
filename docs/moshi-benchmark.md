@@ -124,7 +124,7 @@ tolerances identify candidate operations; this is not official-runtime parity or
 throughput benchmark. No GPU kernel fix is claimed in build 3.
 
 
-## Build 5: portable IM2COL correction and device correctness gate
+## Build 5 onward: portable IM2COL correction and device correctness gate
 
 Build 4 on SM-F956U verified all 356,462,404 uploaded bytes with zero mismatches.
 Encoder node 3 (IM2COL, F16 [7,1920,1,1]) diverged despite exact inputs. Decoder
