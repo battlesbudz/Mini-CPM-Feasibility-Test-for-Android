@@ -11,6 +11,7 @@ std::string traceCodec(const std::string& root,const std::vector<float>& input,c
         ggml_backend_cpu_set_n_threads(backends.cpu,4);
         if(ggml_backend_vk_get_device_count()==0)throw std::runtime_error("Vulkan unavailable");
         backends.gpu=ggml_backend_vk_init(0);if(!backends.gpu)throw std::runtime_error("Vulkan unavailable");
+        checkGpuIm2col(backends.gpu,outDir,event);
         auto pass=[&](ggml_backend_t backend,std::vector<int16_t>& tokens,std::vector<float>& pcm,TensorTrace* trace){
             unref_ptr<moshi_context_t> context=moshi_alloc(backend,backends.cpu);
             if(trace)trace->stage("weights");

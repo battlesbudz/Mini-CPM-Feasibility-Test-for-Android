@@ -16,6 +16,7 @@
 #include <functional>
 #include "audio_metrics.h"
 #include "tensor_trace.h"
+#include "im2col_check.h"
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -112,6 +113,29 @@ struct Stats {
         out << "}"; return out.str();
     }
 };
+// Persist before each dispatch so a native/driver crash identifies the failing case.
+void checkGpuIm2col(ggml_backend_t gpu,const std::string& outDir,
+    const std::function<void(const std::string&)>& event) {
+    event("Checking GPU convolution correctness before loading models");
+    const auto start=Clock::now();
+    std::ofstream log(outDir+"/im2col-check.jsonl");
+    if(!log)throw std::runtime_error("Cannot write IM2COL diagnostics");
+    auto report=[&](const std::string& message){
+        log<<"{\"message\":"<<quoted(message)<<"}\n";log.flush();
+        if(!log)throw std::runtime_error("Cannot persist IM2COL diagnostics");
+    };
+    const std::string path=outDir+"/im2col-summary.json";
+    save(path,"{\"status\":\"RUNNING\",\"implementation\":\"descriptor_scalar_64_v1\"}");
+    try {
+        uint64_t count=moshi_im2col::check(gpu,report);
+        save(path,"{\"status\":\"PASS\",\"implementation\":\"descriptor_scalar_64_v1\",\"cases\":16,\"dispatches\":32,\"checkedElements\":"+
+            std::to_string(count)+",\"elapsedMs\":"+std::to_string(elapsed(start))+"}");
+        event("GPU convolution check passed; loading models");
+    }catch(const std::exception& e){
+        save(path,"{\"status\":\"FAIL\",\"error\":"+quoted(e.what())+"}");
+        throw;
+    }
+}
 #include "codec_comparison.h"
 #include "codec_trace.h"
 }
@@ -152,6 +176,7 @@ Java_com_battlesbudz_moshitest_NativeBench_run(JNIEnv* env, jclass, jstring mode
             char description[256]{};
             ggml_backend_vk_get_device_description(0,description,sizeof(description));
             event(std::string("Vulkan device: ")+description);
+            checkGpuIm2col(devices.gpu,outDir,event);
         }
         auto modelBackend=backend==0?devices.cpu:devices.gpu;
         auto codecBackend=backend==2?devices.gpu:devices.cpu;

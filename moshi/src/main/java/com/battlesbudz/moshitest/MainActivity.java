@@ -36,7 +36,7 @@ public final class MainActivity extends Activity {
         button(column,"Record a question · 10 seconds",()->{if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED)requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},11);else record();});
         duration=new Spinner(this);duration.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"CPU · 4 threads","Vulkan model · CPU codec","Vulkan model + codec"}));column.addView(duration);duration.setSelection(0);
         voice=new Spinner(this);voice.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"1. Mimi codec replay · 10 sec","2. Moshi load-only · 750-frame context","3. Moshi voice replay · 20 sec","4. Compare CPU/GPU codec · all four routes","5. Trace CPU/GPU operations · first frame"}));column.addView(voice);
-        voice.setSelection(4);
+        voice.setSelection(3);
         voice.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener(){
             public void onItemSelected(android.widget.AdapterView<?> p,android.view.View v,int position,long id){refresh();}
             public void onNothingSelected(android.widget.AdapterView<?> p){}

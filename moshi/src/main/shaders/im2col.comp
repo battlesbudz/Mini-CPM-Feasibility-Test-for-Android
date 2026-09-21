@@ -1,0 +1,49 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+#include "rte.glsl"
+#include "types.glsl"
+
+layout (push_constant) uniform parameter
+{
+    BDA_STORAGE_T dst_addr;
+    uint batch_offset; uint offset_delta;
+    uint IC;
+    uint IW; uint IH;
+    uint OW; uint OH;
+    uint KW; uint KH;
+    uint pelements;
+    uint CHW;
+    int s0; int s1;
+    int p0; int p1;
+    int d0; int d1;
+} p;
+
+// Portable path: one output per invocation, no specialization-sized local arrays,
+// unrolled scatter or physical storage buffer addresses. Host dispatch divides by 64.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer X { A_TYPE data_a[]; };
+layout(binding = 1) writeonly buffer D { D_TYPE data_d[]; };
+
+void main() {
+    const uint linear = gl_GlobalInvocationID.x;
+    if (linear >= p.pelements) return;
+    const uint oh = gl_GlobalInvocationID.y;
+    const uint batch = gl_GlobalInvocationID.z / p.IC;
+    const uint ic = gl_GlobalInvocationID.z % p.IC;
+    const uint kx = linear / (p.OW * p.KH);
+    const uint rem = linear % (p.OW * p.KH);
+    const uint ky = rem / p.OW;
+    const uint ix = rem % p.OW;
+    const int x = int(ix) * p.s0 + int(kx) * p.d0 - p.p0;
+    const int y = int(oh) * p.s1 + int(ky) * p.d1 - p.p1;
+    A_TYPE value = A_TYPE(0);
+    if (x >= 0 && x < int(p.IW) && y >= 0 && y < int(p.IH)) {
+        value = data_a[batch * p.batch_offset + ic * p.offset_delta + uint(y) * p.IW + uint(x)];
+    }
+    const uint dst = ((batch * p.OH + oh) * p.OW + ix) * p.CHW
+                   + ic * p.KW * p.KH + ky * p.KW + kx;
+    data_d[dst] = D_TYPE(value);
+}

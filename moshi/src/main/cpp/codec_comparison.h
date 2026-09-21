@@ -59,6 +59,7 @@ std::string compareCodec(const std::string& root, const std::vector<float>& inpu
         event("Comparison: initializing Vulkan");
         if(ggml_backend_vk_get_device_count()==0) throw std::runtime_error("Vulkan unavailable");
         backends.gpu=ggml_backend_vk_init(0);if(!backends.gpu) throw std::runtime_error("Vulkan initialization failed");
+        checkGpuIm2col(backends.gpu,outDir,event);
         char description[256]{};ggml_backend_vk_get_device_description(0,description,sizeof(description));device=description;
         event("Comparison: loading two Mimi codec instances");
         unref_ptr<moshi_context_t> cpuContext=moshi_alloc(backends.cpu,backends.cpu);

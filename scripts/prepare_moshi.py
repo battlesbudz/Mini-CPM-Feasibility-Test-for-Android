@@ -28,6 +28,25 @@ def main():
         if subprocess.check_output(["git", "-C", str(dest), "status", "--porcelain"]):
             raise RuntimeError(f"Refusing to overwrite changes in {dest}")
         subprocess.run(["git", "-C", str(dest), "checkout", "--detach", pin], check=True)
+    # Keep upstream checkout pristine; all backend fixes are reproducible overlays.
+    ggml_adapted = VENDOR / "ggml-moshi-android"
+    if ggml_adapted.exists():
+        shutil.rmtree(ggml_adapted)
+    shutil.copytree(VENDOR / "ggml-moshi", ggml_adapted, ignore=shutil.ignore_patterns(".git"))
+    shader = ggml_adapted / "src/ggml-vulkan/vulkan-shaders/im2col.comp"
+    shutil.copyfile(ROOT / "moshi/src/main/shaders/im2col.comp", shader)
+    backend = ggml_adapted / "src/ggml-vulkan/ggml-vulkan.cpp"
+    # IM2COL 1D/2D alone uses descriptor writes with fixed 64-thread dispatch.
+    # Leave IM2COL_3D and all unrelated BDA pipelines untouched.
+    for variant in ("im2col_f32", "im2col_f32_f16_rte", "im2col_f32_f16"):
+        checked_replace(backend, variant + " ## bda ## _len", variant + "_len")
+        checked_replace(backend, variant + " ## bda ## _data", variant + "_data")
+    checked_replace(backend,
+        "sizeof(vk_op_im2col_push_constants), {512, 1, 1}, { device->subgroup_size }",
+        "sizeof(vk_op_im2col_push_constants), {64, 1, 1}, {}", 3)
+    checked_replace(backend,
+        "if (ctx->device->shader_int64 && ctx->device->buffer_device_address) {\n            // buffer device address path doesn't use dst buffer",
+        "if (op == GGML_OP_IM2COL_3D && ctx->device->shader_int64 && ctx->device->buffer_device_address) {\n            // Only 3D still uses buffer device addresses; 1D/2D needs the full descriptor range.")
     adapted = VENDOR / "moshi-android-src"
     if adapted.exists():
         shutil.rmtree(adapted)

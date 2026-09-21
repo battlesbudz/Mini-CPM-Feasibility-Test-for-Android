@@ -33,8 +33,21 @@ jobs:
       - name: Check tensor sampling and difference detection
         run: |
           cmake -S moshi/src/main/cpp -B /tmp/moshi-host-tests -DMOSHI_HOST_SMOKE=ON -DCMAKE_BUILD_TYPE=Release
-          cmake --build /tmp/moshi-host-tests --target moshi_trace_test -j4
+          cmake --build /tmp/moshi-host-tests --target moshi_trace_test moshi_im2col_test moshi_codec_smoke -j4
           /tmp/moshi-host-tests/moshi_trace_test
+          /tmp/moshi-host-tests/moshi_im2col_test | tee /tmp/moshi-cpu-im2col.txt
+      - name: Check actual Mimi CPU codec regression
+        run: |
+          curl --fail --location --retry 3 'https://huggingface.co/Codes4Fun/moshi-common/resolve/a39d64307b971321140a67dc1bc4a8b0e43e4e6b/mimi-e351c8d8-125.gguf' -o /tmp/mimi.gguf
+          echo '7e0c9ced83cbd035f70b82f1c5602673083fcccec006ea29f48d2e32c60ec697 /tmp/mimi.gguf' | sha256sum --check
+          /tmp/moshi-host-tests/moshi_codec_smoke /tmp/mimi.gguf | tee /tmp/moshi-cpu-codec.txt
+      - name: Check Vulkan shader against scalar oracle on Mesa
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers
+          cmake -S moshi/src/main/cpp -B /tmp/moshi-vulkan-tests -DMOSHI_HOST_SMOKE=ON -DMOSHI_HOST_VULKAN=ON -DCMAKE_BUILD_TYPE=Release -DVulkan_GLSLC_EXECUTABLE="$MOSHI_GLSLC"
+          cmake --build /tmp/moshi-vulkan-tests --target moshi_im2col_test -j4
+          /tmp/moshi-vulkan-tests/moshi_im2col_test | tee /tmp/moshi-vulkan-im2col.txt
       - name: Build and lint release
         run: ./gradlew --no-daemon :moshi:assembleRelease :moshi:lintRelease
       - name: Upload release APK
@@ -47,4 +60,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: moshi-validation-results
-          path: moshi/build/reports/lint-results-release.*
+          path: |
+            moshi/build/reports/lint-results-release.*
+            /tmp/moshi-cpu-im2col.txt
+            /tmp/moshi-cpu-codec.txt
+            /tmp/moshi-vulkan-im2col.txt

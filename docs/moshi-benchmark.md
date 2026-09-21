@@ -79,7 +79,7 @@ This test exercises 20 tone/silence frames, validates token ranges and finite no
 
 - Implemented: pinned native build, loader repairs, JNI benchmark, resumable/verified setup, codec/load/full-replay modes, CPU/Vulkan selection, isolated worker, playback, stop, memory/timing/crash diagnostics, ZIP export and model deletion.
 - Verified during development: Android ARM64 native compilation and host CPU Mimi encode/decode/reset smoke test with the pinned codec checksum.
-- Pending device evidence: APK installation on Fold6; codec CPU/Vulkan output; full model load; coherent full replay; actual memory and throughput.
+- Verified on Fold6 through build 4: installation, CPU codec audio, four-route replay and first-frame trace. Vulkan encoder/decoder correctness failed at IM2COL; full Moshi model load and coherent full replay remain unverified.
 - Later gates: deterministic official-reference parity, sustained ten-minute inference, OpenCL comparison if justified, then live duplex and echo-control integration.
 
 ## Build 3: first-frame tensor tracing
@@ -122,3 +122,42 @@ changes GPU fusion/synchronization. A difference that disappears under tracing i
 useful evidence of that sensitivity, not proof of correctness. Sampling and numeric
 tolerances identify candidate operations; this is not official-runtime parity or a
 throughput benchmark. No GPU kernel fix is claimed in build 3.
+
+
+## Build 5: portable IM2COL correction and device correctness gate
+
+Build 4 on SM-F956U verified all 356,462,404 uploaded bytes with zero mismatches.
+Encoder node 3 (IM2COL, F16 [7,1920,1,1]) diverged despite exact inputs. Decoder
+node 625 (IM2COL, F16 [3584,2,1,1]) became all zeros; earlier matrix multiplication
+differences were much smaller. Normal and traced GPU paths both reproduced the
+collapse. This isolates an operation, not a proven Adreno compiler root cause.
+
+The 1D/2D shader now writes one output per invocation through a normal storage
+buffer, using fixed 64-thread groups. It avoids the old specialization-sized
+arrays, unrolled scatter and physical-address writes. Host dispatch sizing and
+full output descriptor ranges change together. 3D and other operators retain
+their existing pipelines. `prepare_moshi.py` applies a checked overlay to an
+integration copy; upstream pinned checkouts remain pristine.
+
+Every Vulkan test first runs 16 operator cases / 32 dispatches without model
+weights. It checks every element against an independent scalar oracle with exactly
+representable data, including both failing Mimi shapes, single timestep, padding,
+stride, dilation, batches, partial groups, 2D and F16/F32. Changed inputs and poisoned
+outputs catch stale data and missing writes. A failure stops the GPU run explicitly;
+there is no silent CPU fallback. `im2col-check.jsonl` and `im2col-summary.json` are
+included in the diagnostic ZIP. Passing this gate does not prove whole-codec parity.
+
+The default is now **4. Compare CPU/GPU codec paths**. Upgrade the release APK,
+keep the verified model and recording, run the comparison and export diagnostics.
+Check that the GPU no longer produces constant tokens or collapsed audio, and
+compare CPU-token/GPU-decoder PCM against the CPU reference. If differences remain,
+run **5. Trace CPU/GPU operations · first frame** to locate the next divergence.
+No additional model download is required.
+
+Validation gates: host CPU operator oracle and trace tests; 20 actual Mimi CPU
+frames with independent-state/reset checks; Mesa software-Vulkan operator oracle;
+Android ARM64 release build and lint. CI logs identify the source revision.
+**Fold6/Adreno confirmation remains pending the next device ZIP.** Software Vulkan
+cannot validate Qualcomm's driver. Performance may change because the simpler
+shader trades the old batching optimization for easier-to-verify writes. Full
+Moshi 7B execution, real-time throughput and live duplex remain separate gates.
