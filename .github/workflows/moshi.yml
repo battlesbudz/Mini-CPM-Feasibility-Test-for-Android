@@ -50,7 +50,7 @@ jobs:
           sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers
           cmake -S moshi/src/main/cpp -B /tmp/moshi-vulkan-tests -DMOSHI_HOST_SMOKE=ON -DMOSHI_HOST_VULKAN=ON -DCMAKE_BUILD_TYPE=Release -DVulkan_GLSLC_EXECUTABLE="$MOSHI_GLSLC"
           cmake --build /tmp/moshi-vulkan-tests --target moshi_im2col_test -j4
-          export VK_DRIVER_FILES="$(rg --files /usr/share/vulkan/icd.d | rg '/lvp' | head -n 1)"
+          export VK_DRIVER_FILES="$(find /usr/share/vulkan/icd.d -name '*lvp*.json' -print -quit)"
           test -n "$VK_DRIVER_FILES"
           GGML_VK_VISIBLE_DEVICES=0 /tmp/moshi-vulkan-tests/moshi_im2col_test | tee /tmp/moshi-vulkan-im2col.txt
       - name: Build and lint release
