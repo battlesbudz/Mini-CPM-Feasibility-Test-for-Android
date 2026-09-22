@@ -4,7 +4,7 @@ Separate application ID: `com.battlesbudz.moshitest`. Installs alongside Jarvis,
 
 ## Current phone test
 
-Use **6. Compare GPU precision · seven routes** (the default) with the existing Mimi download and recording. Install the latest release APK over the existing app. Let the phone cool first, run once, then export the diagnostic ZIP. This compares current and higher GPU precision against the CPU reference in one run. See the precision experiment below.
+Build 11 passed the Fold6 precision gate. Use the existing APK for the next test: select **Vulkan model · CPU codec** and **2. Moshi load-only · 750-frame context**. Install/verify the full model pack if not already present; the existing Mimi file is reused. Export diagnostics after loading. If the result is `LOAD_OK`, run **3. Moshi voice replay · 20 sec**, listen to the output and export another ZIP. A load failure is a diagnostic result, not a reason to retry repeatedly. No new APK is needed for these modes.
 
 ## Earlier phone tests
 
@@ -84,7 +84,8 @@ This test exercises 20 tone/silence frames, validates token ranges and finite no
 - Implemented: pinned native build, loader repairs, JNI benchmark, resumable/verified setup, codec/load/full-replay modes, CPU/Vulkan selection, isolated worker, playback, stop, memory/timing/crash diagnostics, ZIP export and model deletion.
 - Verified during development: Android ARM64 native compilation and host CPU Mimi encode/decode/reset smoke test with the pinned codec checksum.
 - Verified on Fold6 through build 9: IM2COL repair passes all 112,480 element checks; GPU audio no longer collapses and tokens are no longer constant. CPU output remains byte-identical to earlier working CPU builds.
-- Implemented next: opt-in FP32 accumulation comparison, shared Android/host codec experiment and software-Vulkan numerical gates. Adreno precision results remain pending a new device run.
+- Verified on Fold6 in build 11: opt-in FP32 Mimi accumulation matches all 1,000 CPU encoder tokens across 125 frames; identical-token GPU decoder NRMSE 0.0007614; no level collapse. CPU PCM remains byte-identical to build 9.
+- Next device gate: full-model load and bounded replay using the existing Vulkan-model/CPU-codec configuration. CPU codec remains the faster measured reference; FP32 is the supported accuracy choice for future GPU-codec integration, still opt-in in this APK.
 - Unverified: full Moshi model load, coherent full replay, official-reference parity and real-time throughput.
 - Later gates: deterministic official-reference parity, sustained ten-minute inference, OpenCL comparison if justified, then live duplex and echo-control integration.
 
@@ -220,9 +221,9 @@ decoder NRMSE >= 0.05 and FP32 encoder/combined NRMSE >= 0.1. These are regressi
 bounds, not official model tolerances. Existing CPU, IM2COL and release/lint gates
 remain required. Software Vulkan cannot establish Adreno correctness or speed.
 
-Next gates: run mode 6 on Fold6; retain higher precision only if evidence supports
-it; then validate full-model load and replay before standalone throughput and live
-duplex work. Do not infer full 7B model success from Mimi-only results.
+The Fold6 precision gate is now complete (results below). Next validate full-model
+load and replay before standalone throughput and live duplex work. Do not infer
+full 7B model success from Mimi-only results.
 
 
 The first precision CI run (build 10) correctly blocked the release on nonfinite
@@ -236,3 +237,52 @@ least 16 lanes, including the tested Adreno, retain their previous configuration
 Matrix tests poison outputs, compare every result, and require repeatable baseline
 outputs across precision changes. This host-path correction is separate from the
 Fold6 precision experiment; it is not evidence that the Adreno had the same bug.
+
+
+## Fold6 build 11 results — precision gate passed
+
+Evidence: user-provided `moshi-test (6).zip`, build `0.1.0-build.11`, source
+`cc8228fa63c9ca1c0552048ccb4188a30be0802c`, SM-F956U / SDK 36 / Adreno 750,
+64-lane groups. All 125 frames (10 seconds) completed across seven routes.
+Input SHA-256: `4c73c0e8e1020f14a48e41140a95ee83a1f42fc9ae2401c47bd8e1b803de2fd3`,
+identical to the previous build-9 comparison and trace. Counts below were checked
+against the token CSV and PCM files, not only the report's completion status.
+
+| Check | Default Vulkan | FP32 Vulkan |
+| --- | ---: | ---: |
+| Encoder tokens matching CPU | 882 / 1,000 (88.2%) | 1,000 / 1,000 (100%) |
+| Decoder NRMSE using identical CPU tokens | 0.00807655 (0.808%) | 0.000761403 (0.0761%) |
+| Combined encoder/decoder NRMSE | 0.1553958 (15.54%) | 0.000761403 (0.0761%) |
+| Encoder mean ms/frame, excluding first frame | 66.844 | 71.394 |
+| Decoder mean ms/frame, own encoder tokens, excluding first frame | 158.905 | 160.094 |
+
+The precision request reached 23,125 matrix nodes in 750 graphs. All encoder tokens
+were in range. FP32-encoder/CPU-decoder PCM is byte-identical to CPU/CPU PCM;
+both FP32-decoder routes are byte-identical to each other. CPU reference PCM SHA-256
+`daf88d6a1f3a0d9cc5ed8ea983bc58af0b3e48b8305253bcb7b76e3796c2283a`
+matches build 9. The IM2COL gate again passed all 112,480 elements.
+
+The recording's GPU token divergence disappears under FP32 accumulation. Decoder
+waveform error improves about 10.6 times, and combined error about 204 times.
+This establishes a useful GPU-codec correctness baseline for this recording;
+remaining small waveform differences and official-runtime parity are not resolved.
+Native float output exceeds PCM range on 850 CPU samples and 851 FP32 samples
+(about 0.35%); export clipping is shared with the CPU reference and is not the
+previous GPU collapse. Listening quality and generated-answer relevance were not
+established by this numeric analysis.
+
+Thermal status stayed 0 in all 140 memory samples; peak worker PSS was 1,268,186 KiB
+(about 1.21 GiB), with no low-memory flag. The complete diagnostic took 144.8 seconds.
+Steady CPU encoder/decoder means were 61.241 + 97.505 ms/frame; default GPU
+66.844 + 158.905 and FP32 GPU 71.394 + 160.094. FP32 adds about 2.5% to this summed
+GPU component time after excluding first-use costs. This is a seven-route interleaved
+comparison, not a standalone throughput benchmark. CPU remains faster here; neither
+this run nor the prior standalone CPU replay proves real-time 80 ms frame processing.
+Do not interpret the diagnostic wall time as the speed of one inference pipeline.
+
+Decision: preserve build 11 and the existing model files. Test full Moshi first with
+Vulkan model / CPU codec using modes 2 then 3 as described above. Those modes do not
+silently enable FP32 for the language model: Mimi precision evidence does not validate
+quantized language-model kernels. Full-model fit, first-frame allocations, coherent
+speech and sustained real-time operation remain separate gates. The next required
+evidence is a Fold6 load report, followed by full replay only if loading succeeds.
