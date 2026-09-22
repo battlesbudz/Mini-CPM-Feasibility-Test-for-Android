@@ -19,7 +19,7 @@ void require(bool condition,const char* message){if(!condition)throw std::runtim
 void matrixChecks(ggml_backend_t backend,ggml_backend_t other){
     for(auto shape:{std::array<int,3>{256,1,512},std::array<int,3>{192,1920,32},std::array<int,3>{257,17,1}})
     for(auto type:{GGML_TYPE_F16,GGML_TYPE_F32}){
-        auto [k,m,n]=shape;Graph g;require(g.ctx,"context allocation failed");
+        auto [k,m,n]=shape;std::cout<<"START MATRIX "<<ggml_backend_name(backend)<<" k="<<k<<" m="<<m<<" n="<<n<<" input="<<ggml_type_name(type)<<std::endl;Graph g;require(g.ctx,"context allocation failed");
         auto a=ggml_new_tensor_2d(g.ctx,GGML_TYPE_F16,k,m),b=ggml_new_tensor_2d(g.ctx,type,k,n);
         auto out=ggml_mul_mat(g.ctx,a,b);auto graph=ggml_new_graph(g.ctx);ggml_build_forward_expand(graph,out);
         g.buffer=ggml_backend_alloc_ctx_tensors(g.ctx,backend);require(g.buffer,"buffer allocation failed");
@@ -30,7 +30,11 @@ void matrixChecks(ggml_backend_t backend,ggml_backend_t other){
         ggml_backend_tensor_set(a,ah.data(),0,ah.size()*2);
         ggml_backend_tensor_set(b,type==GGML_TYPE_F16?static_cast<void*>(bh.data()):static_cast<void*>(bf.data()),0,ggml_nbytes(b));
         std::vector<float> base(m*n),precise(m*n),again(m*n);
-        auto run=[&](std::vector<float>& result){require(moshi_trace_compute(backend,graph)==GGML_STATUS_SUCCESS,"matrix dispatch failed");ggml_backend_tensor_get(out,result.data(),0,result.size()*4);};
+        auto run=[&](std::vector<float>& result){std::fill(result.begin(),result.end(),12345.f);ggml_backend_tensor_set(out,result.data(),0,result.size()*4);require(moshi_trace_compute(backend,graph)==GGML_STATUS_SUCCESS,"matrix dispatch failed");ggml_backend_tensor_get(out,result.data(),0,result.size()*4);
+            size_t nonfinite=0;for(float v:result)nonfinite+=!std::isfinite(v);
+            std::cout<<"DISPATCH "<<(&result==&base?"baseline":&result==&precise?"fp32":"baseline_check")<<" first="<<result[0]<<" last="<<result.back()<<" nonfinite="<<nonfinite<<std::endl;
+            std::vector<ggml_fp16_t> actual(ah.size());ggml_backend_tensor_get(a,actual.data(),0,actual.size()*2);require(actual==ah,"matrix input A corrupted");
+        };
         run(base);
         {
             GpuPrecisionScope scope(backend);
@@ -43,12 +47,17 @@ void matrixChecks(ggml_backend_t backend,ggml_backend_t other){
         double e=0,ref=0,baseError=0,maxError=0;
         for(int col=0;col<n;++col)for(int row=0;row<m;++row){
             double expected=0;for(int j=0;j<k;++j)expected+=double(af[row*k+j])*bf[col*k+j];
-            auto index=col*m+row;require(std::isfinite(precise[index])&&std::isfinite(base[index]),"nonfinite matrix output");
+            auto index=col*m+row;
+            if(!std::isfinite(precise[index])||!std::isfinite(base[index])){
+                std::cerr<<"NONFINITE index="<<index<<" reference="<<expected<<" default="<<base[index]<<" fp32="<<precise[index]<<" baseline_after="<<again[index]<<std::endl;
+                throw std::runtime_error("nonfinite matrix output");
+            }
             double d=precise[index]-expected;e+=d*d;ref+=expected*expected;maxError=std::max(maxError,std::abs(d));d=base[index]-expected;baseError+=d*d;
         }
         double relative=std::sqrt(e/ref);
         std::cout<<"MATRIX "<<ggml_backend_name(backend)<<" k="<<k<<" m="<<m<<" n="<<n<<" input="<<ggml_type_name(type)<<" default_nrmse="<<std::sqrt(baseError/ref)<<" fp32_nrmse="<<relative<<" max_error="<<maxError<<std::endl;
         require(relative<1e-5&&maxError<.001,"FP32 matrix differs from double-accumulation oracle");
+        require(std::sqrt(baseError/ref)<.02,"Default matrix exceeds F16 rounding budget");
     }
     std::cout<<"PASS matrix oracle, backend isolation, nested scope and baseline restoration"<<std::endl;
 }

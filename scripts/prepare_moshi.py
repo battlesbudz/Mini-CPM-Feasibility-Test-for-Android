@@ -47,6 +47,17 @@ def main():
     checked_replace(backend,
         "if (ctx->device->shader_int64 && ctx->device->buffer_device_address) {\n            // buffer device address path doesn't use dst buffer",
         "if (op == GGML_OP_IM2COL_3D && ctx->device->shader_int64 && ctx->device->buffer_device_address) {\n            // Only 3D still uses buffer device addresses; 1D/2D needs the full descriptor range.")
+    # The scalar small tile covers exactly one 32x32 virtual warp. On an
+    # 8-lane Vulkan device, BLOCK_SIZE=16 with WARP=8 creates a second virtual
+    # warp outside that tile, causing overlapping writes and shared-memory OOB.
+    # Keep cooperative-matrix layouts and >=16-lane devices (including Adreno)
+    # unchanged. Logical scalar lanes do not use hardware subgroup operations.
+    checked_replace(backend,
+        "s_warptile = { subgroup_size_16, 32, 32, 16, 32, 32, 2, tm_s, tn_s, tk_s, subgroup_size_8 };",
+        "s_warptile = { subgroup_size_16, 32, 32, 16, 32, 32, 2, tm_s, tn_s, tk_s, device->coopmat_support ? subgroup_size_8 : subgroup_size_16 };")
+    checked_replace(backend,
+        "s_warptile = { subgroup_size_16, 32, 32, 16, 32, 32, 2, 2, 2, 1, subgroup_size_8 };",
+        "s_warptile = { subgroup_size_16, 32, 32, 16, 32, 32, 2, 2, 2, 1, subgroup_size_16 };")
     adapted = VENDOR / "moshi-android-src"
     if adapted.exists():
         shutil.rmtree(adapted)

@@ -223,3 +223,16 @@ remain required. Software Vulkan cannot establish Adreno correctness or speed.
 Next gates: run mode 6 on Fold6; retain higher precision only if evidence supports
 it; then validate full-model load and replay before standalone throughput and live
 duplex work. Do not infer full 7B model success from Mimi-only results.
+
+
+The first precision CI run (build 10) correctly blocked the release on nonfinite
+matrix results. Local reproduction exposed an upstream scalar small-tile layout
+error on eight-lane software Vulkan: 16 invocations were divided into two virtual
+warps, each sized for the whole 32x32 output tile. The second warp accessed beyond
+that tile and raced adjacent output groups. The integration overlay makes that
+scalar tile use a single 16-lane virtual warp. Hardware subgroup operations are
+not used by this scalar kernel. Cooperative-matrix layouts and devices with at
+least 16 lanes, including the tested Adreno, retain their previous configuration.
+Matrix tests poison outputs, compare every result, and require repeatable baseline
+outputs across precision changes. This host-path correction is separate from the
+Fold6 precision experiment; it is not evidence that the Adreno had the same bug.
