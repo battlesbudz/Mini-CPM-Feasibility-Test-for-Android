@@ -4,7 +4,7 @@ Separate application ID: `com.battlesbudz.moshitest`. Installs alongside Jarvis,
 
 ## Current phone test
 
-Build 11 passed the Fold6 precision gate. Use the existing APK for the next test: select **Vulkan model · CPU codec** and **2. Moshi load-only · 750-frame context**. Install/verify the full model pack if not already present; the existing Mimi file is reused. Export diagnostics after loading. If the result is `LOAD_OK`, run **3. Moshi voice replay · 20 sec**, listen to the output and export another ZIP. A load failure is a diagnostic result, not a reason to retry repeatedly. No new APK is needed for these modes.
+Build 11 passed both the Fold6 precision gate and full-model load-only test. Keep the existing APK and downloaded model pack. Select **Vulkan model · CPU codec**, then **3. Moshi voice replay · 20 sec**. Run once, listen to the output if available, and export the diagnostics ZIP. The 20 seconds describes the input timeline, not the processing duration; this unpaced test can take several minutes. Export failures or timeouts too. No new APK or repeat load-only test is needed.
 
 ## Earlier phone tests
 
@@ -85,8 +85,9 @@ This test exercises 20 tone/silence frames, validates token ranges and finite no
 - Verified during development: Android ARM64 native compilation and host CPU Mimi encode/decode/reset smoke test with the pinned codec checksum.
 - Verified on Fold6 through build 9: IM2COL repair passes all 112,480 element checks; GPU audio no longer collapses and tokens are no longer constant. CPU output remains byte-identical to earlier working CPU builds.
 - Verified on Fold6 in build 11: opt-in FP32 Mimi accumulation matches all 1,000 CPU encoder tokens across 125 frames; identical-token GPU decoder NRMSE 0.0007614; no level collapse. CPU PCM remains byte-identical to build 9.
-- Next device gate: full-model load and bounded replay using the existing Vulkan-model/CPU-codec configuration. CPU codec remains the faster measured reference; FP32 is the supported accuracy choice for future GPU-codec integration, still opt-in in this APK.
-- Unverified: full Moshi model load, coherent full replay, official-reference parity and real-time throughput.
+- Verified on Fold6 in build 11: full Moshi Q4_K weights, CPU Mimi codec and initial 750-frame streaming state load successfully in 15.031 seconds; sampled peak worker PSS 4.80 GiB. No inference frames executed.
+- Next device gate: bounded full-model replay using the existing Vulkan-model/CPU-codec configuration. CPU codec remains the faster measured reference; FP32 is the supported accuracy choice for future GPU-codec integration, still opt-in in this APK.
+- Unverified: first-frame inference allocations, coherent full replay, official-reference parity and real-time throughput.
 - Later gates: deterministic official-reference parity, sustained ten-minute inference, OpenCL comparison if justified, then live duplex and echo-control integration.
 
 ## Build 3: first-frame tensor tracing
@@ -285,4 +286,33 @@ Vulkan model / CPU codec using modes 2 then 3 as described above. Those modes do
 silently enable FP32 for the language model: Mimi precision evidence does not validate
 quantized language-model kernels. Full-model fit, first-frame allocations, coherent
 speech and sustained real-time operation remain separate gates. The next required
-evidence is a Fold6 load report, followed by full replay only if loading succeeds.
+evidence was a Fold6 load report. That gate subsequently passed below; full replay is next.
+
+
+## Fold6 build 11 results — full-model load gate passed
+
+Evidence: `moshi-test (7).zip`, build `0.1.0-build.11`, source
+`cc8228fa63c9ca1c0552048ccb4188a30be0802c`, Samsung SM-F956U / SDK 36 /
+Adreno 750; run `startedAtMs=1790064840674`.
+
+- Status and verdict: `LOAD_OK`, native mode 1 (UI mode 2), Vulkan0 model / CPU codec,
+  750-frame context. Loading took 15,031.13343 ms.
+- Native phases reached Moshi Q4_K weight loading, Mimi loading and streaming-state
+  initialization, then explicitly released model state. Input/output frames and
+  generated audio samples are all zero, as expected for load-only mode.
+- GPU convolution check passed 112,480 elements across 16 cases / 32 dispatches.
+- All 16 memory samples reported thermal status 1 and no system low-memory flag.
+  Peak sampled worker PSS was 5,036,316 KiB (4.803 GiB). Minimum sampled system
+  available memory was 892,203,008 bytes (0.831 GiB), during state initialization.
+  Available memory rose to 5,126,426,624 bytes during release. These are sampled
+  Android accounting values, not exact allocation peaks or a guarantee of replay fit.
+- The worker exit record follows the successful result and matches the service's
+  deliberate process termination in `retire()`; it is not evidence of a failed load.
+
+Decision: keep build 11 and proceed to UI **3. Moshi voice replay · 20 sec** with
+**Vulkan model · CPU codec**. The full pack is already present. This test must establish
+first-frame execution, generated text/audio, relevance of the spoken response and
+component timing. Extra graph allocations during inference may still exceed available
+memory. Load success does not validate quantized model kernels, generated speech,
+real-time performance or live duplex. A failure ZIP is the next debugging evidence;
+there is no code change justified by this successful load-only result.
