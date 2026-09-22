@@ -4,7 +4,7 @@ Separate application ID: `com.battlesbudz.moshitest`. Installs alongside Jarvis,
 
 ## Current phone test
 
-Build 11 loaded the full model but crashed during its first replay when the Adreno driver rejected the Q4_K matrix-vector pipeline. The next release includes a portable Q4_K shader and an automatic correctness check before model loading. Install it over build 11 to retain models and recording. Use **Vulkan model · CPU codec** and **3. Moshi voice replay · 20 sec** (the new defaults), run once and export diagnostics even if it fails. Listen to any output and report whether it answers the recording. No model re-download or repeat load-only test is needed. The 20 seconds is the input timeline, not processing time.
+Build 11 loaded the full model but crashed during its first replay when the Adreno driver rejected the Q4_K matrix-vector pipeline. Build 12 includes a portable Q4_K shader and an automatic correctness check before model loading. Install it over build 11 to retain models and recording. Use **Vulkan model · CPU codec** and **3. Moshi voice replay · 20 sec** (the new defaults), run once and export diagnostics even if it fails. Listen to any output and report whether it answers the recording. No model re-download or repeat load-only test is needed. The 20 seconds is the input timeline, not processing time.
 
 ## Earlier phone tests
 
@@ -373,3 +373,20 @@ Local Mesa Vulkan passed the Q4_K oracle and injected compiler-failure recovery.
 GitHub Actions repeats these checks, the existing IM2COL and actual Mimi precision
 regressions, and ARM64 release build/lint before publishing an APK. Full-model device
 inference, coherent speech and real-time throughput remain unverified.
+
+
+Build 12 CI evidence: code revision `3611f52a34e455cec1d3c09951402eebe7186ba8`,
+[Actions run 35706186865](https://github.com/battlesbudz/Mini-CPM-Feasibility-Test-for-Android/actions/runs/35706186865),
+job `106675585118`. CPU and Vulkan checks all passed, including Q4_K 24 cases /
+48 dispatches / 1,180 checked outputs, injected compiler-error propagation and
+fresh-backend recovery, 112,480 IM2COL values, and actual Mimi codec regression.
+ARM64 `assembleRelease` and `lintRelease` completed successfully in 3m27s.
+
+[Release APK artifact 10684544182](https://github.com/battlesbudz/Mini-CPM-Feasibility-Test-for-Android/actions/runs/35706186865/artifacts/10684544182)
+is `Moshi-Voice-Test-build-12`; archive digest
+`sha256:f03a4a274aae4e1ac5c32f7c782c0985a7ba7b8d909c6dacdfb52be2edda9f2b`.
+Validation artifact: `10684334391`. Both artifacts identify the same code revision.
+These are host/CI checks, not Adreno execution. The next required user evidence is
+one build 12 Vulkan-model/CPU-codec full replay ZIP and, if audio is produced, whether
+the spoken reply is intelligible and relevant. Models and the existing recording
+can be reused.
