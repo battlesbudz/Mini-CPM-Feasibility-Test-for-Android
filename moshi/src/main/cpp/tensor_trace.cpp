@@ -1,4 +1,5 @@
 #include "tensor_trace.h"
+#include "gpu_precision.h"
 #include "ggml-impl.h"
 #include <algorithm>
 #include <cmath>
@@ -132,6 +133,7 @@ void moshi_trace_tensor_set(ggml_tensor* tensor,const void* data,size_t offset,s
     }
 }
 ggml_status moshi_trace_compute(ggml_backend_t backend,ggml_cgraph* graph){
+    GpuPrecisionGraph precision(backend,graph);
     if(!active||backend!=active->tested)return ggml_backend_graph_compute(backend,graph);
     auto& t=*active;int number=t.graphs++;
     if(t.graphs>64||t.nodes+graph->n_nodes>20000)throw std::runtime_error("Tensor trace graph budget exceeded");

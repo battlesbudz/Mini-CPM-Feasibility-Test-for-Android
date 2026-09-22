@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <functional>
 #include "audio_metrics.h"
+#include "codec_precision.h"
 #include "tensor_trace.h"
 #include "im2col_check.h"
 
@@ -146,7 +147,7 @@ Java_com_battlesbudz_moshitest_NativeBench_run(JNIEnv* env, jclass, jstring mode
     Stats stats; auto started=Clock::now(); double replayWall=0;
     try {
         const std::string root=utf(env,modelsArg), inputPath=utf(env,inputArg), outDir=utf(env,outputArg);
-        if(mode<0 || mode>4 || backend<0 || backend>2 || (context!=750 && context!=1000 && context!=3000))
+        if(mode<0 || mode>5 || backend<0 || backend>2 || (context!=750 && context!=1000 && context!=3000))
             throw std::runtime_error("Invalid benchmark configuration");
         if(!freopen((outDir+"/native.log").c_str(),"w",stderr)) throw std::runtime_error("Cannot open native log");
         setvbuf(stderr,nullptr,_IONBF,0);
@@ -161,6 +162,15 @@ Java_com_battlesbudz_moshitest_NativeBench_run(JNIEnv* env, jclass, jstring mode
         };
         std::vector<float> input;
         if(mode!=1) input=readInput(inputPath);
+        if(mode==5) {
+            Backends devices;devices.cpu=ggml_backend_cpu_init();
+            if(!devices.cpu)throw std::runtime_error("CPU unavailable");
+            ggml_backend_cpu_set_n_threads(devices.cpu,4);
+            if(!ggml_backend_vk_get_device_count())throw std::runtime_error("Vulkan unavailable");
+            devices.gpu=ggml_backend_vk_init(0);if(!devices.gpu)throw std::runtime_error("Vulkan initialization failed");
+            checkGpuIm2col(devices.gpu,outDir,event);
+            return javaString(env,compareCodecPrecision(devices.cpu,devices.gpu,root+"/mimi-e351c8d8-125.gguf",input,outDir,event).json);
+        }
         if(mode==4) return javaString(env,traceCodec(root,input,outDir,event));
         if(mode==3) return javaString(env,compareCodec(root,input,outDir,event));
         if(!input.empty()){double energy=0;for(float x:input)energy+=double(x)*x;stats.inputRms=std::sqrt(energy/input.size());}

@@ -40,7 +40,7 @@ public final class BenchmarkService extends Service {
         heartbeat=SystemClock.elapsedRealtime();
         int profile=intent==null?1:intent.getIntExtra("profile",1);
         int voice=intent==null?0:intent.getIntExtra("voice",0);
-        if(profile<0||profile>2)profile=1;if(voice<0||voice>4)voice=0;
+        if(profile<0||profile>2)profile=1;if(voice<0||voice>5)voice=0;
         run=new File(getFilesDir(),"last-run");run.mkdirs();state=new JSONObject();
         try{state.put("startedAtMs",System.currentTimeMillis()).put("profile","moshi-replay-v3").put("contextFrames",750).put("build",BuildConfig.VERSION_NAME).put("sourceCommit",BuildConfig.SOURCE_COMMIT).put("device",Build.MANUFACTURER+" "+Build.MODEL).put("sdk",Build.VERSION.SDK_INT);}catch(Exception ignored){}
         state("Starting","RUNNING");

@@ -7,7 +7,7 @@ android {
         applicationId = "com.battlesbudz.moshitest"
         minSdk = 29
         targetSdk = 35
-        versionCode = maxOf(5, System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 5)
+        versionCode = maxOf(10, System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 10)
         versionName = "0.1.0-build.$versionCode"
         ndk { abiFilters += "arm64-v8a" }
         externalNativeBuild { cmake { arguments += listOf("-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON", "-DCMAKE_BUILD_TYPE=Release", "-DVulkan_GLSLC_EXECUTABLE=${System.getenv("MOSHI_GLSLC") ?: "/usr/bin/glslc"}"); targets += "moshi_bench" } }

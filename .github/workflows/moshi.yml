@@ -36,7 +36,8 @@ jobs:
       - name: Check tensor sampling and difference detection
         run: |
           cmake -S moshi/src/main/cpp -B /tmp/moshi-host-tests -DMOSHI_HOST_SMOKE=ON -DCMAKE_BUILD_TYPE=Release
-          cmake --build /tmp/moshi-host-tests --target moshi_trace_test moshi_im2col_test moshi_codec_smoke -j4
+          cmake --build /tmp/moshi-host-tests --target moshi_trace_test moshi_im2col_test moshi_codec_smoke moshi_precision_test -j4
+          /tmp/moshi-host-tests/moshi_precision_test | tee /tmp/moshi-cpu-precision.txt
           /tmp/moshi-host-tests/moshi_trace_test
           /tmp/moshi-host-tests/moshi_im2col_test | tee /tmp/moshi-cpu-im2col.txt
       - name: Check actual Mimi CPU codec regression
@@ -49,10 +50,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers
           cmake -S moshi/src/main/cpp -B /tmp/moshi-vulkan-tests -DMOSHI_HOST_SMOKE=ON -DMOSHI_HOST_VULKAN=ON -DCMAKE_BUILD_TYPE=Release -DVulkan_GLSLC_EXECUTABLE="$MOSHI_GLSLC"
-          cmake --build /tmp/moshi-vulkan-tests --target moshi_im2col_test -j4
+          cmake --build /tmp/moshi-vulkan-tests --target moshi_im2col_test moshi_precision_test -j4
           export VK_DRIVER_FILES="$(find /usr/share/vulkan/icd.d -name '*lvp*.json' -print -quit)"
           test -n "$VK_DRIVER_FILES"
           GGML_VK_VISIBLE_DEVICES=0 /tmp/moshi-vulkan-tests/moshi_im2col_test | tee /tmp/moshi-vulkan-im2col.txt
+      - name: Compare actual Mimi precision on software Vulkan
+        run: |
+          export VK_DRIVER_FILES="$(find /usr/share/vulkan/icd.d -name '*lvp*.json' -print -quit)"
+          test -n "$VK_DRIVER_FILES"
+          GGML_VK_VISIBLE_DEVICES=0 /tmp/moshi-vulkan-tests/moshi_precision_test /tmp/mimi.gguf /tmp/moshi-precision | tee /tmp/moshi-vulkan-precision.txt
       - name: Build and lint release
         run: ./gradlew --no-daemon :moshi:assembleRelease :moshi:lintRelease
       - name: Upload release APK
@@ -70,3 +76,6 @@ jobs:
             /tmp/moshi-cpu-im2col.txt
             /tmp/moshi-cpu-codec.txt
             /tmp/moshi-vulkan-im2col.txt
+            /tmp/moshi-cpu-precision.txt
+            /tmp/moshi-vulkan-precision.txt
+            /tmp/moshi-precision/

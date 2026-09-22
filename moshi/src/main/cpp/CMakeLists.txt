@@ -28,6 +28,7 @@ set(SPM_ENABLE_TCMALLOC OFF CACHE BOOL "" FORCE)
 add_subdirectory("${VENDOR}/sentencepiece-moshi" sentencepiece EXCLUDE_FROM_ALL)
 add_library(moshi_core STATIC
     tensor_trace.cpp
+    codec_precision.cpp
     "${VENDOR}/moshi-android-src/src/moshi.cpp"
     "${VENDOR}/moshi-android-src/src/json.cpp"
     "${VENDOR}/moshi-android-src/src/safetensor.cpp")
@@ -47,6 +48,11 @@ if(MOSHI_HOST_SMOKE)
     add_executable(moshi_trace_test ../../test/cpp/tensor_trace_test.cpp)
     target_include_directories(moshi_trace_test PRIVATE "${CMAKE_CURRENT_LIST_DIR}" "${VENDOR}/ggml-moshi-android/src")
     target_link_libraries(moshi_trace_test PRIVATE ggml)
+    add_executable(moshi_precision_test ../../test/cpp/precision_test.cpp)
+    target_link_libraries(moshi_precision_test PRIVATE moshi_core)
+    if(MOSHI_HOST_VULKAN)
+        target_compile_definitions(moshi_precision_test PRIVATE MOSHI_TEST_VULKAN=1)
+    endif()
     add_executable(moshi_codec_smoke ../../test/cpp/codec_smoke.cpp)
     target_link_libraries(moshi_codec_smoke PRIVATE moshi_core)
 else()

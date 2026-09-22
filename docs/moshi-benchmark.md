@@ -2,7 +2,11 @@
 
 Separate application ID: `com.battlesbudz.moshitest`. Installs alongside Jarvis, Liquid and MiniCPM. This is a release APK with the repository's existing feasibility-test signing key, not a debug build or a production Jarvis replacement.
 
-## First phone test
+## Current phone test
+
+Use **6. Compare GPU precision · seven routes** (the default) with the existing Mimi download and recording. Install the latest release APK over the existing app. Let the phone cool first, run once, then export the diagnostic ZIP. This compares current and higher GPU precision against the CPU reference in one run. See the precision experiment below.
+
+## Earlier phone tests
 
 ### Build 2: isolate the observed Vulkan audio failure
 
@@ -79,7 +83,9 @@ This test exercises 20 tone/silence frames, validates token ranges and finite no
 
 - Implemented: pinned native build, loader repairs, JNI benchmark, resumable/verified setup, codec/load/full-replay modes, CPU/Vulkan selection, isolated worker, playback, stop, memory/timing/crash diagnostics, ZIP export and model deletion.
 - Verified during development: Android ARM64 native compilation and host CPU Mimi encode/decode/reset smoke test with the pinned codec checksum.
-- Verified on Fold6 through build 4: installation, CPU codec audio, four-route replay and first-frame trace. Vulkan encoder/decoder correctness failed at IM2COL; full Moshi model load and coherent full replay remain unverified.
+- Verified on Fold6 through build 9: IM2COL repair passes all 112,480 element checks; GPU audio no longer collapses and tokens are no longer constant. CPU output remains byte-identical to earlier working CPU builds.
+- Implemented next: opt-in FP32 accumulation comparison, shared Android/host codec experiment and software-Vulkan numerical gates. Adreno precision results remain pending a new device run.
+- Unverified: full Moshi model load, coherent full replay, official-reference parity and real-time throughput.
 - Later gates: deterministic official-reference parity, sustained ten-minute inference, OpenCL comparison if justified, then live duplex and echo-control integration.
 
 ## Build 3: first-frame tensor tracing
@@ -157,7 +163,63 @@ No additional model download is required.
 Validation gates: host CPU operator oracle and trace tests; 20 actual Mimi CPU
 frames with independent-state/reset checks; Mesa software-Vulkan operator oracle;
 Android ARM64 release build and lint. CI logs identify the source revision.
-**Fold6/Adreno confirmation remains pending the next device ZIP.** Software Vulkan
+**Build 9 Fold6 diagnostics subsequently confirmed the IM2COL repair.** Software Vulkan
 cannot validate Qualcomm's driver. Performance may change because the simpler
 shader trades the old batching optimization for easier-to-verify writes. Full
 Moshi 7B execution, real-time throughput and live duplex remain separate gates.
+
+
+## Build 10 onward: controlled GPU precision comparison
+
+Build 9 on Fold6 passed all IM2COL checks and verified 356,462,404 uploaded bytes
+without a mismatch. Over 125 frames, default GPU token agreement was 88.2%; GPU
+decoding of identical CPU tokens had waveform NRMSE 0.00808. The first-frame trace
+found the first decoder difference at F16 matrix multiplication with matching
+sampled inputs (NRMSE 0.00198); final first-frame decoder NRMSE was 0.01069. Encoder
+rounding accumulated before later codebook decisions. These results motivate a
+precision experiment; they do not prove that accumulation explains every difference.
+
+Mode 6 requests `GGML_PREC_F32` for matrix multiplications only while executing
+higher-precision GPU states. F16 model weights and normal backend input conversions
+remain unchanged. Some kernels already accumulate in F32. The report counts graphs
+and matrix nodes receiving the request; it does not claim hardware instruction
+tracing. Scope and graph flags are restored after each operation. CPU and previous
+GPU modes retain their normal settings; no environment-wide precision override is
+used and no new model download is required.
+
+Two loaded codec weight instances support three independent encoder histories and
+seven independent decoder histories:
+
+| Encoder | Decoder | Purpose |
+| --- | --- | --- |
+| CPU | CPU | Reference |
+| Default GPU | CPU | Baseline encoder difference |
+| CPU | Default GPU | Baseline decoder difference |
+| Default GPU | Default GPU | Baseline combined difference |
+| FP32 GPU | CPU | Higher-precision encoder difference |
+| CPU | FP32 GPU | Higher-precision decoder difference |
+| FP32 GPU | FP32 GPU | Higher-precision combined difference |
+
+`precision.json`, `precision-tokens.csv`, `precision-frames.csv`, and seven PCM
+files are exported alongside existing memory, thermal and native logs. Metrics use
+native floating-point audio before PCM clipping. First-frame timings are separate;
+GPU variant order alternates per frame. Total seven-route timing is not standalone
+throughput. `PRECISION_COMPARISON_COMPLETE` means all routes completed, not numerical
+parity or a working conversational model. Compare token agreement, identical-token
+decoder NRMSE, combined audio, thermal history and component time before choosing a
+precision policy. A quiet reference limits interpretation.
+
+CI runs an independent double-accumulation matrix oracle with the actual stored
+half-precision inputs, including the first divergent decoder shape, the encoder
+convolution shape and a partial/vector shape. It verifies backend isolation, nested
+scope restoration and bit-identical default results before/after FP32. The same
+codec experiment used by Android processes eight tone/silence frames on CPU and
+Mesa software Vulkan with the pinned real Mimi model. It rejects invalid tokens,
+nonfinite or collapsed audio, missing precision dispatches, FP32 identical-token
+decoder NRMSE >= 0.05 and FP32 encoder/combined NRMSE >= 0.1. These are regression
+bounds, not official model tolerances. Existing CPU, IM2COL and release/lint gates
+remain required. Software Vulkan cannot establish Adreno correctness or speed.
+
+Next gates: run mode 6 on Fold6; retain higher precision only if evidence supports
+it; then validate full-model load and replay before standalone throughput and live
+duplex work. Do not infer full 7B model success from Mimi-only results.
