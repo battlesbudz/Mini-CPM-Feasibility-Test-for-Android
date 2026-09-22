@@ -58,6 +58,59 @@ def main():
     checked_replace(backend,
         "s_warptile = { subgroup_size_16, 32, 32, 16, 32, 32, 2, 2, 2, 1, subgroup_size_8 };",
         "s_warptile = { subgroup_size_16, 32, 32, 16, 32, 32, 2, 2, 2, 1, subgroup_size_16 };")
+    # Build 11: Adreno rejected mul_mat_vec_q4_k_f32_f32 at first inference.
+    # Use an explicitly bounded scalar Q4_K path; keep all other quants, matrix
+    # kernels, expert routing and integer-dot variants unchanged.
+    shaders = ggml_adapted / "src/ggml-vulkan/vulkan-shaders"
+    shutil.copyfile(ROOT / "moshi/src/main/cpp/shaders/mul_mat_vec_q4_k_portable.comp",
+                    shaders / "mul_mat_vec_q4_k_portable.comp")
+    checked_replace(shaders / "vulkan-shaders-gen.cpp", "    // flash attention\n", '''    string_to_spv("moshi_q4_k_f32", "mul_mat_vec_q4_k_portable.comp", {});
+    string_to_spv("moshi_q4_k_f16", "mul_mat_vec_q4_k_portable.comp", {{"MOSHI_B_F16", "1"}});
+
+    // flash attention
+''')
+    for btype in ("f32", "f16"):
+        old = f'''            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_{btype}_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_{btype}_f32", arr_dmmv_q4_k_{btype}_f32_len[reduc16], arr_dmmv_q4_k_{btype}_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {{rm_kq, 1, 1}}, {{wg_size_subgroup16, rm_kq, i+1}}, 1, true, use_subgroups16, force_subgroup_size16);'''
+        new = f'''            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_{btype}_f32[w][GGML_TYPE_Q4_K][i], "moshi_q4_k_portable_{btype}", moshi_q4_k_{btype}_len, moshi_q4_k_{btype}_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {{1, 1, 1}}, {{64, 1, i+1}}, 1, false, false, 0);'''
+        checked_replace(backend, old, new)
+    # The pinned runtime waits on compiler futures without get(): driver errors
+    # are silently discarded, then the caller uses an uncompiled pipeline.
+    # Drain every future, propagate the first error, and release the compile slot
+    # even on exceptions. This also prevents a later compile waiting forever.
+    checked_replace(backend, "    GGML_ASSERT(parameter_count > 0);", '''    struct CompileSlot {
+        ~CompileSlot() {
+            { std::lock_guard<std::mutex> guard(compile_count_mutex); --compile_count; }
+            compile_count_cond.notify_all();
+        }
+    } compile_slot;
+#ifdef MOSHI_VULKAN_TEST_FAILURE
+    if (pipeline->name == "moshi_q4_k_portable_f32" && getenv("MOSHI_TEST_FAIL_Q4_PIPELINE"))
+        throw std::runtime_error("Injected Q4 pipeline compile failure");
+#endif
+    GGML_ASSERT(parameter_count > 0);''')
+    checked_replace(backend, '''    {
+        std::lock_guard<std::mutex> guard(compile_count_mutex);
+        assert(compile_count > 0);
+        compile_count--;
+    }
+    compile_count_cond.notify_all();''', '')
+    checked_replace(backend, '''    for (auto &c : compiles) {
+        c.wait();
+    }''', '''    std::exception_ptr compile_error;
+    for (auto &c : compiles) {
+        try { c.get(); } catch (...) { if (!compile_error) compile_error = std::current_exception(); }
+    }
+    if (compile_error) std::rethrow_exception(compile_error);''')
+    checked_replace(backend,
+        '''        std::cerr << "ggml_vulkan: Compute pipeline creation failed for " << pipeline->name << std::endl;
+        std::cerr << "ggml_vulkan: " << e.what() << std::endl;
+        throw e;''',
+        '''        std::cerr << "ggml_vulkan: Compute pipeline creation failed for " << pipeline->name << std::endl;
+        std::cerr << "ggml_vulkan: " << e.what() << " spec=";
+        for (auto value : specialization_constants) std::cerr << value << ',';
+        std::cerr << " required_subgroup=" << required_subgroup_size
+                  << " full_subgroups=" << require_full_subgroups << std::endl;
+        throw;''')
     adapted = VENDOR / "moshi-android-src"
     if adapted.exists():
         shutil.rmtree(adapted)

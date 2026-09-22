@@ -137,6 +137,25 @@ void checkGpuIm2col(ggml_backend_t gpu,const std::string& outDir,
         throw;
     }
 }
+#include "q4_check.h"
+void checkGpuQ4(ggml_backend_t gpu,const std::string& outDir,
+    const std::function<void(const std::string&)>& event) {
+    event("Checking GPU Q4_K matrix-vector correctness before loading models");
+    auto started=Clock::now();
+    std::ofstream log(outDir+"/q4-check.jsonl");
+    if(!log)throw std::runtime_error("Cannot write Q4 diagnostics");
+    const std::string path=outDir+"/q4-summary.json";
+    save(path,"{\"status\":\"RUNNING\",\"implementation\":\"q4_packed_scalar_64_v1\"}");
+    try {
+        auto count=moshi_q4::check(gpu,[&](const std::string& message){
+            log<<"{\"message\":"<<quoted(message)<<"}\n";log.flush();
+            if(!log)throw std::runtime_error("Cannot persist Q4 diagnostics");
+        });
+        save(path,"{\"status\":\"PASS\",\"implementation\":\"q4_packed_scalar_64_v1\",\"cases\":24,\"dispatches\":48,\"checkedElements\":"+
+            std::to_string(count)+",\"elapsedMs\":"+std::to_string(elapsed(started))+"}");
+        event("GPU Q4_K check passed; loading models");
+    }catch(const std::exception& e){save(path,"{\"status\":\"FAIL\",\"error\":"+quoted(e.what())+"}");throw;}
+}
 #include "codec_comparison.h"
 #include "codec_trace.h"
 }
@@ -187,6 +206,7 @@ Java_com_battlesbudz_moshitest_NativeBench_run(JNIEnv* env, jclass, jstring mode
             ggml_backend_vk_get_device_description(0,description,sizeof(description));
             event(std::string("Vulkan device: ")+description);
             checkGpuIm2col(devices.gpu,outDir,event);
+            if(mode==1||mode==2)checkGpuQ4(devices.gpu,outDir,event);
         }
         auto modelBackend=backend==0?devices.cpu:devices.gpu;
         auto codecBackend=backend==2?devices.gpu:devices.cpu;
@@ -227,6 +247,7 @@ Java_com_battlesbudz_moshitest_NativeBench_run(JNIEnv* env, jclass, jstring mode
         std::ofstream timings(outDir+"/frames.csv");
         if(!audio || !timings) throw std::runtime_error("Cannot create replay output");
         timings << "frame,encode_ms,model_ms,decode_ms,total_ms,output\n";
+        timings.flush();
         std::vector<float> frame(1920), decoded(1920);
         std::vector<int16_t> tokens(8);
         const size_t recordedFrames=(input.size()+1919)/1920;
@@ -236,12 +257,17 @@ Java_com_battlesbudz_moshitest_NativeBench_run(JNIEnv* env, jclass, jstring mode
             std::fill(frame.begin(),frame.end(),0.f);
             for(size_t j=0;j<frame.size() && i*1920+j<input.size();++j) frame[j]=input[i*1920+j];
             auto step=Clock::now();
+            if(i==0)event("First frame: Mimi encoding");
             mimi_encode_send(encoder,frame.data()); mimi_encode_receive(encoder,tokens.data());
             double enc=elapsed(step); auto modelStart=Clock::now();
             int token=0; bool output=true;
-            if(mode==2) { moshi_lm_send2(generator,tokens); output=moshi_lm_receive(generator,token,tokens)!=0; }
+            if(mode==2) {
+                if(i==0)event("First frame: Moshi model inference");
+                moshi_lm_send2(generator,tokens); output=moshi_lm_receive(generator,token,tokens)!=0;
+            }
             double modelMs=elapsed(modelStart); auto decodeStart=Clock::now();
             if(output) {
+                if(i==0)event("First frame: Mimi decoding");
                 if(tokens.size()!=8) throw std::runtime_error("Unexpected generated codebook count");
                 for(auto t:tokens) if(t<0 || t>=2048) throw std::runtime_error("Invalid audio token");
                 mimi_decode_send(decoder,tokens.data()); mimi_decode_receive(decoder,decoded.data());

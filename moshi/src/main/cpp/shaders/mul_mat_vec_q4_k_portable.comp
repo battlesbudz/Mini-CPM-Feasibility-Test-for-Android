@@ -1,0 +1,79 @@
+#version 450
+
+// Q4_K compatibility path: fixed workgroup and shared storage, no subgroup
+// operations, specialization-sized arrays, narrow SSBO types or unrolled loops.
+// Packed GGML weights stay Q4_K; accumulation is F32. B is read as raw words
+// so the F16 variant also requires no 16-bit arithmetic/storage extensions.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 2) const uint NUM_COLS = 1;
+layout(binding = 0, std430) readonly buffer A { uint a[]; };
+layout(binding = 1, std430) readonly buffer B { uint b[]; };
+layout(binding = 2, std430) writeonly buffer D { float d[]; };
+layout(binding = 3, std430) readonly buffer F0 { float f0[]; };
+layout(binding = 4, std430) readonly buffer F1 { float f1[]; };
+layout(push_constant) uniform Parameters {
+    uint ncols, stride_a, stride_b, stride_d;
+    uint batch_stride_a, batch_stride_b, batch_stride_d;
+    uint fusion_flags;
+    uint ne02, ne12, broadcast2, broadcast3;
+} p;
+shared float sums[64];
+
+uint weight_byte(uint block_word, uint byte_index) {
+    return (a[block_word + byte_index / 4] >> (8 * (byte_index % 4))) & 255u;
+}
+float input_value(uint index) {
+#ifdef MOSHI_B_F16
+    vec2 pair = unpackHalf2x16(b[index / 2]);
+    return (index & 1u) == 0u ? pair.x : pair.y;
+#else
+    return uintBitsToFloat(b[index]);
+#endif
+}
+void main() {
+    const uint row = gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z;
+    if (row >= p.stride_d) return; // Uniform across this workgroup.
+    const uint lane = gl_LocalInvocationID.x;
+    const uint batch = gl_WorkGroupID.y;
+    const uint batch_a = (batch / p.ne12 / p.broadcast3) * p.ne02
+                      + (batch % p.ne12) / p.broadcast2;
+    const uint first_block = (batch_a * p.batch_stride_a + row * p.ncols) / 256;
+    for (uint col = 0; col < NUM_COLS; ++col) {
+        const uint input_offset = (batch + col) * p.batch_stride_b;
+        float sum = 0.0;
+        for (uint k = lane; k < p.ncols; k += 64) {
+            const uint word = (first_block + k / 256) * 36; // 144-byte Q4_K block.
+            const uint within = k % 256;
+            const uint group = within / 32;
+            uint scale, minimum;
+            if (group < 4) {
+                scale = weight_byte(word, 4 + group) & 63u;
+                minimum = weight_byte(word, 8 + group) & 63u;
+            } else {
+                scale = (weight_byte(word, 8 + group) & 15u)
+                      | ((weight_byte(word, group) >> 6) << 4);
+                minimum = (weight_byte(word, 8 + group) >> 4)
+                        | ((weight_byte(word, 4 + group) >> 6) << 4);
+            }
+            const uint packed = weight_byte(word, 16 + (within / 64) * 32 + within % 32);
+            const uint quant = (packed >> ((group & 1u) * 4)) & 15u;
+            const vec2 dm = unpackHalf2x16(a[word]);
+            const float weight = (dm.x * float(scale)) * float(quant) - dm.y * float(minimum);
+            sum += weight * input_value(input_offset + k);
+        }
+        sums[lane] = sum;
+        barrier();
+        for (uint step = 32; step > 0; step >>= 1) {
+            if (lane < step) sums[lane] += sums[lane + step];
+            barrier();
+        }
+        if (lane == 0) {
+            const uint output_index = (batch + col) * p.batch_stride_d + row;
+            float value = sums[0];
+            if ((p.fusion_flags & 1u) != 0u) value += f0[output_index];
+            if ((p.fusion_flags & 2u) != 0u) value += f1[output_index];
+            d[output_index] = value;
+        }
+        barrier(); // All readers finish before the next column overwrites sums.
+    }
+}

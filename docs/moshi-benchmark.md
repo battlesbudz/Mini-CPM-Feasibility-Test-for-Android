@@ -4,7 +4,7 @@ Separate application ID: `com.battlesbudz.moshitest`. Installs alongside Jarvis,
 
 ## Current phone test
 
-Build 11 passed both the Fold6 precision gate and full-model load-only test. Keep the existing APK and downloaded model pack. Select **Vulkan model · CPU codec**, then **3. Moshi voice replay · 20 sec**. Run once, listen to the output if available, and export the diagnostics ZIP. The 20 seconds describes the input timeline, not the processing duration; this unpaced test can take several minutes. Export failures or timeouts too. No new APK or repeat load-only test is needed.
+Build 11 loaded the full model but crashed during its first replay when the Adreno driver rejected the Q4_K matrix-vector pipeline. The next release includes a portable Q4_K shader and an automatic correctness check before model loading. Install it over build 11 to retain models and recording. Use **Vulkan model · CPU codec** and **3. Moshi voice replay · 20 sec** (the new defaults), run once and export diagnostics even if it fails. Listen to any output and report whether it answers the recording. No model re-download or repeat load-only test is needed. The 20 seconds is the input timeline, not processing time.
 
 ## Earlier phone tests
 
@@ -86,7 +86,8 @@ This test exercises 20 tone/silence frames, validates token ranges and finite no
 - Verified on Fold6 through build 9: IM2COL repair passes all 112,480 element checks; GPU audio no longer collapses and tokens are no longer constant. CPU output remains byte-identical to earlier working CPU builds.
 - Verified on Fold6 in build 11: opt-in FP32 Mimi accumulation matches all 1,000 CPU encoder tokens across 125 frames; identical-token GPU decoder NRMSE 0.0007614; no level collapse. CPU PCM remains byte-identical to build 9.
 - Verified on Fold6 in build 11: full Moshi Q4_K weights, CPU Mimi codec and initial 750-frame streaming state load successfully in 15.031 seconds; sampled peak worker PSS 4.80 GiB. No inference frames executed.
-- Next device gate: bounded full-model replay using the existing Vulkan-model/CPU-codec configuration. CPU codec remains the faster measured reference; FP32 is the supported accuracy choice for future GPU-codec integration, still opt-in in this APK.
+- Build 11 full replay failed before its first output at Q4_K Vulkan pipeline compilation; a portable Q4_K path and compiler-exception propagation are now implemented.
+- Next device gate: Q4_K preflight and bounded full-model replay using Vulkan model / CPU codec in the repaired release. CPU codec remains the faster measured reference; FP32 is the supported accuracy choice for future GPU-codec integration, still opt-in in this APK.
 - Unverified: first-frame inference allocations, coherent full replay, official-reference parity and real-time throughput.
 - Later gates: deterministic official-reference parity, sustained ten-minute inference, OpenCL comparison if justified, then live duplex and echo-control integration.
 
@@ -316,3 +317,59 @@ component timing. Extra graph allocations during inference may still exceed avai
 memory. Load success does not validate quantized model kernels, generated speech,
 real-time performance or live duplex. A failure ZIP is the next debugging evidence;
 there is no code change justified by this successful load-only result.
+
+
+## Build 11 full replay failure and Q4_K compatibility repair
+
+Evidence: `moshi-test (8).zip`, source
+`cc8228fa63c9ca1c0552048ccb4188a30be0802c`, SM-F956U / SDK 36 / Adreno 750,
+run `startedAtMs=1790065526718`. Mode 2 / backend 1 reached
+`Replaying recording through Moshi`, then logged:
+
+```
+Compute pipeline creation failed for mul_mat_vec_q4_k_f32_f32
+vk::Device::createComputePipeline: ErrorUnknown
+```
+
+Android recorded `WORKER_EXITED`, native crash, exit reason 5 / signal 11.
+Generated PCM and frame CSV are empty; no full-model response was established.
+Sampled peak worker PSS was 5,425,995 KiB (about 5.17 GiB); the last available-memory
+sample was 1,230,163,968 bytes, thermal status 1, and no low-memory flag. The explicit
+pipeline failure is the primary evidence; the driver error does not establish its
+internal cause or rule out all resource-related factors.
+
+Code inspection also found that the pinned Vulkan loader only called `wait()` on
+compiler futures. It discarded exceptions and could proceed with an uncompiled
+pipeline. The repair drains all futures with `get()`, rethrows the first exception,
+and releases the compiler slot through RAII on both success and failure. Android
+returns an error report and retires the worker; a backend with a failed graph must
+not be reused. Host-only fault injection verifies propagation and a fresh-context
+successful run. Fault injection is not compiled into Android.
+
+The scoped compatibility shader replaces non-expert Q4_K × F32/F16 matrix-vector
+pipelines in the Moshi integration copy. It uses fixed 64-lane workgroups, a fixed
+64-float shared array, ordinary reductions, packed 32-bit buffer reads, and F32
+accumulation. It avoids subgroup operations, narrow buffer types, specialization-sized
+arrays and the original unrolled shader structure. Weights remain Q4_K: no expanded
+F32 copy or CPU fallback. Other quantizations, integer-dot paths, expert routing and
+matrix-matrix kernels are unchanged. This is a compatibility candidate; its Adreno
+acceptance and performance need device measurement, and it may be slower than the
+original optimized shader.
+
+Before loading the full model, the app now tests 24 Q4_K cases / 48 dispatches against
+pinned CPU dequantization plus an independent double-accumulation oracle. It checks
+all 1,180 output elements, one through eight vectors, F32/F16 inputs, odd row counts,
+batch/broadcast indexing, up to two fused biases, model input widths 1,024 / 2,816 /
+4,096 / 11,264, changed-input reuse and unchanged weights. Per-element tolerance is
+0.0005 + 0.00002 × absolute reference, with NRMSE limited to 0.00002. Case starts are
+flushed to `q4-check.jsonl`; `q4-summary.json` records running/pass/fail. First-frame
+encode/model/decode phase markers now distinguish subsequent failures.
+
+The model widths were checked against the tensor directory of the manifest-pinned
+GGUF revision `ef0b8d55ea51706e5285fded849218f81ff637dc`: 439 tensors, including 337 Q4_K,
+25 Q4_0 and 77 F32. This header inspection is not a full-model execution test.
+
+Local Mesa Vulkan passed the Q4_K oracle and injected compiler-failure recovery.
+GitHub Actions repeats these checks, the existing IM2COL and actual Mimi precision
+regressions, and ARM64 release build/lint before publishing an APK. Full-model device
+inference, coherent speech and real-time throughput remain unverified.
