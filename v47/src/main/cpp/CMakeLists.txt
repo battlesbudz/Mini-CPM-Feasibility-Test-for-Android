@@ -23,6 +23,15 @@ if(ANDROID_ABI STREQUAL "arm64-v8a")
     set(GGML_OPENMP ON CACHE BOOL "" FORCE)
 endif()
 add_subdirectory("${OMNI_ROOT}" upstream EXCLUDE_FROM_ALL)
+# tools/mtmd/CMakeLists.txt reads LLAMA_INSTALL_VERSION, which the fork's
+# root CMakeLists sets as a normal variable in its own directory scope.
+# Upstream builds add mtmd from inside that scope; we add it from here, so
+# the variable is not visible and set_target_properties() gets an empty
+# VERSION (configure error at mtmd/CMakeLists.txt:48). Define it here,
+# mirroring the root computation (0.0.<build number>).
+if(NOT DEFINED LLAMA_INSTALL_VERSION)
+    set(LLAMA_INSTALL_VERSION 0.0.0)
+endif()
 add_subdirectory("${OMNI_ROOT}/tools/mtmd" mtmd EXCLUDE_FROM_ALL)
 add_library(minicpm_v47_bench SHARED benchmark.cpp)
 target_include_directories(minicpm_v47_bench PRIVATE
