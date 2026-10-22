@@ -1,35 +1,50 @@
-CPU alloc-only buffer type for the MoE-SSD (LES) model load path.
+Trial patch: give the CPU backend a Metal-style alloc-only buffer type, and
+make the model loader actually use it for CPU-assigned layers.
 
-The pinned fork (tc-mb/llama.cpp-omni @ 96bbf617) can only load the stripped
-`-les` MiniCPM-V 4.7 GGUF if the backend registry answers the
-"ggml_backend_dev_buffer_type_alloc_only" lookup: llama_model synthesizes the
-stripped routed-expert tensors from the experts manifest and must place them
-on a buffer type that is NOT the device default, because load_tensors wraps
-default-buft tensors into the (read-only) mmap of the model file while expert
-content is written at runtime by preadv from the experts pack.
+Upstream (tc-mb llama.cpp-omni) supports "stripped" (-les) MoE models whose
+routed expert tensors are absent from the GGUF and must be synthesized at
+load time into an alloc-only buffer (real storage is streamed in later by
+the slot-fill machinery). llama-model.cpp asks the backend registry for a
+proc named "ggml_backend_dev_buffer_type_alloc_only" (make_alloc_only_buft).
+At the pinned commit the only implementation is Metal's; the CPU backend
+answers nothing, so loading a stripped model on a CPU-only device dies at
+the first routed expert tensor:
 
-At the pin, only the Metal backend implements that lookup (it hands out its
-"mapped" buffer type: a distinct instance with ordinary allocations). The
-CPU backend exports no such proc, so llama_model_load_from_file throws
-"backend has no alloc-only buft" and returns null on Android (build 6;
-build 5 died one check earlier, on the slot-bank contract).
+    create_expert_tensor_from_manifest: backend has no alloc-only buft,
+    cannot synthesize stripped expert tensor 'blk.0.ffn_down_exps.weight'
 
-This patch mirrors the Metal semantics for CPU:
-- ggml-backend.cpp gains ggml_backend_cpu_buffer_type_alloc_only(): a second
-  CPU buffer type instance (name "CPU_AllocOnly") whose iface is exactly the
-  default CPU one (ggml_aligned_malloc host memory, TENSOR_ALIGNMENT,
-  is_host=true), defined next to the existing "CPU_Mapped" precedent.
-- ggml-cpu.cpp answers "ggml_backend_dev_buffer_type_alloc_only" in
-  ggml_backend_cpu_get_proc_address with a reg-level wrapper honoring the
-  size_t device-index argument (CPU registry has one device; out-of-range
-  returns nullptr, like Metal's bounds check).
+Part 1 mirrors the Metal semantics for CPU:
+  - ggml/include/ggml-backend.h: declare ggml_backend_cpu_alloc_only_buffer_type().
+  - ggml/src/ggml-backend.cpp: define a "CPU_AllocOnly" buffer type whose
+    buffers really allocate memory (CPU buffers are directly dereferenceable,
+    so unlike the GPU alloc-only type this is a plain allocating buft with a
+    distinct identity) and reuse the default CPU interface / host free path.
+  - ggml/src/ggml-cpu/ggml-cpu.cpp: answer the proc-address lookup for
+    "ggml_backend_dev_buffer_type_alloc_only" with a wrapper that maps the
+    device index the loader passes (0 == the single CPU device) to the
+    CPU_AllocOnly buffer type.
 
-Applied to the fetched fork by scripts/prepare_v47.py; the vendored checkout
-is never edited by hand. No behavior changes for any other buffer type.
+Part 1 alone is not enough: the loader never queries the CPU device.
+  - src/llama-model.cpp (load_tensors): the alloc_only_buft map is only
+    populated for devices in the model's device list, and that list never
+    contains the CPU device (llama_prepare_model_devices keeps only
+    GPU/IGPU/RPC devices; CPU layers are the implicit fallback). Ask for
+    the CPU device's alloc-only buft explicitly next to the existing
+    cpu_dev lookup.
+  - src/llama-model.cpp (create_tensor_own_alloc,
+    create_expert_tensor_from_manifest): derive the lookup device from the
+    layer's assigned device (dev_layer[bid].dev) instead of from the
+    layer's first buffer type. The CPU backend's default buft reports a
+    NULL device (upstream FIXME in ggml-backend.cpp), so the old
+    derivation yields nullptr for any layer whose buft list starts with
+    the plain CPU buft, and the map lookup misses even with the entry
+    present. On GPU paths the two derivations agree.
 
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 27b22c5..355aa37 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -430,6 +430,7 @@
+@@ -430,6 +430,7 @@ extern "C" {
      // CPU buffer types are always available
      GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
      GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
@@ -37,9 +52,11 @@ is never edited by hand. No behavior changes for any other buffer type.
  
  #ifdef  __cplusplus
  }
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 9681df9..4e4ea31 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -2355,6 +2355,40 @@
+@@ -2355,6 +2355,40 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
      return &ggml_backend_cpu_buffer_type;
  }
  
@@ -80,9 +97,11 @@ is never edited by hand. No behavior changes for any other buffer type.
  static const char * ggml_backend_cpu_buffer_from_ptr_type_get_name(ggml_backend_buffer_type_t buft) {
      return "CPU_Mapped";
  
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 128883b..79569d0 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
-@@ -639,6 +639,20 @@
+@@ -639,6 +639,20 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
      GGML_UNUSED(reg);
  }
  
@@ -103,7 +122,7 @@ is never edited by hand. No behavior changes for any other buffer type.
  static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
      if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
          ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
-@@ -648,6 +662,9 @@
+@@ -648,6 +662,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
          ggml_backend_dev_get_extra_bufts_t fct = ggml_backend_cpu_device_get_extra_buffers_type;
          return (void *)fct;
      }
@@ -113,3 +132,53 @@ is never edited by hand. No behavior changes for any other buffer type.
      if (strcmp(name, "ggml_backend_get_features") == 0) {
          return (void *)ggml_backend_cpu_get_features;
      }
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index f896b83..0524ab9 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1308,6 +1308,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         throw std::runtime_error(format("%s: no CPU backend found", __func__));
+     }
+ 
++    // The CPU device is never part of the model's device list (it is the
++    // implicit fallback for layers that are not offloaded), so the loop above
++    // never asks it for an alloc-only buft. CPU-assigned layers look the CPU
++    // device up in this same map (see create_expert_tensor_from_manifest),
++    // so ask for it here: without this entry a CPU-only load can never
++    // synthesize stripped expert tensors.
++    if (ggml_backend_buffer_type_t buft = make_alloc_only_buft(cpu_dev)) {
++        pimpl->alloc_only_buft.emplace(cpu_dev, buft);
++    }
++
+     // calculate the split points
+     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
+     std::vector<float> splits(n_devices());
+@@ -1706,9 +1716,14 @@ ggml_tensor * llama_model_base::create_tensor_own_alloc(llama_model_loader & ml,
+     //
+     // 未开 mmap 时行为与原来一致（那个 buft 的 alloc_buffer 就是普通的 shared 分配），
+     // 所以这个改动对现有路径是透明的。
++    // Use the device the layer was assigned to. Deriving it from the layer's
++    // first buft is unreliable: the CPU backend's default buft reports a
++    // NULL device (see ggml_backend_cpu_buffer_type), so on a layer whose
++    // buft list starts with that buft the lookup below would miss the
++    // device even when the map has an entry for it.
+     ggml_backend_dev_t dev = tn.bid == -1
+         ? nullptr
+-        : ggml_backend_buft_get_device(pimpl->dev_layer.at(tn.bid).buft_list->front().second);
++        : pimpl->dev_layer.at(tn.bid).dev;
+ 
+     // 诊断开关：退回「和非专家权重共用一个 buffer」的旧行为，用于 A/B。
+     static const bool disabled = [] {
+@@ -1736,9 +1751,11 @@ ggml_tensor * llama_model_base::create_expert_tensor_from_manifest(llama_model_l
+     // gguf 里没有这个专家张量（已剥离），只能用 experts manifest 的形状/类型合成。
+     // 必须放在 alloc_only_buft 上：专家内容是 preadv 运行时写入的，不能被 mmap
+     // 的文件映射包住（见 create_tensor_own_alloc 的说明）。
++    // Use the device the layer was assigned to (see create_tensor_own_alloc:
++    // the layer's first buft is not a reliable source for it on CPU).
+     ggml_backend_dev_t dev = tn.bid == -1
+         ? nullptr
+-        : ggml_backend_buft_get_device(pimpl->dev_layer.at(tn.bid).buft_list->front().second);
++        : pimpl->dev_layer.at(tn.bid).dev;
+ 
+     const auto it = dev ? pimpl->alloc_only_buft.find(dev) : pimpl->alloc_only_buft.end();
+     if (it == pimpl->alloc_only_buft.end()) {

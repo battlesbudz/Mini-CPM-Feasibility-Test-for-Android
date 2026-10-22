@@ -129,7 +129,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         {"profile", "minicpm-v47-phone-trial-v1"},
         {"runtime", "llama.cpp-omni (tc-mb fork, LES / MoE-SSD)"},
         {"runtimeCommit", RUNTIME_COMMIT},
-        {"runtimePatch", "v47/patches/ggml-cpu-alloc-only-buft.patch (CPU alloc-only buft for the LES load path)"},
+        {"runtimePatch", "v47/patches/ggml-cpu-alloc-only-buft.patch (CPU alloc-only buft + llama-model.cpp loader fix)"},
         {"modelRepo", "tc-mb/MiniCPM-V-Apps-gguf"},
         {"modelRevision", "8716e5209f308fd53f197ccd7d50c6fdcc2dc37d"},
         {"modelFiles", "main -les gguf + mmproj f16 + experts/ (40 shards + manifest.json)"},
