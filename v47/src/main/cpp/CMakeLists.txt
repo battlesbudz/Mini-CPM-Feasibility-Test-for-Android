@@ -23,6 +23,17 @@ if(ANDROID_ABI STREQUAL "arm64-v8a")
     set(GGML_OPENMP ON CACHE BOOL "" FORCE)
 endif()
 add_subdirectory("${OMNI_ROOT}" upstream EXCLUDE_FROM_ALL)
+if(ANDROID)
+    # Portability shim for the fork's LES slot runtime: llama-moe-slot.cpp
+    # toggles the Darwin-only F_NOCACHE fcntl command on its experts fds.
+    # That toggle is an advisory page-cache hint only (failures are logged,
+    # reads do not depend on it) and it is reached only when the
+    # LLAMA_MOE_F_NOCACHE env toggle is explicitly enabled. Bionic does not
+    # define F_NOCACHE, so the fork does not compile for Android as pinned.
+    # Darwin's value (48) is an unassigned fcntl command on Linux, so the
+    # call fails cleanly with EINVAL if ever reached. Data is unaffected.
+    target_compile_definitions(llama PRIVATE F_NOCACHE=48)
+endif()
 # tools/mtmd/CMakeLists.txt reads LLAMA_INSTALL_VERSION, which the fork's
 # root CMakeLists sets as a normal variable in its own directory scope.
 # Upstream builds add mtmd from inside that scope; we add it from here, so
