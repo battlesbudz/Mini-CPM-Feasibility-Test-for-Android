@@ -127,7 +127,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
 
     emit("Loading MiniCPM-V 4.7 main model (LES expert streaming)");
     const auto load_start = Clock::now();
-    llama_model_params mparams = llama_model_params_default();
+    llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0;
     mparams.use_mmap = true;
     mparams.moe_experts_path = experts_path.c_str();
@@ -156,7 +156,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
 
     emit("Creating context");
     const auto ctx_start = Clock::now();
-    llama_context_params cparams = llama_context_params_default();
+    llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = N_CTX;
     cparams.n_batch = N_BATCH;
     cparams.n_ubatch = 512;
