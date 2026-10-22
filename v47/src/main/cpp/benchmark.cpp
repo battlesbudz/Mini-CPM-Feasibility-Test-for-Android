@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <sys/resource.h>
@@ -62,9 +63,30 @@ static std::string jstr(JNIEnv * env, jstring value) {
     env->ReleaseStringUTFChars(value, p);
     return out;
 }
+// The llama/ggml loader explains its failures only through this log stream
+// (llama_model_load_from_file itself just returns null), so accumulate the
+// stream and ship it in the report: a failed run must say where it died in
+// the loader's own words. Capped so a noisy run cannot bloat the report.
+static std::string g_loader_log;
+static std::mutex g_loader_log_mutex;
+static const size_t LOADER_LOG_MAX = 256 * 1024;
+
 static void log_callback(ggml_log_level level, const char * text, void *) {
     __android_log_print(level == GGML_LOG_LEVEL_ERROR ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO,
                         "MiniCPMV47", "%s", text);
+    if (text) {
+        std::lock_guard<std::mutex> lock(g_loader_log_mutex);
+        if (g_loader_log.size() < LOADER_LOG_MAX) {
+            g_loader_log += text;
+        }
+    }
+}
+static std::string loader_log_snapshot() {
+    std::lock_guard<std::mutex> lock(g_loader_log_mutex);
+    if (g_loader_log.size() >= LOADER_LOG_MAX) {
+        return g_loader_log + "\n[loader log truncated at 256 KiB]\n";
+    }
+    return g_loader_log;
 }
 
 static llama_token greedy_token(llama_context * ctx, const llama_vocab * vocab) {
@@ -107,6 +129,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         {"profile", "minicpm-v47-phone-trial-v1"},
         {"runtime", "llama.cpp-omni (tc-mb fork, LES / MoE-SSD)"},
         {"runtimeCommit", RUNTIME_COMMIT},
+        {"runtimePatch", "v47/patches/ggml-cpu-alloc-only-buft.patch (CPU alloc-only buft for the LES load path)"},
         {"modelRepo", "tc-mb/MiniCPM-V-Apps-gguf"},
         {"modelRevision", "8716e5209f308fd53f197ccd7d50c6fdcc2dc37d"},
         {"modelFiles", "main -les gguf + mmproj f16 + experts/ (40 shards + manifest.json)"},
@@ -121,6 +144,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     auto fail = [&](const std::string & phase, const std::string & message) -> jstring {
         report["errorPhase"] = phase;
         report["error"] = message;
+        report["loaderLog"] = loader_log_snapshot();
         report["peakRssKb"] = peak_rss_kb();
         report["totalMs"] = ms_between(trial_start, Clock::now());
         emit("FAILED at " + phase + ": " + message);
@@ -296,6 +320,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     if (!fatal.empty()) return fail(fatal_phase, fatal);
     report["peakRssKb"] = peak_rss_kb();
     report["totalMs"] = ms_between(trial_start, Clock::now());
+    report["loaderLog"] = loader_log_snapshot();
     emit("Trial complete");
     return env->NewStringUTF(report.dump(2).c_str());
 }

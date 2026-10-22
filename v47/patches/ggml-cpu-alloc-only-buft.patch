@@ -1,0 +1,115 @@
+CPU alloc-only buffer type for the MoE-SSD (LES) model load path.
+
+The pinned fork (tc-mb/llama.cpp-omni @ 96bbf617) can only load the stripped
+`-les` MiniCPM-V 4.7 GGUF if the backend registry answers the
+"ggml_backend_dev_buffer_type_alloc_only" lookup: llama_model synthesizes the
+stripped routed-expert tensors from the experts manifest and must place them
+on a buffer type that is NOT the device default, because load_tensors wraps
+default-buft tensors into the (read-only) mmap of the model file while expert
+content is written at runtime by preadv from the experts pack.
+
+At the pin, only the Metal backend implements that lookup (it hands out its
+"mapped" buffer type: a distinct instance with ordinary allocations). The
+CPU backend exports no such proc, so llama_model_load_from_file throws
+"backend has no alloc-only buft" and returns null on Android (build 6;
+build 5 died one check earlier, on the slot-bank contract).
+
+This patch mirrors the Metal semantics for CPU:
+- ggml-backend.cpp gains ggml_backend_cpu_buffer_type_alloc_only(): a second
+  CPU buffer type instance (name "CPU_AllocOnly") whose iface is exactly the
+  default CPU one (ggml_aligned_malloc host memory, TENSOR_ALIGNMENT,
+  is_host=true), defined next to the existing "CPU_Mapped" precedent.
+- ggml-cpu.cpp answers "ggml_backend_dev_buffer_type_alloc_only" in
+  ggml_backend_cpu_get_proc_address with a reg-level wrapper honoring the
+  size_t device-index argument (CPU registry has one device; out-of-range
+  returns nullptr, like Metal's bounds check).
+
+Applied to the fetched fork by scripts/prepare_v47.py; the vendored checkout
+is never edited by hand. No behavior changes for any other buffer type.
+
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -430,6 +430,7 @@
+     // CPU buffer types are always available
+     GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
+     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
++    GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type_alloc_only(void);
+ 
+ #ifdef  __cplusplus
+ }
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2355,6 +2355,40 @@
+     return &ggml_backend_cpu_buffer_type;
+ }
+ 
++static const char * ggml_backend_cpu_buffer_alloc_only_type_get_name(ggml_backend_buffer_type_t buft) {
++    return "CPU_AllocOnly";
++
++    GGML_UNUSED(buft);
++}
++
++// A second CPU buffer type instance whose allocation behavior is identical to
++// the default CPU buffer type (plain aligned host memory). It exists for
++// llama's MoE-SSD (LES) load path: tensors whose content is produced at
++// runtime (MoE expert slots filled by preadv from the experts pack) must not
++// be folded into the mmap of the model file, and llama_model::load_tensors
++// only wraps tensors of the device *default* buffer type into that mapping
++// (a pointer comparison), so the synthesized expert tensors need a distinct
++// buffer type whose buffers are real allocations. The CPU registry hands
++// this type out for the "ggml_backend_dev_buffer_type_alloc_only" lookup,
++// mirroring how the Metal backend hands out its mapped buffer type for it.
++ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type_alloc_only(void) {
++    static struct ggml_backend_buffer_type ggml_backend_cpu_buffer_type_alloc_only = {
++        /* .iface   = */ {
++            /* .get_name         = */ ggml_backend_cpu_buffer_alloc_only_type_get_name,
++            /* .alloc_buffer     = */ ggml_backend_cpu_buffer_type_alloc_buffer,
++            /* .get_alignment    = */ ggml_backend_cpu_buffer_type_get_alignment,
++            /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
++            /* .get_alloc_size   = */ NULL, // defaults to ggml_nbytes
++            /* .is_host          = */ ggml_backend_cpu_buffer_type_is_host,
++            /* .is_host_addressable = */ NULL, // fall back to is_host
++        },
++        /* .device  = */ NULL, // same as the default CPU buffer type
++        /* .context = */ NULL,
++    };
++
++    return &ggml_backend_cpu_buffer_type_alloc_only;
++}
++
+ static const char * ggml_backend_cpu_buffer_from_ptr_type_get_name(ggml_backend_buffer_type_t buft) {
+     return "CPU_Mapped";
+ 
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -639,6 +639,20 @@
+     GGML_UNUSED(reg);
+ }
+ 
++static ggml_backend_buffer_type_t ggml_backend_cpu_reg_buffer_type_alloc_only(size_t device) {
++    // The CPU registry has a single device, so only index 0 is valid (the
++    // Metal backend bounds-checks the same way). The buffer type allocates
++    // plain host memory exactly like the device default; it only needs to be
++    // a distinct instance so llama's mmap load path does not wrap its tensors
++    // into the model file mapping (see ggml_backend_cpu_buffer_type_alloc_only
++    // in ggml-backend.cpp).
++    if (device != 0) {
++        return nullptr;
++    }
++
++    return ggml_backend_cpu_buffer_type_alloc_only();
++}
++
+ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
+         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
+@@ -648,6 +662,9 @@
+         ggml_backend_dev_get_extra_bufts_t fct = ggml_backend_cpu_device_get_extra_buffers_type;
+         return (void *)fct;
+     }
++    if (strcmp(name, "ggml_backend_dev_buffer_type_alloc_only") == 0) {
++        return (void *)ggml_backend_cpu_reg_buffer_type_alloc_only;
++    }
+     if (strcmp(name, "ggml_backend_get_features") == 0) {
+         return (void *)ggml_backend_cpu_get_features;
+     }
