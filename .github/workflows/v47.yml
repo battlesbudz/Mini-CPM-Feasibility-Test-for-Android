@@ -1,0 +1,40 @@
+name: MiniCPM-V 4.7 phone trial APK
+on:
+  push:
+    branches: [main]
+    paths: ["v47/**", "scripts/prepare_v47.py", "settings.gradle.kts", ".github/workflows/v47.yml"]
+  pull_request:
+    paths: ["v47/**", "scripts/prepare_v47.py", "settings.gradle.kts", ".github/workflows/v47.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install pinned Android tools
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
+      - name: Fetch pinned native runtime
+        run: python3 scripts/prepare_v47.py
+      - name: Test and build
+        run: ./gradlew --no-daemon :v47:testDebugUnitTest :v47:assembleRelease
+      - name: Preserve test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v47-validation-results
+          path: |
+            v47/build/reports/tests/
+            v47/build/outputs/androidTest-results/
+      - name: Upload trial APK (artifact only, no release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiniCPM-V47-phone-trial-apk
+          path: v47/build/outputs/apk/release/v47-release.apk
