@@ -34,6 +34,17 @@ static const char * MODEL_SUBDIR   = "MiniCPM-V-4.7-35B-A3B";
 static const char * MAIN_GGUF      = "MiniCPM-V-4_7-35B-A3B-mix_q3gud_im-les.gguf";
 static const char * MMPROJ_GGUF    = "mmproj-model-f16.gguf";
 static const int    N_THREADS      = 4;
+// LES contract in the pinned fork: llama_model_params.moe_experts_path and
+// moe_slot_bank MUST be set together (include/llama.h: "Both fields must be
+// set together"). With the path set and the bank left at its default of 0,
+// the llama_model constructor throws std::invalid_argument, which
+// llama_model_load catches and converts into a null model return — that was
+// the build-5 device failure (null in ~170 ms, before any tensor loads).
+// 256 is the vendor demo's own default for this model
+// (MiniCPMV47Const.defaultSlotBank; min = expert_used_count 8,
+// max = expert_count 256). Resident cost on this pack:
+// 256 slots x 1,351,680 B per-slot-per-layer bytes = ~330 MiB.
+static const int    MOE_SLOT_BANK  = 256;
 static const int    N_CTX          = 4096;
 static const int    N_BATCH        = 2048;
 static const int    MAX_NEW_TOKENS = 512;
@@ -124,6 +135,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     const std::string mmproj_path  = model_dir + "/" + MMPROJ_GGUF;
     const std::string experts_path = model_dir + "/experts";
     report["moeExpertsPath"] = experts_path;
+    report["moeSlotBank"] = MOE_SLOT_BANK;
 
     emit("Loading MiniCPM-V 4.7 main model (LES expert streaming)");
     const auto load_start = Clock::now();
@@ -131,6 +143,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     mparams.n_gpu_layers = 0;
     mparams.use_mmap = true;
     mparams.moe_experts_path = experts_path.c_str();
+    mparams.moe_slot_bank = MOE_SLOT_BANK;
     llama_model * model = llama_model_load_from_file(main_path.c_str(), mparams);
     if (!model) return fail("model_load", "llama_model_load_from_file returned null for " + main_path);
     report["loadModelMs"] = ms_between(load_start, Clock::now());
