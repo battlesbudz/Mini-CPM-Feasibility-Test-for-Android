@@ -123,6 +123,24 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         env->CallVoidMethod(listener, on_event, js);
         env->DeleteLocalRef(js);
     };
+    // Build 9 diagnostic instrumentation (observability only, no model
+    // behavior changes): live stage checkpoints. The native run is one
+    // blocking JNI call, and before build 9 the only in-case events were
+    // the case-start line and a token count every 32 tokens, so a stall
+    // inside vision encode, prefill or a slow decode was indistinguishable
+    // from a hard hang (build 8, Case 1, 30 minutes, no further events).
+    // Checkpoints go out as "PROGRESS {json}" events; the service parses
+    // them and merges the fields into status.json, stamping wall-clock
+    // times itself (stageStartedAtMs on a stage start, lastProgressAtMs
+    // on every checkpoint). Payload keys: stage, event (start / progress
+    // / first_token / done), caseIndex, label (readable phase text), plus
+    // per-stage measurements (modelLoadMs, mmprojLoadMs, contextMs,
+    // tokenizeMs, visionMs, prefillMs, promptTokens, imageTokens,
+    // generatedTokens, decodeElapsedMs, decodeTokensPerSec). The plain
+    // phase events above are unchanged.
+    auto emit_progress = [&](const json & fields) {
+        emit("PROGRESS " + fields.dump());
+    };
 
     json report = {
         {"schemaVersion", 2},
@@ -142,6 +160,8 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     };
     const auto trial_start = Clock::now();
     auto fail = [&](const std::string & phase, const std::string & message) -> jstring {
+        emit_progress({{"stage", "failed"}, {"event", "done"}, {"errorPhase", phase},
+                       {"label", "Failed at " + phase}});
         report["errorPhase"] = phase;
         report["error"] = message;
         report["loaderLog"] = loader_log_snapshot();
@@ -162,6 +182,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     report["moeSlotBank"] = MOE_SLOT_BANK;
 
     emit("Loading MiniCPM-V 4.7 main model (LES expert streaming)");
+    emit_progress({{"stage", "model_load"}, {"event", "start"}, {"label", "Loading main model"}});
     const auto load_start = Clock::now();
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0;
@@ -170,7 +191,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     mparams.moe_slot_bank = MOE_SLOT_BANK;
     llama_model * model = llama_model_load_from_file(main_path.c_str(), mparams);
     if (!model) return fail("model_load", "llama_model_load_from_file returned null for " + main_path);
-    report["loadModelMs"] = ms_between(load_start, Clock::now());
+    const double load_model_ms = ms_between(load_start, Clock::now());
+    report["loadModelMs"] = load_model_ms;
+    emit_progress({{"stage", "model_load"}, {"event", "done"}, {"label", "Main model loaded"},
+                   {"modelLoadMs", load_model_ms}, {"stageElapsedMs", load_model_ms}});
     {
         char desc[256];
         llama_model_desc(model, desc, sizeof(desc));
@@ -180,6 +204,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     emit("Main model loaded");
 
     emit("Loading vision projector (mmproj)");
+    emit_progress({{"stage", "mmproj_load"}, {"event", "start"}, {"label", "Loading vision projector"}});
     const auto mmproj_start = Clock::now();
     mtmd_context_params vparams = mtmd_context_params_default();
     vparams.use_gpu = false;
@@ -188,10 +213,14 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     vparams.image_max_slice_nums = 9; // vendor demo default for MiniCPM-V
     mtmd_context * vision = mtmd_init_from_file(mmproj_path.c_str(), model, vparams);
     if (!vision) { llama_model_free(model); return fail("mmproj_load", "mtmd_init_from_file returned null for " + mmproj_path); }
-    report["loadMmprojMs"] = ms_between(mmproj_start, Clock::now());
+    const double load_mmproj_ms = ms_between(mmproj_start, Clock::now());
+    report["loadMmprojMs"] = load_mmproj_ms;
+    emit_progress({{"stage", "mmproj_load"}, {"event", "done"}, {"label", "Vision projector loaded"},
+                   {"mmprojLoadMs", load_mmproj_ms}, {"stageElapsedMs", load_mmproj_ms}});
     report["visionSupported"] = mtmd_support_vision(vision);
 
     emit("Creating context");
+    emit_progress({{"stage", "context_create"}, {"event", "start"}, {"label", "Creating context"}});
     const auto ctx_start = Clock::now();
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = N_CTX;
@@ -201,7 +230,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     cparams.n_threads_batch = N_THREADS;
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) { mtmd_free(vision); llama_model_free(model); return fail("context", "llama_init_from_model returned null"); }
-    report["contextMs"] = ms_between(ctx_start, Clock::now());
+    const double context_ms = ms_between(ctx_start, Clock::now());
+    report["contextMs"] = context_ms;
+    emit_progress({{"stage", "context_create"}, {"event", "done"}, {"label", "Context created"},
+                   {"contextMs", context_ms}, {"stageElapsedMs", context_ms}});
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
     llama_batch batch = llama_batch_init(1, 0, 1);
@@ -220,6 +252,9 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         emit("Case " + std::to_string(qi + 1) + "/3: " + question);
         json kase = {{"index", qi + 1}, {"prompt", question}};
         const auto case_start = Clock::now();
+        emit_progress({{"stage", "tokenize"}, {"event", "start"}, {"caseIndex", qi + 1},
+                       {"generatedTokens", 0},
+                       {"label", "Case " + std::to_string(qi + 1) + ": reading image"}});
         llama_memory_clear(llama_get_memory(ctx), true);
         llama_pos n_past = 0;
 
@@ -237,7 +272,11 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         const mtmd_bitmap * bitmaps[] = { bitmap };
         const auto tok_start = Clock::now();
         int32_t tres = mtmd_tokenize(vision, chunks, &text, bitmaps, 1);
-        kase["tokenizeMs"] = ms_between(tok_start, Clock::now());
+        const double tokenize_ms = ms_between(tok_start, Clock::now());
+        kase["tokenizeMs"] = tokenize_ms;
+        emit_progress({{"stage", "tokenize"}, {"event", "done"}, {"caseIndex", qi + 1},
+                       {"tokenizeMs", tokenize_ms}, {"stageElapsedMs", tokenize_ms},
+                       {"label", "Case " + std::to_string(qi + 1) + ": evaluating prompt"}});
         mtmd_bitmap_free(bitmap);
         if (tres != 0) {
             mtmd_input_chunks_free(chunks);
@@ -248,9 +287,27 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         size_t image_tokens = 0, prompt_tokens = 0;
         bool eval_ok = true;
         const size_t n_chunks = mtmd_input_chunks_size(chunks);
+        // Pre-scan so the vision_encode stage can close the moment the
+        // last image chunk finishes (image chunks sit inside the prefill
+        // loop; visionMs below is the image-chunk share of prefillMs,
+        // matching the report's existing visionEvalMs/prefillMs split).
+        size_t last_image_chunk = n_chunks; // n_chunks == no image chunk
+        for (size_t ci = 0; ci < n_chunks; ci++) {
+            if (mtmd_input_chunk_get_type(mtmd_input_chunks_get(chunks, ci)) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                last_image_chunk = ci;
+            }
+        }
+        bool vision_started = false;
+        emit_progress({{"stage", "prefill"}, {"event", "start"}, {"caseIndex", qi + 1},
+                       {"label", "Case " + std::to_string(qi + 1) + ": evaluating prompt"}});
         for (size_t ci = 0; ci < n_chunks; ci++) {
             const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, ci);
             const bool is_image = mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE;
+            if (is_image && !vision_started) {
+                vision_started = true;
+                emit_progress({{"stage", "vision_encode"}, {"event", "start"}, {"caseIndex", qi + 1},
+                               {"label", "Case " + std::to_string(qi + 1) + ": vision encode"}});
+            }
             const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk);
             prompt_tokens += n_tok;
             if (is_image) image_tokens += n_tok;
@@ -266,6 +323,11 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
             prefill_ms += chunk_ms;
             if (is_image) vision_ms += chunk_ms;
             n_past = new_n_past;
+            if (is_image && ci == last_image_chunk) {
+                emit_progress({{"stage", "vision_encode"}, {"event", "done"}, {"caseIndex", qi + 1},
+                               {"visionMs", vision_ms}, {"stageElapsedMs", vision_ms},
+                               {"label", "Case " + std::to_string(qi + 1) + ": vision encode done"}});
+            }
         }
         mtmd_input_chunks_free(chunks);
         kase["promptTokens"] = prompt_tokens;
@@ -273,6 +335,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         kase["visionEvalMs"] = vision_ms;
         kase["prefillMs"] = prefill_ms;
         if (!eval_ok) { fatal_phase = "prefill"; fatal = "mtmd_helper_eval_chunk_single failed in case " + std::to_string(qi + 1); break; }
+        emit_progress({{"stage", "prefill"}, {"event", "done"}, {"caseIndex", qi + 1},
+                       {"prefillMs", prefill_ms}, {"visionMs", vision_ms}, {"stageElapsedMs", prefill_ms},
+                       {"promptTokens", prompt_tokens}, {"imageTokens", image_tokens},
+                       {"label", "Case " + std::to_string(qi + 1) + ": generating answer"}});
 
         // Greedy generation.
         const auto gen_start = Clock::now();
@@ -280,12 +346,34 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         int generated = 0;
         bool ended_eos = false;
         double decode_calls_ms = 0.0;
+        emit_progress({{"stage", "decode"}, {"event", "start"}, {"caseIndex", qi + 1},
+                       {"generatedTokens", 0},
+                       {"label", "Case " + std::to_string(qi + 1) + ": generating answer"}});
+        auto last_progress_emit = Clock::now();
         while (generated < MAX_NEW_TOKENS) {
             const llama_token token = greedy_token(ctx, vocab);
             if (llama_vocab_is_eog(vocab, token)) { ended_eos = true; break; }
             if (generated == 0) kase["ttftMs"] = ms_between(case_start, Clock::now());
             answer += token_piece(vocab, token);
             generated++;
+            if (generated == 1) {
+                emit_progress({{"stage", "decode"}, {"event", "first_token"}, {"caseIndex", qi + 1},
+                               {"generatedTokens", generated},
+                               {"ttftMs", kase["ttftMs"].get<double>()},
+                               {"label", "Case " + std::to_string(qi + 1) + ": generating answer"}});
+                last_progress_emit = Clock::now();
+            } else if (ms_between(last_progress_emit, Clock::now()) >= 1000.0) {
+                // Live token counter, ~1 Hz: status.json always shows the
+                // latest count and (via the service stamp) when the last
+                // token arrived, so a crawl reads as a crawl, not a hang.
+                const double decode_elapsed_ms = ms_between(gen_start, Clock::now());
+                emit_progress({{"stage", "decode"}, {"event", "progress"}, {"caseIndex", qi + 1},
+                               {"generatedTokens", generated},
+                               {"decodeElapsedMs", decode_elapsed_ms},
+                               {"decodeTokensPerSec", decode_elapsed_ms > 0 ? generated / (decode_elapsed_ms / 1000.0) : 0.0},
+                               {"label", "Case " + std::to_string(qi + 1) + ": generating answer"}});
+                last_progress_emit = Clock::now();
+            }
             if (generated % 32 == 0) emit("Case " + std::to_string(qi + 1) + ": " + std::to_string(generated) + " tokens");
             if (generated >= MAX_NEW_TOKENS) break;
             batch.n_tokens = 1;
@@ -306,6 +394,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         kase["generatedTokens"] = generated;
         kase["decodeTokensPerSec"] = gen_wall_ms > 0 ? generated / (gen_wall_ms / 1000.0) : 0.0;
         kase["endedByEos"] = ended_eos;
+        emit_progress({{"stage", "decode"}, {"event", "done"}, {"caseIndex", qi + 1},
+                       {"generatedTokens", generated}, {"decodeWallMs", gen_wall_ms},
+                       {"decodeTokensPerSec", kase["decodeTokensPerSec"].get<double>()},
+                       {"label", "Case " + std::to_string(qi + 1) + " complete"}});
         kase["peakRssKb"] = peak_rss_kb();
         kase["answer"] = answer;
         cases.push_back(kase);

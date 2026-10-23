@@ -16,10 +16,23 @@ public final class BenchmarkService extends Service {
     private JSONObject state;
     private int chargeStart;
     private volatile String currentPhase="Starting";
+    private volatile JSONObject lastProgress;
+    private volatile long lastProgressAtMs;
     @Override public IBinder onBind(Intent intent){return null;}
     private synchronized void state(String phase,String status){
         currentPhase=phase;
         try{state.put("phase",phase).put("status",status).put("updatedAtMs",System.currentTimeMillis()).put("pid",android.os.Process.myPid());write(new File(getFilesDir(),"status.json"),state.toString(2));}
+        catch(Exception ignored){} // Retain the previous checkpoint on I/O failure.
+    }
+    private void onNativeEvent(String message){
+        JSONObject progress=Progress.parse(message);
+        if(progress==null){state(message,"RUNNING");return;}
+        lastProgress=progress;lastProgressAtMs=System.currentTimeMillis();
+        progressState(progress);
+    }
+    private synchronized void progressState(JSONObject progress){
+        currentPhase=Progress.label(progress);
+        try{Progress.merge(state,progress,System.currentTimeMillis());state.put("phase",currentPhase).put("status","RUNNING").put("updatedAtMs",System.currentTimeMillis()).put("pid",android.os.Process.myPid());write(new File(getFilesDir(),"status.json"),state.toString(2));}
         catch(Exception ignored){} // Retain the previous checkpoint on I/O failure.
     }
     static void write(File target,String value)throws IOException{
@@ -53,6 +66,8 @@ public final class BenchmarkService extends Service {
                     .put("systemAvailableBytes",system.availMem).put("systemTotalBytes",system.totalMem)
                     .put("systemLowMemoryThresholdBytes",system.threshold).put("systemLowMemory",system.lowMemory)
                     .put("thermalStatus",pm.getCurrentThermalStatus()).put("peakThermalStatus",peakThermal);
+                JSONObject progress=lastProgress;
+                if(progress!=null){sample.put("stage",progress.optString("stage",""));if(progress.has("caseIndex"))sample.put("stageCase",progress.optInt("caseIndex"));if(progress.has("generatedTokens"))sample.put("generatedTokens",progress.optInt("generatedTokens"));sample.put("lastProgressAtMs",lastProgressAtMs);}
                 write(new File(run,"memory.json"),sample.toString(2));
                 try(FileOutputStream out=new FileOutputStream(new File(run,"memory-history.jsonl"),true)){
                     out.write((sample.toString()+"\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));out.getFD().sync();
@@ -68,7 +83,7 @@ public final class BenchmarkService extends Service {
             ModelStore models=new ModelStore(this);if(!models.ready())throw new IOException("Model pack is not verified");
             File image=new File(getFilesDir(),"test-bus.jpg");
             try(InputStream in=getAssets().open("test-bus.jpg")){Files.copy(in,image.toPath(),StandardCopyOption.REPLACE_EXISTING);}
-            JSONObject report=new JSONObject(NativeBench.run(models.root.getPath(),image.getPath(),run.getPath(),message->{heartbeat=SystemClock.elapsedRealtime();state(message,"RUNNING");}));
+            JSONObject report=new JSONObject(NativeBench.run(models.root.getPath(),image.getPath(),run.getPath(),message->{heartbeat=SystemClock.elapsedRealtime();onNativeEvent(message);}));
             JSONArray cases=report.optJSONArray("cases");int answered=0;
             if(cases!=null)for(int i=0;i<cases.length();i++){JSONObject c=cases.optJSONObject(i);if(c!=null&&c.optInt("generatedTokens",0)>0)answered++;}
             String verdict=TrialVerdict.classify(report.has("error"),report.optString("error"),answered,cases==null?0:cases.length());

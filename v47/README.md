@@ -32,6 +32,32 @@ through OpenBMB's own phone stack, and what does it answer?
   Faraday's pipelines on the same photo: native ONNX 5 detections
   (3 people / 2 cars, ~0.3 s); phone-inference server 17 raw detections.
 
+## Live stage checkpoints (build 9)
+
+Build 8 fixed model load but a device run then sat in Case 1 for the full
+30 minutes with no signal past the case-start line, so a hang and an
+extreme crawl were indistinguishable. From build 9 the native benchmark
+emits live stage checkpoints and the service merges them into
+`status.json` (and the current stage into the memory sample), so the
+status always shows where a run is and when it last made progress:
+
+- `stage` / `stageEvent` / `caseIndex`: current stage (`model_load`,
+  `mmproj_load`, `context_create`, then per case `tokenize`,
+  `prefill`, `vision_encode`, `decode`, `failed`) and whether it
+  started, is in progress, produced its first token, or finished.
+- `stageStartedAtMs`: when the current stage began; `lastProgressAtMs`:
+  when the last checkpoint arrived. A stage that started long ago with
+  no later progress is a hang in that stage; a growing
+  `generatedTokens` with a fresh `lastProgressAtMs` is a crawl.
+- Per-stage measurements as they complete: `modelLoadMs`, `mmprojLoadMs`,
+  `contextMs`, `tokenizeMs`, `visionMs`, `prefillMs`, `promptTokens`,
+  `imageTokens`, and during decode a ~1 Hz `generatedTokens` counter
+  with `decodeElapsedMs` / `decodeTokensPerSec`.
+
+Instrumentation only: model files, prompts, context/batch/token caps,
+thread count and the watchdog are unchanged, and the final report format
+is untouched.
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub

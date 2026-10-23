@@ -19,4 +19,9 @@ android {
     buildFeatures { buildConfig = true }
     externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
 }
-dependencies { testImplementation("junit:junit:4.13.2") }
+dependencies {
+    testImplementation("junit:junit:4.13.2")
+    // Real org.json for JVM unit tests (the android.jar stub is not
+    // runnable); used by ProgressTest. Not an app dependency.
+    testImplementation("org.json:json:20240303")
+}
