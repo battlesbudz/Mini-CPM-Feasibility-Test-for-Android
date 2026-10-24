@@ -3,8 +3,20 @@
 // Loads the phone-only `-les` split of MiniCPM-V 4.7 35B-A3B through the
 // llama.cpp-omni fork's LES / MoE-SSD runtime (routed experts streamed from
 // the sibling experts/ directory via llama_model_params.moe_experts_path),
-// then runs three fixed questions about one bundled street photo and reports
-// measured timings, token rates, peak RSS and the verbatim answers as JSON.
+// then runs fixed benchmark cases and reports measured timings, token
+// rates, peak RSS and the verbatim answers as JSON. Cases, in run order:
+// three text-only questions, then the original three questions about one
+// bundled street photo (build 10). A text-only case skips the bitmap load
+// and the whole mmproj/mtmd path: its prompt is tokenized with
+// llama_tokenize and prefilled through llama_decode, then shares the
+// greedy generation loop with the image cases. Text cases run first
+// because on device the first image case alone can consume the whole
+// watchdog window (PHONE_TRIAL.md section 13), so their measurements must
+// land before that. The vision projector is therefore loaded lazily, at
+// the first image case. Build 10 also emits one progress checkpoint per
+// evaluated chunk in the image path (chunk index / total), so a future
+// image run shows whether chunks advance (a crawl) or freeze on a single
+// chunk (a deadlock).
 //
 // Configuration mirrors the vendor demo defaults for this fork
 // (OpenBMB MiniCPM-V-demo-Android): 4 threads, 4096-token context,
@@ -15,7 +27,9 @@
 // llama.cpp MiniCPM-V 4.7 notes).
 #include <jni.h>
 #include <android/log.h>
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -203,21 +217,9 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     }
     emit("Main model loaded");
 
-    emit("Loading vision projector (mmproj)");
-    emit_progress({{"stage", "mmproj_load"}, {"event", "start"}, {"label", "Loading vision projector"}});
-    const auto mmproj_start = Clock::now();
-    mtmd_context_params vparams = mtmd_context_params_default();
-    vparams.use_gpu = false;
-    vparams.print_timings = false;
-    vparams.n_threads = N_THREADS;
-    vparams.image_max_slice_nums = 9; // vendor demo default for MiniCPM-V
-    mtmd_context * vision = mtmd_init_from_file(mmproj_path.c_str(), model, vparams);
-    if (!vision) { llama_model_free(model); return fail("mmproj_load", "mtmd_init_from_file returned null for " + mmproj_path); }
-    const double load_mmproj_ms = ms_between(mmproj_start, Clock::now());
-    report["loadMmprojMs"] = load_mmproj_ms;
-    emit_progress({{"stage", "mmproj_load"}, {"event", "done"}, {"label", "Vision projector loaded"},
-                   {"mmprojLoadMs", load_mmproj_ms}, {"stageElapsedMs", load_mmproj_ms}});
-    report["visionSupported"] = mtmd_support_vision(vision);
+    // The vision projector (mmproj) is NOT loaded here: build 10 runs the
+    // text-only cases first, and they must not depend on it. It loads
+    // lazily at the first image case (see ensure_vision below).
 
     emit("Creating context");
     emit_progress({{"stage", "context_create"}, {"event", "start"}, {"label", "Creating context"}});
@@ -229,7 +231,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     cparams.n_threads = N_THREADS;
     cparams.n_threads_batch = N_THREADS;
     llama_context * ctx = llama_init_from_model(model, cparams);
-    if (!ctx) { mtmd_free(vision); llama_model_free(model); return fail("context", "llama_init_from_model returned null"); }
+    if (!ctx) { llama_model_free(model); return fail("context", "llama_init_from_model returned null"); }
     const double context_ms = ms_between(ctx_start, Clock::now());
     report["contextMs"] = context_ms;
     emit_progress({{"stage", "context_create"}, {"event", "done"}, {"label", "Context created"},
@@ -238,25 +240,220 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     const llama_vocab * vocab = llama_model_get_vocab(model);
     llama_batch batch = llama_batch_init(1, 0, 1);
 
-    const char * questions[] = {
-        "Describe this image.",
-        "How many people are in this image?",
-        "How many cars are in this image?",
+    // Build 10 case list. Text-only cases first (indices 1-3), then the
+    // original image cases (indices 4-6, prompts and image unchanged).
+    // A text-only prompt needs no image: plain general knowledge questions,
+    // the third written to produce a long answer so decode speed is
+    // measured over a decent token count.
+    struct TrialCase { const char * question; bool has_image; };
+    const TrialCase trial_cases[] = {
+        { "What is the capital of France?", false },
+        { "Explain in a few sentences why the sky appears blue.", false },
+        { "Write a detailed explanation of how a bicycle stays upright while it is moving, covering the main physical ideas in several paragraphs.", false },
+        { "Describe this image.", true },
+        { "How many people are in this image?", true },
+        { "How many cars are in this image?", true },
     };
+    const int n_cases = (int) (sizeof(trial_cases) / sizeof(trial_cases[0]));
     json cases = json::array();
     std::string fatal;
     std::string fatal_phase;
 
-    for (int qi = 0; qi < 3 && fatal.empty(); qi++) {
-        const std::string question = questions[qi];
-        emit("Case " + std::to_string(qi + 1) + "/3: " + question);
-        json kase = {{"index", qi + 1}, {"prompt", question}};
-        const auto case_start = Clock::now();
-        emit_progress({{"stage", "tokenize"}, {"event", "start"}, {"caseIndex", qi + 1},
+    // Extra batch for text-only prefill (the generation batch above holds one
+    // token). Capacity N_BATCH; llama_decode splits into n_ubatch pieces
+    // internally, exactly as the mtmd helper's eval calls do.
+    llama_batch prefill_batch = llama_batch_init(N_BATCH, 0, 1);
+
+    // Lazy vision load (build 10): mtmd enters only here, at the first
+    // image case. Measurements and checkpoints match build 9's upfront
+    // load (stage mmproj_load; report loadMmprojMs / visionSupported).
+    mtmd_context * vision = nullptr;
+    auto ensure_vision = [&](int display) -> bool {
+        if (vision) return true;
+        emit("Loading vision projector (mmproj)");
+        emit_progress({{"stage", "mmproj_load"}, {"event", "start"}, {"caseIndex", display},
+                       {"label", "Loading vision projector"}});
+        const auto mmproj_start = Clock::now();
+        mtmd_context_params vparams = mtmd_context_params_default();
+        vparams.use_gpu = false;
+        vparams.print_timings = false;
+        vparams.n_threads = N_THREADS;
+        vparams.image_max_slice_nums = 9; // vendor demo default for MiniCPM-V
+        vision = mtmd_init_from_file(mmproj_path.c_str(), model, vparams);
+        if (!vision) {
+            fatal_phase = "mmproj_load";
+            fatal = "mtmd_init_from_file returned null for " + mmproj_path;
+            return false;
+        }
+        const double load_mmproj_ms = ms_between(mmproj_start, Clock::now());
+        report["loadMmprojMs"] = load_mmproj_ms;
+        emit_progress({{"stage", "mmproj_load"}, {"event", "done"}, {"caseIndex", display},
+                       {"label", "Vision projector loaded"},
+                       {"mmprojLoadMs", load_mmproj_ms}, {"stageElapsedMs", load_mmproj_ms}});
+        report["visionSupported"] = mtmd_support_vision(vision);
+        return true;
+    };
+
+    // Greedy generation, shared verbatim by the text-only and image
+    // cases (build 9 behavior, including the decode checkpoints: start,
+    // first_token, ~1 Hz live token counter, done). On a decode failure
+    // it sets fatal/fatal_phase and returns with the partial counts
+    // recorded, exactly as the inlined build 9 loop did.
+    auto run_generation = [&](int display, const Clock::time_point & case_start,
+                              json & kase, llama_pos & n_past) {
+        const std::string tag = "Case " + std::to_string(display);
+        const auto gen_start = Clock::now();
+        std::string answer;
+        int generated = 0;
+        bool ended_eos = false;
+        double decode_calls_ms = 0.0;
+        emit_progress({{"stage", "decode"}, {"event", "start"}, {"caseIndex", display},
                        {"generatedTokens", 0},
-                       {"label", "Case " + std::to_string(qi + 1) + ": reading image"}});
+                       {"label", tag + ": generating answer"}});
+        auto last_progress_emit = Clock::now();
+        while (generated < MAX_NEW_TOKENS) {
+            const llama_token token = greedy_token(ctx, vocab);
+            if (llama_vocab_is_eog(vocab, token)) { ended_eos = true; break; }
+            if (generated == 0) kase["ttftMs"] = ms_between(case_start, Clock::now());
+            answer += token_piece(vocab, token);
+            generated++;
+            if (generated == 1) {
+                emit_progress({{"stage", "decode"}, {"event", "first_token"}, {"caseIndex", display},
+                               {"generatedTokens", generated},
+                               {"ttftMs", kase["ttftMs"].get<double>()},
+                               {"label", tag + ": generating answer"}});
+                last_progress_emit = Clock::now();
+            } else if (ms_between(last_progress_emit, Clock::now()) >= 1000.0) {
+                // Live token counter, ~1 Hz: status.json always shows the
+                // latest count and (via the service stamp) when the last
+                // token arrived, so a crawl reads as a crawl, not a hang.
+                const double decode_elapsed_ms = ms_between(gen_start, Clock::now());
+                emit_progress({{"stage", "decode"}, {"event", "progress"}, {"caseIndex", display},
+                               {"generatedTokens", generated},
+                               {"decodeElapsedMs", decode_elapsed_ms},
+                               {"decodeTokensPerSec", decode_elapsed_ms > 0 ? generated / (decode_elapsed_ms / 1000.0) : 0.0},
+                               {"label", tag + ": generating answer"}});
+                last_progress_emit = Clock::now();
+            }
+            if (generated % 32 == 0) emit(tag + ": " + std::to_string(generated) + " tokens");
+            if (generated >= MAX_NEW_TOKENS) break;
+            batch.n_tokens = 1;
+            batch.token[0] = token;
+            batch.pos[0] = n_past;
+            batch.n_seq_id[0] = 1;
+            batch.seq_id[0][0] = 0;
+            batch.logits[0] = 1;
+            const auto dec_start = Clock::now();
+            const int dres = llama_decode(ctx, batch);
+            decode_calls_ms += ms_between(dec_start, Clock::now());
+            if (dres != 0) { fatal_phase = "decode"; fatal = "llama_decode failed with code " + std::to_string(dres); break; }
+            n_past++;
+        }
+        const double gen_wall_ms = ms_between(gen_start, Clock::now());
+        kase["decodeWallMs"] = gen_wall_ms;
+        kase["decodeCallsMs"] = decode_calls_ms;
+        kase["generatedTokens"] = generated;
+        kase["decodeTokensPerSec"] = gen_wall_ms > 0 ? generated / (gen_wall_ms / 1000.0) : 0.0;
+        kase["endedByEos"] = ended_eos;
+        emit_progress({{"stage", "decode"}, {"event", "done"}, {"caseIndex", display},
+                       {"generatedTokens", generated}, {"decodeWallMs", gen_wall_ms},
+                       {"decodeTokensPerSec", kase["decodeTokensPerSec"].get<double>()},
+                       {"label", tag + " complete"}});
+        kase["peakRssKb"] = peak_rss_kb();
+        kase["answer"] = answer;
+    };
+
+    for (int qi = 0; qi < n_cases && fatal.empty(); qi++) {
+        const int display = qi + 1;
+        const std::string tag = "Case " + std::to_string(display);
+        const std::string question = trial_cases[qi].question;
+        const bool has_image = trial_cases[qi].has_image;
+        emit(tag + "/" + std::to_string(n_cases) + ": " + question);
+        json kase = {{"index", display}, {"type", has_image ? "image" : "text"}, {"prompt", question}};
+        const auto case_start = Clock::now();
         llama_memory_clear(llama_get_memory(ctx), true);
         llama_pos n_past = 0;
+
+        if (!has_image) {
+            // ---- Text-only case (build 10): no bitmap, no mmproj, no
+            // mtmd. Same chat wrapper as the image cases minus the image
+            // marker; tokenize with llama_tokenize (add_special and
+            // parse_special mirror the mtmd_input_text flags) and prefill
+            // the tokens through llama_decode in N_BATCH pieces.
+            emit_progress({{"stage", "tokenize"}, {"event", "start"}, {"caseIndex", display},
+                           {"generatedTokens", 0},
+                           {"label", tag + " (text): tokenizing prompt"}});
+            const std::string prompt = "<|im_start|>user\n" + question +
+                "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+            const auto tok_start = Clock::now();
+            int32_t n_needed = llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(),
+                                              nullptr, 0, true, true);
+            std::vector<llama_token> tokens;
+            int32_t n_tok = -1;
+            if (n_needed != INT32_MIN && n_needed != 0) {
+                tokens.assign((size_t) (n_needed < 0 ? -n_needed : n_needed), 0);
+                n_tok = llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(),
+                                       tokens.data(), (int32_t) tokens.size(), true, true);
+            }
+            const double tokenize_ms = ms_between(tok_start, Clock::now());
+            kase["tokenizeMs"] = tokenize_ms;
+            emit_progress({{"stage", "tokenize"}, {"event", "done"}, {"caseIndex", display},
+                           {"tokenizeMs", tokenize_ms}, {"stageElapsedMs", tokenize_ms},
+                           {"label", tag + " (text): evaluating prompt"}});
+            if (n_tok < 0) {
+                fatal_phase = "tokenize";
+                fatal = "llama_tokenize failed for text case " + std::to_string(display);
+                break;
+            }
+            tokens.resize((size_t) n_tok);
+
+            emit_progress({{"stage", "text_prefill"}, {"event", "start"}, {"caseIndex", display},
+                           {"label", tag + " (text): evaluating prompt"}});
+            const auto prefill_start = Clock::now();
+            bool prefill_ok = true;
+            for (size_t off = 0; off < tokens.size(); ) {
+                const int32_t chunk_n = (int32_t) std::min<size_t>((size_t) N_BATCH, tokens.size() - off);
+                prefill_batch.n_tokens = chunk_n;
+                for (int32_t i = 0; i < chunk_n; i++) {
+                    prefill_batch.token[i]  = tokens[off + (size_t) i];
+                    prefill_batch.pos[i]    = (llama_pos) (off + (size_t) i);
+                    prefill_batch.n_seq_id[i] = 1;
+                    prefill_batch.seq_id[i][0] = 0;
+                    // logits only needed from the final prompt token
+                    prefill_batch.logits[i] = (off + (size_t) i + 1 == tokens.size()) ? 1 : 0;
+                }
+                if (llama_decode(ctx, prefill_batch) != 0) { prefill_ok = false; break; }
+                off += (size_t) chunk_n;
+            }
+            const double prefill_ms = ms_between(prefill_start, Clock::now());
+            if (!prefill_ok) {
+                fatal_phase = "prefill";
+                fatal = "llama_decode failed during text prefill in case " + std::to_string(display);
+                break;
+            }
+            n_past = (llama_pos) tokens.size();
+            const double prefill_tps = prefill_ms > 0 ? (double) tokens.size() / (prefill_ms / 1000.0) : 0.0;
+            kase["promptTokens"] = tokens.size();
+            kase["imageTokens"] = 0;
+            kase["visionEvalMs"] = 0.0;
+            kase["prefillMs"] = prefill_ms;
+            kase["prefillTokensPerSec"] = prefill_tps;
+            emit_progress({{"stage", "text_prefill"}, {"event", "done"}, {"caseIndex", display},
+                           {"prefillMs", prefill_ms}, {"prefillTokensPerSec", prefill_tps},
+                           {"promptTokens", tokens.size()}, {"stageElapsedMs", prefill_ms},
+                           {"label", tag + " (text): generating answer"}});
+
+            run_generation(display, case_start, kase, n_past);
+            cases.push_back(kase);
+            emit(tag + " complete: " + std::to_string(kase["generatedTokens"].get<int>()) + " tokens");
+            continue;
+        }
+
+        // ---- Image case: build 9 flow, plus per-chunk progress.
+        if (!ensure_vision(display)) break;
+        emit_progress({{"stage", "tokenize"}, {"event", "start"}, {"caseIndex", display},
+                       {"generatedTokens", 0},
+                       {"label", tag + ": reading image"}});
 
         mtmd_bitmap * bitmap = mtmd_helper_bitmap_init_from_file(vision, image.c_str());
         if (!bitmap) { fatal_phase = "image_load"; fatal = "mtmd_helper_bitmap_init_from_file failed for " + image; break; }
@@ -274,9 +471,9 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         int32_t tres = mtmd_tokenize(vision, chunks, &text, bitmaps, 1);
         const double tokenize_ms = ms_between(tok_start, Clock::now());
         kase["tokenizeMs"] = tokenize_ms;
-        emit_progress({{"stage", "tokenize"}, {"event", "done"}, {"caseIndex", qi + 1},
+        emit_progress({{"stage", "tokenize"}, {"event", "done"}, {"caseIndex", display},
                        {"tokenizeMs", tokenize_ms}, {"stageElapsedMs", tokenize_ms},
-                       {"label", "Case " + std::to_string(qi + 1) + ": evaluating prompt"}});
+                       {"label", tag + ": evaluating prompt"}});
         mtmd_bitmap_free(bitmap);
         if (tres != 0) {
             mtmd_input_chunks_free(chunks);
@@ -298,15 +495,16 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
             }
         }
         bool vision_started = false;
-        emit_progress({{"stage", "prefill"}, {"event", "start"}, {"caseIndex", qi + 1},
-                       {"label", "Case " + std::to_string(qi + 1) + ": evaluating prompt"}});
+        size_t image_chunks_done = 0;
+        emit_progress({{"stage", "prefill"}, {"event", "start"}, {"caseIndex", display},
+                       {"label", tag + ": evaluating prompt"}});
         for (size_t ci = 0; ci < n_chunks; ci++) {
             const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, ci);
             const bool is_image = mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE;
             if (is_image && !vision_started) {
                 vision_started = true;
-                emit_progress({{"stage", "vision_encode"}, {"event", "start"}, {"caseIndex", qi + 1},
-                               {"label", "Case " + std::to_string(qi + 1) + ": vision encode"}});
+                emit_progress({{"stage", "vision_encode"}, {"event", "start"}, {"caseIndex", display},
+                               {"label", tag + ": vision encode"}});
             }
             const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk);
             prompt_tokens += n_tok;
@@ -321,12 +519,23 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
             }
             const double chunk_ms = ms_between(chunk_start, Clock::now());
             prefill_ms += chunk_ms;
-            if (is_image) vision_ms += chunk_ms;
+            if (is_image) { vision_ms += chunk_ms; image_chunks_done++; }
             n_past = new_n_past;
+            // Build 10: per-chunk sign of life. One checkpoint after
+            // every evaluated chunk, image or text, carrying the chunk's
+            // position in the sequence. In status.json this advances
+            // chunkIndex (and lastProgressAtMs) chunk by chunk: a crawl
+            // shows steady movement, a deadlock freezes on one index.
+            emit_progress({{"stage", "chunk_progress"}, {"event", "progress"}, {"caseIndex", display},
+                           {"chunkIndex", ci + 1}, {"chunkTotal", n_chunks},
+                           {"chunkIsImage", is_image}, {"chunkMs", chunk_ms},
+                           {"imageChunksDone", image_chunks_done},
+                           {"label", tag + ": chunk " + std::to_string(ci + 1) + "/" +
+                                     std::to_string(n_chunks) + (is_image ? " (image)" : " (text)")}});
             if (is_image && ci == last_image_chunk) {
-                emit_progress({{"stage", "vision_encode"}, {"event", "done"}, {"caseIndex", qi + 1},
+                emit_progress({{"stage", "vision_encode"}, {"event", "done"}, {"caseIndex", display},
                                {"visionMs", vision_ms}, {"stageElapsedMs", vision_ms},
-                               {"label", "Case " + std::to_string(qi + 1) + ": vision encode done"}});
+                               {"label", tag + ": vision encode done"}});
             }
         }
         mtmd_input_chunks_free(chunks);
@@ -334,80 +543,22 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         kase["imageTokens"] = image_tokens;
         kase["visionEvalMs"] = vision_ms;
         kase["prefillMs"] = prefill_ms;
-        if (!eval_ok) { fatal_phase = "prefill"; fatal = "mtmd_helper_eval_chunk_single failed in case " + std::to_string(qi + 1); break; }
-        emit_progress({{"stage", "prefill"}, {"event", "done"}, {"caseIndex", qi + 1},
+        if (!eval_ok) { fatal_phase = "prefill"; fatal = "mtmd_helper_eval_chunk_single failed in case " + std::to_string(display); break; }
+        emit_progress({{"stage", "prefill"}, {"event", "done"}, {"caseIndex", display},
                        {"prefillMs", prefill_ms}, {"visionMs", vision_ms}, {"stageElapsedMs", prefill_ms},
                        {"promptTokens", prompt_tokens}, {"imageTokens", image_tokens},
-                       {"label", "Case " + std::to_string(qi + 1) + ": generating answer"}});
+                       {"label", tag + ": generating answer"}});
 
-        // Greedy generation.
-        const auto gen_start = Clock::now();
-        std::string answer;
-        int generated = 0;
-        bool ended_eos = false;
-        double decode_calls_ms = 0.0;
-        emit_progress({{"stage", "decode"}, {"event", "start"}, {"caseIndex", qi + 1},
-                       {"generatedTokens", 0},
-                       {"label", "Case " + std::to_string(qi + 1) + ": generating answer"}});
-        auto last_progress_emit = Clock::now();
-        while (generated < MAX_NEW_TOKENS) {
-            const llama_token token = greedy_token(ctx, vocab);
-            if (llama_vocab_is_eog(vocab, token)) { ended_eos = true; break; }
-            if (generated == 0) kase["ttftMs"] = ms_between(case_start, Clock::now());
-            answer += token_piece(vocab, token);
-            generated++;
-            if (generated == 1) {
-                emit_progress({{"stage", "decode"}, {"event", "first_token"}, {"caseIndex", qi + 1},
-                               {"generatedTokens", generated},
-                               {"ttftMs", kase["ttftMs"].get<double>()},
-                               {"label", "Case " + std::to_string(qi + 1) + ": generating answer"}});
-                last_progress_emit = Clock::now();
-            } else if (ms_between(last_progress_emit, Clock::now()) >= 1000.0) {
-                // Live token counter, ~1 Hz: status.json always shows the
-                // latest count and (via the service stamp) when the last
-                // token arrived, so a crawl reads as a crawl, not a hang.
-                const double decode_elapsed_ms = ms_between(gen_start, Clock::now());
-                emit_progress({{"stage", "decode"}, {"event", "progress"}, {"caseIndex", qi + 1},
-                               {"generatedTokens", generated},
-                               {"decodeElapsedMs", decode_elapsed_ms},
-                               {"decodeTokensPerSec", decode_elapsed_ms > 0 ? generated / (decode_elapsed_ms / 1000.0) : 0.0},
-                               {"label", "Case " + std::to_string(qi + 1) + ": generating answer"}});
-                last_progress_emit = Clock::now();
-            }
-            if (generated % 32 == 0) emit("Case " + std::to_string(qi + 1) + ": " + std::to_string(generated) + " tokens");
-            if (generated >= MAX_NEW_TOKENS) break;
-            batch.n_tokens = 1;
-            batch.token[0] = token;
-            batch.pos[0] = n_past;
-            batch.n_seq_id[0] = 1;
-            batch.seq_id[0][0] = 0;
-            batch.logits[0] = 1;
-            const auto dec_start = Clock::now();
-            const int dres = llama_decode(ctx, batch);
-            decode_calls_ms += ms_between(dec_start, Clock::now());
-            if (dres != 0) { fatal_phase = "decode"; fatal = "llama_decode failed with code " + std::to_string(dres); break; }
-            n_past++;
-        }
-        const double gen_wall_ms = ms_between(gen_start, Clock::now());
-        kase["decodeWallMs"] = gen_wall_ms;
-        kase["decodeCallsMs"] = decode_calls_ms;
-        kase["generatedTokens"] = generated;
-        kase["decodeTokensPerSec"] = gen_wall_ms > 0 ? generated / (gen_wall_ms / 1000.0) : 0.0;
-        kase["endedByEos"] = ended_eos;
-        emit_progress({{"stage", "decode"}, {"event", "done"}, {"caseIndex", qi + 1},
-                       {"generatedTokens", generated}, {"decodeWallMs", gen_wall_ms},
-                       {"decodeTokensPerSec", kase["decodeTokensPerSec"].get<double>()},
-                       {"label", "Case " + std::to_string(qi + 1) + " complete"}});
-        kase["peakRssKb"] = peak_rss_kb();
-        kase["answer"] = answer;
+        run_generation(display, case_start, kase, n_past);
         cases.push_back(kase);
-        emit("Case " + std::to_string(qi + 1) + " complete: " + std::to_string(generated) + " tokens");
+        emit(tag + " complete: " + std::to_string(kase["generatedTokens"].get<int>()) + " tokens");
     }
 
     report["cases"] = cases;
     llama_batch_free(batch);
+    llama_batch_free(prefill_batch);
     llama_free(ctx);
-    mtmd_free(vision);
+    if (vision) mtmd_free(vision);
     llama_model_free(model);
     if (!fatal.empty()) return fail(fatal_phase, fatal);
     report["peakRssKb"] = peak_rss_kb();
