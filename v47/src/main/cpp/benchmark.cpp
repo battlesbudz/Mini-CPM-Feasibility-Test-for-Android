@@ -18,6 +18,16 @@
 // image run shows whether chunks advance (a crawl) or freeze on a single
 // chunk (a deadlock).
 //
+// Build 11 changes exactly one thing: the MoE decode-window expert cache
+// is ON, with prewarm. The §16 diagnosis (PHONE_TRIAL.md) proved build
+// 10's decode re-read ~412 MB of experts from flash for every generated
+// token because the fork's decode cache was off by default and nothing
+// was ever prewarmed (0.274 tok/s). Build 11 sets LLAMA_MOE_DECODE_WINDOW
+// before model load and calls llama_moe_prewarm_experts() before every
+// case's prefill, using the vendor app's own static w16 table. Prompts,
+// cases, sampling, threads, context, the vision path and the model pack
+// are all untouched.
+//
 // Configuration mirrors the vendor demo defaults for this fork
 // (OpenBMB MiniCPM-V-demo-Android): 4 threads, 4096-token context,
 // image_max_slice_nums 9. Sampling is greedy (temperature 0) to match the
@@ -31,6 +41,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -60,6 +71,68 @@ static const int    N_THREADS      = 4;
 // max = expert_count 256). Resident cost on this pack:
 // 256 slots x 1,351,680 B per-slot-per-layer bytes = ~330 MiB.
 static const int    MOE_SLOT_BANK  = 256;
+// Build 11: per-layer decode-window width, in expert slots
+// (LLAMA_MOE_DECODE_WINDOW, read by the fork at model load to build the
+// per-layer decode tensor layout, and again by the slot runtime; the
+// fork clamps it to [n_expert_used, 1024] = [8, 1024] for this model).
+// The decode windows are physically separate from the 256-slot prefill
+// bank, so the resident cost is additive: 40 layers x 16 slots x
+// 1,351,680 B per expert = ~825 MiB. 16 is the vendor app's matched
+// pairing with its w16 prewarm table (below), and it fits the headroom
+// build 10 proved on device (worker PSS peaked ~3.02 GB with ~3.91 GB
+// of system memory still free). Lookahead prefetch stays off (its env
+// is never set), so the effective window width is exactly this value.
+static const int    MOE_DECODE_WINDOW = 16;
+// The vendor app's static prewarm table for this model, top-16 experts
+// per layer, ranked by observed routing frequency (k_mb_prewarm_w16 in
+// OpenBMB/MiniCPM-V-Apps, MTMDWrapper/Bridge/MBPrewarmTable.h, generated
+// from their tables_w.json). The slot runtime's parser skips '#' lines;
+// every other line is one model layer, in order. Written to the model
+// directory at run start and handed to the runtime via LLAMA_MOE_PREWARM,
+// exactly the vendor app's own mechanism.
+static const char * MOE_PREWARM_TABLE_W16 =
+R"PREWARM(# Prewarm table: one line per model layer, top-16 experts per layer (vendor tables_w.json)
+151,43,203,231,222,70,106,187,217,31,55,30,33,66,147,177
+233,211,128,19,236,123,141,48,70,107,242,238,124,146,190,232
+49,3,39,58,164,169,188,90,11,43,217,221,20,60,133,23
+172,199,159,125,44,167,62,94,163,110,177,223,117,16,90,92
+154,192,54,80,160,204,166,79,109,58,88,243,206,30,33,34
+165,202,102,158,155,205,69,54,77,147,178,46,182,218,139,52
+15,56,232,79,37,236,196,100,36,65,84,149,108,138,191,227
+35,14,202,76,147,32,173,38,171,116,23,36,191,130,166,121
+180,194,183,61,77,110,173,232,3,4,51,116,215,84,227,46
+86,197,98,198,0,138,59,104,44,196,102,93,161,218,120,15
+196,234,187,111,239,81,39,142,242,99,246,146,247,157,194,228
+107,3,225,69,235,106,111,37,145,218,7,56,93,181,147,160
+35,15,128,1,39,193,46,219,139,172,220,49,223,107,191,108
+32,249,160,125,99,19,13,175,219,134,224,113,28,191,182,154
+52,51,64,172,137,22,160,106,167,174,131,212,19,32,129,130
+213,4,162,54,165,242,135,87,122,58,5,104,120,250,94,118
+150,32,252,222,170,199,28,80,102,185,98,116,243,53,7,205
+48,64,230,87,200,16,173,147,20,201,212,214,232,41,242,15
+84,115,155,251,135,13,204,134,158,43,192,142,174,4,122,203
+30,230,112,168,117,42,26,109,86,228,20,35,53,85,229,4
+51,194,4,110,115,183,61,180,191,3,116,227,185,232,19,63
+86,161,197,102,138,198,200,93,208,196,120,34,98,104,66,245
+234,196,187,111,239,39,242,155,157,146,99,142,228,106,159,194
+107,3,111,145,7,93,106,218,194,56,70,235,225,69,195,6
+35,1,15,237,39,46,193,219,81,49,108,107,11,125,96,220
+32,249,130,13,125,66,134,245,113,191,219,175,19,229,29,124
+137,131,52,159,54,106,51,67,118,16,130,77,19,172,174,212
+162,4,94,54,135,5,104,165,120,58,63,41,110,242,204,28
+170,252,222,150,199,98,179,102,181,73,185,26,80,53,149,152
+230,48,200,212,147,20,24,201,19,41,188,220,242,21,173,101
+84,135,251,177,192,155,115,174,158,196,204,134,29,248,4,122
+30,230,86,112,42,229,228,117,14,168,253,177,82,76,187,226
+239,72,178,207,65,176,126,141,50,249,55,169,69,153,253,200
+149,16,46,120,1,249,27,67,216,230,8,125,229,222,65,154
+189,145,79,127,178,102,33,148,60,251,40,47,119,190,78,35
+175,28,92,247,112,29,158,243,10,1,63,134,205,50,25,159
+184,38,108,104,182,175,176,209,221,18,113,215,84,76,162,90
+247,203,157,155,48,79,41,97,20,251,197,229,231,249,217,47
+26,221,51,53,208,2,240,97,170,1,178,211,244,75,79,157
+156,135,51,172,82,59,214,143,188,3,26,207,54,121,43,76
+)PREWARM";
 static const int    N_CTX          = 4096;
 static const int    N_BATCH        = 2048;
 static const int    MAX_NEW_TOKENS = 512;
@@ -194,6 +267,29 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     const std::string experts_path = model_dir + "/experts";
     report["moeExpertsPath"] = experts_path;
     report["moeSlotBank"] = MOE_SLOT_BANK;
+
+    // Build 11: enable the decode-window expert cache + prewarm BEFORE
+    // the model loads — the fork reads LLAMA_MOE_DECODE_WINDOW on the
+    // model side at load time to size the per-layer decode tensors, and
+    // LLAMA_MOE_PREWARM when the slot runtime initializes. Overwrite
+    // unconditionally, as the vendor app does, so no stale value can
+    // leak in. If the table file cannot be written the window still
+    // turns on; prewarm then no-ops inside the runtime and the report
+    // says so.
+    setenv("LLAMA_MOE_DECODE_WINDOW", std::to_string(MOE_DECODE_WINDOW).c_str(), 1);
+    const std::string prewarm_path = model_dir + "/moe_prewarm_w16.txt";
+    bool prewarm_written = false;
+    if (FILE * pf = std::fopen(prewarm_path.c_str(), "w")) {
+        prewarm_written = std::fputs(MOE_PREWARM_TABLE_W16, pf) >= 0;
+        std::fclose(pf);
+    }
+    if (prewarm_written) {
+        setenv("LLAMA_MOE_PREWARM", prewarm_path.c_str(), 1);
+    }
+    report["moeDecodeWindow"] = MOE_DECODE_WINDOW;
+    report["moePrewarmTable"] = prewarm_written ? "w16 (vendor top-16/layer)" : "WRITE FAILED - prewarm off";
+    emit("MoE decode window on: " + std::to_string(MOE_DECODE_WINDOW) +
+         " slots/layer, prewarm table " + (prewarm_written ? std::string("w16") : std::string("FAILED to write")));
 
     emit("Loading MiniCPM-V 4.7 main model (LES expert streaming)");
     emit_progress({{"stage", "model_load"}, {"event", "start"}, {"label", "Loading main model"}});
@@ -372,6 +468,14 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         json kase = {{"index", display}, {"type", has_image ? "image" : "text"}, {"prompt", question}};
         const auto case_start = Clock::now();
         llama_memory_clear(llama_get_memory(ctx), true);
+        // Build 11: refill the decode windows from the prewarm table
+        // before this case's prefill, the vendor app's per-round path
+        // (the runtime clears window mappings at every prefill-to-decode
+        // transition, and its own comments require a fresh prewarm call
+        // each round). The flash read happens here, off the decode
+        // clock; at the transition the runtime only republishes the
+        // slot mappings. No-op if the table was not written.
+        llama_moe_prewarm_experts(ctx);
         llama_pos n_past = 0;
 
         if (!has_image) {
