@@ -40,6 +40,24 @@ Part 1 alone is not enough: the loader never queries the CPU device.
     the plain CPU buft, and the map lookup misses even with the entry
     present. On GPU paths the two derivations agree.
 
+Part 2 (build 13, telemetry only) scores the lookahead prefetch
+predictions in window mode:
+  - src/llama-moe-slot.cpp: in window mode the n_hits counter is
+    structurally unreachable (its only increment site sits in the
+    ping-pong branch), so whether the next-layer predictions are any
+    good was measured by no live counter (PHONE_TRIAL.md section 21).
+    Two new atomic counters are incremented in process() at the exact
+    point predicted[layer] is consumed for eviction guidance: the raw
+    prediction set stored by the previous layer in the same decode
+    step is scored against the set the layer actually requests in
+    that step. Denominator = distinct in-range predicted experts
+    scored; numerator = those the layer actually requested. The
+    counts print at teardown on a "lookahead-accuracy:" line beside
+    the existing armed/hits line, read from the atomic counters
+    whole (not summed from the throttled per-step flush lines).
+    Counting only; prediction, caching and eviction behavior are
+    bit-for-bit unchanged.
+
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
 index 27b22c5..355aa37 100644
 --- a/ggml/include/ggml-backend.h
@@ -182,3 +200,73 @@ index f896b83..0524ab9 100644
  
      const auto it = dev ? pimpl->alloc_only_buft.find(dev) : pimpl->alloc_only_buft.end();
      if (it == pimpl->alloc_only_buft.end()) {
+diff --git a/src/llama-moe-slot.cpp b/src/llama-moe-slot.cpp
+index 28c7666..3a9af1d 100644
+--- a/src/llama-moe-slot.cpp
++++ b/src/llama-moe-slot.cpp
+@@ -169,6 +169,14 @@ struct lookahead_expert_prefetch {
+     std::atomic<uint64_t> n_evict_saved{0};   // 因「预测会用」而被跳过的淘汰次数
+     std::atomic<uint64_t> n_evict_forced{0};  // pass0 找不到非预测候选、被迫进入 pass1 的次数
+     std::atomic<uint64_t> n_pred_cached{0};   // arm 时因「目标层已有」而被过滤掉的预测数
++    // 预测准确率评分（trial 遥测，build 13）：窗口模式下 n_hits 结构上不可达
++    // （它唯一的自增点在乒乓分支，见 process()），所以窗口模式的预测到底准不准
++    // 以前没有任何活计数器量。这两个计数器在 process() 消费 predicted[layer]
++    // 的地方打分：分母 = 被评分的预测条目数（去重、合法范围内的条目），
++    // 分子 = 其中被该层在同一步真实请求到的条目数。分母是真实条目数，
++    // 不是 armed × depth 那种拼出来的量。纯计数，不改变任何行为。
++    std::atomic<uint64_t> n_pred_scored{0};   // 被评分的预测条目数（分母）
++    std::atomic<uint64_t> n_pred_correct{0};  // 其中被目标层在本步真实请求到的条目数
+     std::atomic<uint64_t> n_used_from_pf{0};  // 主路径用到的专家里，落在**预读区**的次数
+                                               // （用完不保留，本层结束就被重填冲掉）
+     std::atomic<uint64_t> n_evict_total{0};   // 淘汰总次数
+@@ -281,6 +289,16 @@ struct lookahead_expert_prefetch {
+     }
+ 
+     void report() const {
++        // 准确率行独立于 armed 打印：即使 worker 每次都忙到 arm 被跳过
++        // （armed == 0），评分照样存在过，不能被 armed 的早退吞掉。
++        const uint64_t scored  = n_pred_scored.load(std::memory_order_relaxed);
++        const uint64_t correct = n_pred_correct.load(std::memory_order_relaxed);
++        if (scored > 0) {
++            moe_log("lookahead-accuracy: scored=%llu correct=%llu (%.1f%% of scored predictions)",
++                (unsigned long long) scored,
++                (unsigned long long) correct,
++                100.0 * (double) correct / (double) scored);
++        }
+         if (n_armed.load(std::memory_order_relaxed) == 0) {
+             return;
+         }
+@@ -2476,6 +2494,33 @@ void llama_moe_slot_runtime::process(
+             }
+         }
+         if (!pred.empty()) {
++            // 预测准确率评分（trial 遥测，build 13）：pred 是**上一层**在同一
++            // decode 步内为本层算出的预测集（见本函数末尾 predicted[layer+1]
++            // 的存入处与 qwen35moe.cpp 的图侧计算），requested 是本层在本步
++            // 真实路由到的集合 —— 两者在同一步内配对，正是「预测的专家里有
++            // 多少被本层这次真的请求了」。只评 decode（单 token）步：预测本身
++            // 也只为单 token 步生成；多行批次（投机验证）的 requested 是多行
++            // 并集，拿来评分会虚高。去重后计数（图侧 top-k 本应互异，这里只
++            // 防御）。注意本层是被评对象时 pred 未经过 arm 的缓存过滤 —— 分母
++            // 是预测集本身，含那些「已在窗口、无需读」的条目（它们同样算预测
++            // 命中与否）。纯计数，不改变淘汰或任何其他行为。
++            if (decode) {
++                uint64_t scored = 0;
++                uint64_t correct = 0;
++                std::vector<uint8_t> seen((size_t) pimpl->n_expert, 0);
++                for (int32_t e : pred) {
++                    if (e < 0 || e >= pimpl->n_expert || seen[(size_t) e]) {
++                        continue;
++                    }
++                    seen[(size_t) e] = 1;
++                    scored++;
++                    if (requested[(size_t) e]) {
++                        correct++;
++                    }
++                }
++                pimpl->lookahead.n_pred_scored.fetch_add(scored, std::memory_order_relaxed);
++                pimpl->lookahead.n_pred_correct.fetch_add(correct, std::memory_order_relaxed);
++            }
+             keep.assign((size_t) pimpl->n_expert, 0);
+             for (int32_t e : pred) {
+                 if (e >= 0 && e < pimpl->n_expert) {

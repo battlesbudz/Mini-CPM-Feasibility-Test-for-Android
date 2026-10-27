@@ -103,6 +103,28 @@ record) plus the diagnostic-loop fixes:
   instead of a full trial. The full trial's cases, prompts and
   defaults are unchanged.
 
+## Build 13: lookahead prediction accuracy
+
+Builds 11/12 ran lookahead prefetch in the runtime's window mode,
+where its hits counter can never increment (§21 of the trial record:
+the only increment site is in the non-window branch), so both device
+runs reported armed 614/629 with 0 hits while prediction accuracy
+itself was measured by nothing. Build 13 changes no configuration
+and no behavior — it only scores the predictions. The trial patch
+now also adds two counters to the slot runtime: when a layer
+consumes the prediction the previous layer stored for it, the raw
+predicted set (top-8 per layer) is compared with the set the layer
+actually requests in the same decode step. Scored = distinct
+predicted experts compared; correct = those actually requested.
+The totals print at runtime teardown on a `lookahead-accuracy:`
+line and land in the report as `moeLookaheadScored`,
+`moeLookaheadCorrect` and `moeLookaheadAccuracyPct`. They come
+from the runtime's atomic counters read whole at teardown, so
+they cover the entire run (the per-step flush-line sums are
+throttled by the runtime and only ever described the early steps).
+One quick-mode run produces the number under exactly the build 12
+runs' conditions.
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub

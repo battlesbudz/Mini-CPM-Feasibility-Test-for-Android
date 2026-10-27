@@ -47,6 +47,21 @@
 // class at the prefill-to-decode transition). Cross-chunk reuse needs
 // per-layer prefill windows, a fork redesign, not a trial patch.
 //
+// Build 13 changes no configuration and no behavior; it scores the
+// lookahead predictions. The section 21 diagnosis (PHONE_TRIAL.md)
+// proved the runtime's hits counter is structurally unreachable in
+// window mode, so prediction accuracy was measured by nothing. The
+// trial patch now also carries two atomic counters in the slot
+// runtime (patch part 2): in process(), where the previous layer's
+// stored prediction for a layer is consumed, the raw predicted set is
+// scored against the set that layer actually requests in the same
+// decode step. The runtime prints the counts whole at teardown on a
+// "lookahead-accuracy:" line, parsed below into the report as
+// moeLookaheadScored / moeLookaheadCorrect / moeLookaheadAccuracyPct.
+// Because the numbers come from that one teardown line (the atomic
+// counters read directly), they cover the whole run — unlike the
+// per-step flush-line sums, which the runtime throttles (section 21.5).
+//
 // Configuration mirrors the vendor demo defaults for this fork
 // (OpenBMB MiniCPM-V-demo-Android): 4 threads, 4096-token context,
 // image_max_slice_nums 9. Sampling is greedy (temperature 0) to match the
@@ -308,6 +323,13 @@ struct MoeCounters {
     bool lookaheadSeen = false;
     long long laArmed = 0, laHits = 0;
     double laPct = 0.0;
+    // Build 13: prediction accuracy, from the teardown
+    // "lookahead-accuracy:" line (whole-run atomic counters, not
+    // summed flush deltas, so no section 21.5 throttling applies).
+    // The percentage is recomputed here from the raw counts.
+    bool lookaheadAccuracySeen = false;
+    long long laScored = 0, laCorrect = 0;
+    double laAccuracyPct = 0.0;
 };
 static bool log_field_ll(const std::string & line, const char * key, long long & out) {
     const std::string k = std::string(key) + "=";
@@ -349,6 +371,15 @@ static MoeCounters parse_moe_counters(const std::string & log) {
                 c.laHits = hits;
                 const size_t paren = line.find('(', line.find("hits="));
                 c.laPct = paren == std::string::npos ? 0.0 : std::strtod(line.c_str() + paren + 1, nullptr);
+            }
+        }
+        if (line.find("lookahead-accuracy: scored=") != std::string::npos) {
+            long long scored = 0, correct = 0;
+            if (log_field_ll(line, "scored", scored) && log_field_ll(line, "correct", correct)) {
+                c.lookaheadAccuracySeen = true;
+                c.laScored = scored;
+                c.laCorrect = correct;
+                c.laAccuracyPct = scored > 0 ? 100.0 * (double) correct / (double) scored : 0.0;
             }
         }
     }
@@ -437,6 +468,11 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
             fields["moeLookaheadHits"] = c.laHits;
             fields["moeLookaheadHitRatePct"] = c.laPct;
         }
+        if (c.lookaheadAccuracySeen) {
+            fields["moeLookaheadScored"] = c.laScored;
+            fields["moeLookaheadCorrect"] = c.laCorrect;
+            fields["moeLookaheadAccuracyPct"] = c.laAccuracyPct;
+        }
         return fields;
     };
     auto emit_counters = [&]() {
@@ -452,7 +488,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         {"profile", "minicpm-v47-phone-trial-v1"},
         {"runtime", "llama.cpp-omni (tc-mb fork, LES / MoE-SSD)"},
         {"runtimeCommit", RUNTIME_COMMIT},
-        {"runtimePatch", "v47/patches/ggml-cpu-alloc-only-buft.patch (CPU alloc-only buft + llama-model.cpp loader fix)"},
+        {"runtimePatch", "v47/patches/ggml-cpu-alloc-only-buft.patch (CPU alloc-only buft + llama-model.cpp loader fix; build 13 adds lookahead-accuracy telemetry counters in llama-moe-slot.cpp)"},
         {"modelRepo", "tc-mb/MiniCPM-V-Apps-gguf"},
         {"modelRevision", "8716e5209f308fd53f197ccd7d50c6fdcc2dc37d"},
         {"modelFiles", "main -les gguf + mmproj f16 + experts/ (40 shards + manifest.json)"},

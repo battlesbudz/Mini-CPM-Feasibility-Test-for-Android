@@ -4,10 +4,11 @@
 The pin is the exact submodule commit OpenBMB's MiniCPM-V-Apps demos build
 against (tc-mb/llama.cpp-omni, branch ios-omni): it carries the LES / MoE-SSD
 expert-streaming core (src/llama-moe-*) and the MiniCPM-V 4.7 mtmd support.
-The upstream checkout is never edited by hand. The one fix the trial needs
+The upstream checkout is never edited by hand. The changes the trial needs
 on top of the pin (a CPU alloc-only buffer type for the LES load path,
-plus the loader changes that make the loader use it for CPU layers; see
-the patch header for why) lives in v47/patches/ and is applied mechanically
+plus the loader changes that make the loader use it for CPU layers, plus
+a telemetry-only lookahead-accuracy counter in the slot runtime; see
+the patch header for why) live in v47/patches/ and are applied mechanically
 below, after the pin is checked out. Any other local changes to the
 checkout are refused, exactly as before.
 """
@@ -21,6 +22,7 @@ PATCHED_FILES = [
     "ggml/src/ggml-backend.cpp",
     "ggml/src/ggml-cpu/ggml-cpu.cpp",
     "src/llama-model.cpp",
+    "src/llama-moe-slot.cpp",
 ]
 def git(*args): return subprocess.check_output(["git", *args], text=True).strip()
 def run(*args): subprocess.run(["git", *args], check=True)
