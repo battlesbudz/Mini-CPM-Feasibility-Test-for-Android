@@ -4,5 +4,7 @@ final class NativeBench {
     interface Listener {void onEvent(String message);}
     // mode is "quick" (Case 3 only, 32-token cap) or "full" (all six
     // cases, trial defaults); added in build 12 for the quick mode.
+    // Build 14 adds "quick_off": the quick run with lookahead prefetch
+    // switched off (the A/B arm); the report marks it unambiguously.
     static native String run(String models,String image,String output,String mode,Listener listener);
 }

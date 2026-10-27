@@ -125,6 +125,27 @@ throttled by the runtime and only ever described the early steps).
 One quick-mode run produces the number under exactly the build 12
 runs' conditions.
 
+## Build 14: the lookahead A/B test
+
+Build 13's quick run scored the predictor at 84.0% accuracy
+(8,128 of 9,672), but accuracy alone does not prove the prefetch is
+a net speed win on this CPU path — its worker shares the same I/O
+threads as demand installs. Build 14 adds a second quick button,
+**Quick decode check · Lookahead OFF (A/B)**, which runs the exact
+same Case 3 / 32-token quick run with one value changed:
+`LLAMA_MOE_LOOKAHEAD_PREFETCH` is set to `0` instead of `1` before
+load — the fork's own off switch, no fork patch. The decode window
+(16 slots/layer), slot bank (1024), prewarm, threads and prompt are
+identical in both arms; with prefetch off the fork simply reserves
+no prefetch staging slots and never computes predictions. The OFF
+run cannot be confused with the ON run: its status and report carry
+`mode: "quick_off"`, `moeLookaheadPrefetch: "off"` and
+`abArm: "lookahead_off"`, and its report has no
+`moeLookaheadScored/Correct/AccuracyPct` fields at all (nothing is
+predicted, so the runtime prints no accuracy line — the fields are
+absent, not zero). Run the normal quick check and the OFF check
+back to back and compare `decodeTokensPerSec`.
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub

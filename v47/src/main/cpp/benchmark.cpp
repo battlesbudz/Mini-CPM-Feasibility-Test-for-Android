@@ -62,6 +62,22 @@
 // counters read directly), they cover the whole run — unlike the
 // per-step flush-line sums, which the runtime throttles (section 21.5).
 //
+// Build 14 adds the A/B test build 13 left open: is lookahead
+// prefetch a net speed win on this CPU path, or does its I/O and
+// thread contention cost more than the (now proven 84%-accurate)
+// guesses save? A second quick-mode entry, mode "quick_off", runs
+// Case 3 with the same 32-token cap and the identical configuration
+// except one value: LLAMA_MOE_LOOKAHEAD_PREFETCH is set to "0"
+// instead of "1" before load — the fork's own off switch, no patch.
+// The report carries moeLookaheadPrefetch "off" and abArm
+// "lookahead_off" so the two arms can never be confused in a pasted
+// diagnostics dump; the ON arm is byte-for-byte build 13's quick
+// behavior (abArm "lookahead_on" is the only added field). In the
+// OFF arm the runtime prints no lookahead-accuracy line at all
+// (nothing is predicted, so nothing is scored), and the report
+// simply has no moeLookaheadScored/Correct/AccuracyPct fields —
+// absent, not zero-filled.
+//
 // Configuration mirrors the vendor demo defaults for this fork
 // (OpenBMB MiniCPM-V-demo-Android): 4 threads, 4096-token context,
 // image_max_slice_nums 9. Sampling is greedy (temperature 0) to match the
@@ -417,7 +433,11 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // (QUICK_CASE_DISPLAY) with a QUICK_MAX_TOKENS decode cap; anything
     // else is the full six-case trial with untouched defaults.
     const std::string mode  = jmode ? jstr(env, jmode) : std::string("full");
-    const bool quick = mode == "quick";
+    // Build 14: "quick_off" is the A/B lookahead-OFF arm of quick mode
+    // (see the build 14 header note). Everything else about the run —
+    // case, cap, watchdog (service side) — is quick mode unchanged.
+    const bool lookahead_off = mode == "quick_off";
+    const bool quick = mode == "quick" || lookahead_off;
     const int max_tokens = quick ? QUICK_MAX_TOKENS : MAX_NEW_TOKENS;
     auto listener_cls = env->GetObjectClass(listener);
     auto on_event = env->GetMethodID(listener_cls, "onEvent", "(Ljava/lang/String;)V");
@@ -539,8 +559,19 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // the fork default of 8. The runtime predicts the next layer's
     // routing from the current hidden state and pre-reads those
     // experts during the current layer's compute; hits remap for free.
-    setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH", "1", 1);
-    report["moeLookaheadPrefetch"] = "on (depth default 8)";
+    // Build 14 A/B: the OFF arm flips the fork's own switch to "0".
+    // That is the fork's documented off state: the slot runtime's
+    // lookahead init reads depth 0 and disables the mechanism
+    // (llama-moe-slot.cpp), the model graph then never computes
+    // predictions (qwen35moe.cpp gates them on
+    // lookahead_prefetch_enabled()), and moe_prefetch_slots()
+    // (llama-model.cpp) returns 0, so no prefetch staging slots are
+    // reserved in the decode tensors. The decode window (16 cache
+    // slots/layer), the slot bank, prewarm, threads and every other
+    // configuration value are set exactly as in the ON arm.
+    setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH", lookahead_off ? "0" : "1", 1);
+    report["moeLookaheadPrefetch"] = lookahead_off ? "off" : "on (depth default 8)";
+    report["abArm"] = lookahead_off ? "lookahead_off" : "lookahead_on";
     // Build 12 (research 2.2/3): always record this run's routing
     // trace. The runtime truncates the file at context creation, so
     // the previous run's trace must be mined BEFORE the model loads
@@ -588,7 +619,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     report["moeDecodeWindow"] = MOE_DECODE_WINDOW;
     report["moePrewarmTable"] = prewarm_desc.empty() ? "WRITE FAILED - prewarm off" : prewarm_desc;
     emit("MoE decode window on: " + std::to_string(MOE_DECODE_WINDOW) +
-         " slots/layer, lookahead prefetch on, prewarm table " +
+         " slots/layer, lookahead prefetch " + std::string(lookahead_off ? "off" : "on") + ", prewarm table " +
          (prewarm_desc.empty() ? std::string("FAILED to write") : prewarm_desc));
 
     emit("Loading MiniCPM-V 4.7 main model (LES expert streaming)");
