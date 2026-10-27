@@ -58,6 +58,51 @@ Instrumentation only: model files, prompts, context/batch/token caps,
 thread count and the watchdog are unchanged, and the final report format
 is untouched.
 
+## Build 12: streaming levers, quick mode, per-case reports
+
+Build 11 (decode-window expert cache + vendor w16 prewarm table) got
+decode to persist experts across tokens inside a 16-slot-per-layer
+window. Build 12 stacks the next levers from the streaming research
+(`~/workspace/evals/minicpm-v47/STREAMING_RESEARCH.md` in the trial
+record) plus the diagnostic-loop fixes:
+
+- **Lookahead prefetch ON** (`LLAMA_MOE_LOOKAHEAD_PREFETCH=1`, default
+  depth 8): the runtime pre-reads the predicted next experts during the
+  current layer's compute. Report field `moeLookaheadPrefetch`.
+- **Prefill bank 256 → 1024 slots** (~1.29 GiB resident; fork cap is
+  32 × 40 layers = 1280). Total expert residency with the decode
+  windows is ~2.50 GiB, toward the vendor's ~3 GB working set. Honest
+  bound: the fork clears each layer's cache per call (that clear is
+  load-bearing — the shared bank is time-multiplexed across layers),
+  so the bank is within-call capacity, not cross-chunk persistence.
+  Retaining the cache across image chunks is **not** in this build:
+  it needs per-layer prefill windows in the fork, a redesign.
+- **Own prewarm table, mined from our own routing:** every run records
+  its decode routing to `moe_sweep.txt` in the model directory
+  (`LLAMA_MOE_SWEEP`). At startup the previous run's trace is mined
+  (top-16 experts per layer by observed frequency) and used as the
+  prewarm table; with no usable trace the vendor w16 table is the
+  fallback, so the first build 12 run prewarms with w16 and the mined
+  table takes over from the second run. Report field `moePrewarmTable`
+  says which table was used.
+- **[moe-ssd] counters in status and report:** the runtime's own
+  expert-install / cache-hit / prefetch / I/O counters are parsed out
+  of its log stream after every case (`moeExpertInstalls`,
+  `moeCacheHitRatePct`, `moePrefetchHits`, `moeLookaheadHitRatePct`,
+  `moeIoReadMiB`, …), so each lever above is provable from one run.
+- **Per-case partial report:** every finished case is written to
+  `report-partial.json` as it completes (and shown in Copy
+  diagnostics). A watchdog timeout now loses at most the in-progress
+  case — build 10's 100-minute timeout produced no per-case results
+  at all. Cumulative run totals (sums across cases) ride along in
+  `status.json` under `totals`; the per-stage status fields remain
+  latest-case snapshots.
+- **Quick decode check:** the "Quick decode check · Case 3 only"
+  button runs just the long bicycle text case with a 32-token decode
+  cap under a 10-minute watchdog — a trustworthy tok/s in minutes
+  instead of a full trial. The full trial's cases, prompts and
+  defaults are unchanged.
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub
@@ -70,7 +115,9 @@ feasibility-test key, like the other modules.
 
 1. Install the APK, open **MiniCPM-V 4.7 Trial**.
 2. Tap **Download model pack · 16.6 GB** on Wi-Fi with ≥ 18 GB free.
-3. Tap **Run phone trial**. Keep the phone awake and on the charger;
+3. For a fast decode-speed verdict, tap **Quick decode check ·
+   Case 3 only** (32-token cap, 10-minute limit). For the full run,
+   tap **Run phone trial**. Keep the phone awake and on the charger;
    a slow first run is expected (expert paging is storage-bound).
 4. Read the verdict and answers on screen, or copy diagnostics.
 

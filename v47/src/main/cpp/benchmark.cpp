@@ -28,6 +28,25 @@
 // cases, sampling, threads, context, the vision path and the model pack
 // are all untouched.
 //
+// Build 12 stacks the streaming-research additions on top of build 11
+// (STREAMING_RESEARCH.md sections 2.1, 2.2 and 3): lookahead prefetch
+// ON (LLAMA_MOE_LOOKAHEAD_PREFETCH=1, default depth 8), the shared
+// prefill bank raised 256 -> 1024 slots, a prewarm table mined from
+// this app's own previous-run routing trace (LLAMA_MOE_SWEEP) when one
+// exists, with the vendor w16 table kept as the fallback, the runtime's
+// own [moe-ssd] counters parsed out of the captured log into the
+// status and the report, a per-case CASE_DONE event the service turns
+// into an incremental partial report, and a quick mode (Case 3 only,
+// 32-token decode cap) the service selects with the run-mode argument.
+// One research item is deliberately NOT here: retaining the slot cache
+// across image chunks. In this runtime the prefill bank is a single
+// pool time-multiplexed across layers, and the per-call layer-cache
+// clear is what keeps a layer's residency map from going stale while
+// other layers overwrite the same physical slots; removing the clear
+// would silently corrupt weights (the fork documents exactly that bug
+// class at the prefill-to-decode transition). Cross-chunk reuse needs
+// per-layer prefill windows, a fork redesign, not a trial patch.
+//
 // Configuration mirrors the vendor demo defaults for this fork
 // (OpenBMB MiniCPM-V-demo-Android): 4 threads, 4096-token context,
 // image_max_slice_nums 9. Sampling is greedy (temperature 0) to match the
@@ -38,6 +57,7 @@
 #include <jni.h>
 #include <android/log.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -66,23 +86,55 @@ static const int    N_THREADS      = 4;
 // the llama_model constructor throws std::invalid_argument, which
 // llama_model_load catches and converts into a null model return — that was
 // the build-5 device failure (null in ~170 ms, before any tensor loads).
-// 256 is the vendor demo's own default for this model
-// (MiniCPMV47Const.defaultSlotBank; min = expert_used_count 8,
-// max = expert_count 256). Resident cost on this pack:
-// 256 slots x 1,351,680 B per-slot-per-layer bytes = ~330 MiB.
-static const int    MOE_SLOT_BANK  = 256;
+// Builds 5-11 used 256, the vendor demo's own default for this model
+// (MiniCPMV47Const.defaultSlotBank). Build 12 raises the bank to 1024:
+// - The fork's hard cap is 32 x n_moe_layers = 32 x 40 = 1280 slots
+//   (llama-model.cpp, kMoeSlotBankRamBaseline); 1024 stays under it.
+// - The bank is ONE shared pool, resident cost = slots x 1,351,680 B
+//   per-slot-per-layer bytes: 1024 x 1,351,680 B = ~1.29 GiB (was
+//   ~330 MiB at 256). With build 11/12's decode windows (below) total
+//   expert residency is ~2.50 GiB, toward the vendor's ~3 GB working
+//   set for this model.
+// - Headroom check against build 10's device run: worker PSS peaked
+//   ~3.02 GB with the 256 bank and no windows. Swapping in this bank
+//   (+~0.97 GiB) and the windows with prefetch staging (+~1.21 GiB)
+//   estimates a worst-case worker PSS of ~5.2 GB on the 12 GB Fold6,
+//   leaving ~1.3 GB of system-free margin by build 10's observed
+//   split; the run's memory.json lowMemory flag is the on-device
+//   check. 1280 was rejected for a first run of this combination: it
+//   buys capacity current workloads cannot use (a layer call routes
+//   ~84 unique experts per image chunk, ~200 max on the text prompts)
+//   for ~0.3 GiB more margin loss.
+// - Honest bound: with the fork's per-call layer-cache clear left in
+//   place (see the build 12 header note), the bank is within-call
+//   capacity — a single layer call can now hold up to 1024 unique
+//   experts without eviction or the fork's "requires more than N
+//   unique experts" throw. It does not by itself create cross-chunk
+//   cache hits.
+static const int    MOE_SLOT_BANK  = 1024;
 // Build 11: per-layer decode-window width, in expert slots
 // (LLAMA_MOE_DECODE_WINDOW, read by the fork at model load to build the
 // per-layer decode tensor layout, and again by the slot runtime; the
 // fork clamps it to [n_expert_used, 1024] = [8, 1024] for this model).
-// The decode windows are physically separate from the 256-slot prefill
-// bank, so the resident cost is additive: 40 layers x 16 slots x
-// 1,351,680 B per expert = ~825 MiB. 16 is the vendor app's matched
-// pairing with its w16 prewarm table (below), and it fits the headroom
-// build 10 proved on device (worker PSS peaked ~3.02 GB with ~3.91 GB
-// of system memory still free). Lookahead prefetch stays off (its env
-// is never set), so the effective window width is exactly this value.
+// The decode windows are physically separate from the prefill bank, so
+// the resident cost is additive. 16 is the vendor app's matched pairing
+// with its w16 prewarm table (below). Build 12 turns lookahead
+// prefetch ON (LLAMA_MOE_LOOKAHEAD_PREFETCH=1, default depth 8): the
+// model-side tensor layout then adds the fork's prefetch staging of
+// depth slots per layer (moe_prefetch_slots()), so the physical width
+// is 16 + 8 = 24 slots/layer and the resident cost is 40 layers x 24 x
+// 1,351,680 B = ~1.21 GiB (was ~825 MiB in build 11 with prefetch off).
+// The cache portion a token can hit stays 16/layer either way.
 static const int    MOE_DECODE_WINDOW = 16;
+// Build 12: lookahead prefetch depth is left at the fork's default (8)
+// — LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH is never set. Depth is also the
+// per-layer prefetch staging width counted in the sizing above.
+// Build 12 quick mode: run only this case (1-based display index; the
+// long bicycle text case, build 10/11's decode measurement) with the
+// decode cap below. Selected by the service via the run-mode argument;
+// the full trial's case list and defaults are unchanged.
+static const int    QUICK_CASE_DISPLAY = 3;
+static const int    QUICK_MAX_TOKENS   = 32;
 // The vendor app's static prewarm table for this model, top-16 experts
 // per layer, ranked by observed routing frequency (k_mb_prewarm_w16 in
 // OpenBMB/MiniCPM-V-Apps, MTMDWrapper/Bridge/MBPrewarmTable.h, generated
@@ -176,6 +228,133 @@ static std::string loader_log_snapshot() {
     return g_loader_log;
 }
 
+// Build 12: mine a prewarm table from a previous run's routing trace.
+// The slot runtime's LLAMA_MOE_SWEEP dump writes one line per decode
+// step per layer: "L<layer> E:<experts actually used> P:<predicted>".
+// Routing depends only on the real weights and prompts, so the
+// per-layer frequency of the E: ids over a previous run IS this app's
+// own routing distribution; the top-16 per layer is exactly what the
+// width-16 decode window wants prewarmed. Returns the table text in
+// the runtime's parser format (one line per layer, '#' lines skipped),
+// or "" when the trace is missing or too thin to trust: fewer than
+// 400 decode lines (10 steps x 40 layers) or any layer unseen. The
+// "P<layer>" prefill lines the runtime also writes are ignored — only
+// decode routing seeds a decode cache.
+static std::string mine_prewarm_table(const std::string & sweep_path, long & lines_out) {
+    lines_out = 0;
+    FILE * fp = std::fopen(sweep_path.c_str(), "r");
+    if (!fp) return "";
+    static const int N_LAYERS = 40, N_EXPERTS = 256;
+    long counts[N_LAYERS][N_EXPERTS] = {};
+    long layer_lines[N_LAYERS] = {};
+    char buf[8192];
+    long total = 0;
+    while (std::fgets(buf, sizeof(buf), fp)) {
+        if (buf[0] != 'L') continue;
+        char * p = buf + 1;
+        char * end = nullptr;
+        const long layer = std::strtol(p, &end, 10);
+        if (end == p || layer < 0 || layer >= N_LAYERS) continue;
+        const char * e = std::strstr(end, "E:");
+        if (!e) continue;
+        e += 2;
+        layer_lines[layer]++;
+        total++;
+        while (*e) {
+            while (*e == ' ' || *e == ',' || *e == '\t') e++;
+            if (*e == 'P' && e[1] == ':') break; // predictions start here
+            if (!*e || *e == '\n' || *e == '\r') break;
+            char * idend = nullptr;
+            const long id = std::strtol(e, &idend, 10);
+            if (idend == e) break;
+            if (id >= 0 && id < N_EXPERTS) counts[layer][id]++;
+            e = idend;
+        }
+    }
+    std::fclose(fp);
+    if (total < 400) return "";
+    for (int l = 0; l < N_LAYERS; l++) if (layer_lines[l] == 0) return "";
+    lines_out = total;
+    std::string out = "# Prewarm table mined from this app's previous run (LLAMA_MOE_SWEEP trace):\n"
+                      "# one line per model layer, top-16 experts by observed decode routing frequency.\n";
+    for (int l = 0; l < N_LAYERS; l++) {
+        std::array<int, N_EXPERTS> ids;
+        for (int i = 0; i < N_EXPERTS; i++) ids[i] = i;
+        std::sort(ids.begin(), ids.end(), [&](int a, int b) {
+            return counts[l][a] != counts[l][b] ? counts[l][a] > counts[l][b] : a < b;
+        });
+        for (int i = 0; i < 16; i++) {
+            if (i) out += ",";
+            out += std::to_string(ids[i]);
+        }
+        out += "\n";
+    }
+    return out;
+}
+
+// Build 12: the runtime's own counters, recovered from its [moe-ssd]
+// log lines (the trial already captures the full llama log stream).
+// The per-ubatch flush lines carry DELTAS (miss/hit/pfhit/pfread/
+// readall/calls per flush window; the runtime resets its accumulator
+// after each flush), so summing the lines yields run totals: misses
+// are main-path expert installs, hits are slot-cache hits, and the
+// lookahead report line ("armed=.. hits=.. (X% of predictions)") is
+// cumulative and taken whole. Approximation by design: the captured
+// log is capped (LOADER_LOG_MAX), so on a very long run the totals
+// undercount — the report flags that via moeCountersTruncated.
+struct MoeCounters {
+    long long miss = 0, hit = 0, pfRead = 0, pfHit = 0, ioCalls = 0;
+    double ioMiB = 0.0;
+    bool lookaheadSeen = false;
+    long long laArmed = 0, laHits = 0;
+    double laPct = 0.0;
+};
+static bool log_field_ll(const std::string & line, const char * key, long long & out) {
+    const std::string k = std::string(key) + "=";
+    const size_t pos = line.find(k);
+    if (pos == std::string::npos) return false;
+    out = std::strtoll(line.c_str() + pos + k.size(), nullptr, 10);
+    return true;
+}
+static bool log_field_d(const std::string & line, const char * key, double & out) {
+    const std::string k = std::string(key) + "=";
+    const size_t pos = line.find(k);
+    if (pos == std::string::npos) return false;
+    out = std::strtod(line.c_str() + pos + k.size(), nullptr);
+    return true;
+}
+static MoeCounters parse_moe_counters(const std::string & log) {
+    MoeCounters c;
+    size_t pos = 0;
+    while (pos < log.size()) {
+        const size_t eol = log.find('\n', pos);
+        const std::string line = log.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+        pos = eol == std::string::npos ? log.size() : eol + 1;
+        if (line.find("[moe-ssd]") == std::string::npos) continue;
+        long long v;
+        double d;
+        if (line.find(" tok=") != std::string::npos && line.find(" span=") != std::string::npos) {
+            if (log_field_ll(line, "miss", v)) c.miss += v;
+            if (log_field_ll(line, "hit", v)) c.hit += v;
+            if (log_field_ll(line, "pfhit", v)) c.pfHit += v;
+            if (log_field_ll(line, "pfread", v)) c.pfRead += v;
+            if (log_field_ll(line, "calls", v)) c.ioCalls += v;
+            if (log_field_d(line, "readall", d)) c.ioMiB += d;
+        }
+        if (line.find("lookahead-prefetch: armed=") != std::string::npos) {
+            long long armed = 0, hits = 0;
+            if (log_field_ll(line, "armed", armed) && log_field_ll(line, "hits", hits)) {
+                c.lookaheadSeen = true;
+                c.laArmed = armed;
+                c.laHits = hits;
+                const size_t paren = line.find('(', line.find("hits="));
+                c.laPct = paren == std::string::npos ? 0.0 : std::strtod(line.c_str() + paren + 1, nullptr);
+            }
+        }
+    }
+    return c;
+}
+
 static llama_token greedy_token(llama_context * ctx, const llama_vocab * vocab) {
     const float * logits = llama_get_logits_ith(ctx, -1);
     const int n = llama_vocab_n_tokens(vocab);
@@ -198,11 +377,17 @@ static std::string token_piece(const llama_vocab * vocab, llama_token token) {
 }
 
 extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench_run(
-        JNIEnv * env, jclass, jstring jroot, jstring jimage, jstring jout, jobject listener) {
+        JNIEnv * env, jclass, jstring jroot, jstring jimage, jstring jout, jstring jmode, jobject listener) {
     const std::string root  = jstr(env, jroot);
     const std::string image = jstr(env, jimage);
     const std::string out   = jstr(env, jout);
     (void) out; // report is returned to the service, which persists it
+    // Build 12: run mode from the service. "quick" runs only Case 3
+    // (QUICK_CASE_DISPLAY) with a QUICK_MAX_TOKENS decode cap; anything
+    // else is the full six-case trial with untouched defaults.
+    const std::string mode  = jmode ? jstr(env, jmode) : std::string("full");
+    const bool quick = mode == "quick";
+    const int max_tokens = quick ? QUICK_MAX_TOKENS : MAX_NEW_TOKENS;
     auto listener_cls = env->GetObjectClass(listener);
     auto on_event = env->GetMethodID(listener_cls, "onEvent", "(Ljava/lang/String;)V");
     auto emit = [&](const std::string & s) {
@@ -229,6 +414,39 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         emit("PROGRESS " + fields.dump());
     };
 
+    // Build 12 (research section 3, item 5): surface the runtime's own
+    // [moe-ssd] counters so every optimization above is provable from a
+    // single run. Parsed from the captured loader log (parse_moe_counters)
+    // and emitted as a checkpoint after every case, so status.json shows
+    // the running totals; the same totals land in the final report.
+    auto moe_counters_json = [&]() {
+        const MoeCounters c = parse_moe_counters(loader_log_snapshot());
+        const double rate = (c.hit + c.miss) > 0 ? 100.0 * (double) c.hit / (double) (c.hit + c.miss) : 0.0;
+        json fields = {
+            {"moeExpertInstalls", c.miss},
+            {"moePrefetchReads", c.pfRead},
+            {"moeCacheHits", c.hit},
+            {"moeCacheMisses", c.miss},
+            {"moeCacheHitRatePct", rate},
+            {"moePrefetchHits", c.pfHit},
+            {"moeIoReadMiB", c.ioMiB},
+            {"moeIoCalls", c.ioCalls},
+        };
+        if (c.lookaheadSeen) {
+            fields["moeLookaheadArmed"] = c.laArmed;
+            fields["moeLookaheadHits"] = c.laHits;
+            fields["moeLookaheadHitRatePct"] = c.laPct;
+        }
+        return fields;
+    };
+    auto emit_counters = [&]() {
+        json fields = moe_counters_json();
+        fields["stage"] = "moe_counters";
+        fields["event"] = "progress";
+        fields["label"] = "MoE expert counters";
+        emit_progress(fields);
+    };
+
     json report = {
         {"schemaVersion", 2},
         {"profile", "minicpm-v47-phone-trial-v1"},
@@ -241,7 +459,8 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         {"threads", N_THREADS},
         {"contextTokens", N_CTX},
         {"batchTokens", N_BATCH},
-        {"maxNewTokens", MAX_NEW_TOKENS},
+        {"mode", quick ? "quick" : "full"},
+        {"maxNewTokens", max_tokens},
         {"sampling", "greedy (temperature 0)"},
         {"thinking", "disabled via closed think block (enable_thinking=false equivalent)"},
     };
@@ -251,6 +470,9 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
                        {"label", "Failed at " + phase}});
         report["errorPhase"] = phase;
         report["error"] = message;
+        const json counters = moe_counters_json();
+        for (auto it = counters.begin(); it != counters.end(); ++it) report[it.key()] = it.value();
+        report["moeCountersTruncated"] = loader_log_snapshot().size() >= LOADER_LOG_MAX;
         report["loaderLog"] = loader_log_snapshot();
         report["peakRssKb"] = peak_rss_kb();
         report["totalMs"] = ms_between(trial_start, Clock::now());
@@ -268,28 +490,70 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     report["moeExpertsPath"] = experts_path;
     report["moeSlotBank"] = MOE_SLOT_BANK;
 
-    // Build 11: enable the decode-window expert cache + prewarm BEFORE
-    // the model loads — the fork reads LLAMA_MOE_DECODE_WINDOW on the
-    // model side at load time to size the per-layer decode tensors, and
-    // LLAMA_MOE_PREWARM when the slot runtime initializes. Overwrite
-    // unconditionally, as the vendor app does, so no stale value can
-    // leak in. If the table file cannot be written the window still
-    // turns on; prewarm then no-ops inside the runtime and the report
-    // says so.
+    // Builds 11/12: enable the decode-window expert cache, prewarm,
+    // lookahead prefetch and the routing-trace dump BEFORE the model
+    // loads — the fork reads LLAMA_MOE_DECODE_WINDOW and
+    // LLAMA_MOE_LOOKAHEAD_PREFETCH on the model side at load time to
+    // size the per-layer decode tensors, LLAMA_MOE_PREWARM when the
+    // slot runtime initializes, and LLAMA_MOE_SWEEP at context
+    // creation. Overwrite unconditionally, as the vendor app does, so
+    // no stale value can leak in.
     setenv("LLAMA_MOE_DECODE_WINDOW", std::to_string(MOE_DECODE_WINDOW).c_str(), 1);
-    const std::string prewarm_path = model_dir + "/moe_prewarm_w16.txt";
-    bool prewarm_written = false;
-    if (FILE * pf = std::fopen(prewarm_path.c_str(), "w")) {
-        prewarm_written = std::fputs(MOE_PREWARM_TABLE_W16, pf) >= 0;
-        std::fclose(pf);
+    // Build 12 (research 2.1): lookahead prefetch ON, depth left at
+    // the fork default of 8. The runtime predicts the next layer's
+    // routing from the current hidden state and pre-reads those
+    // experts during the current layer's compute; hits remap for free.
+    setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH", "1", 1);
+    report["moeLookaheadPrefetch"] = "on (depth default 8)";
+    // Build 12 (research 2.2/3): always record this run's routing
+    // trace. The runtime truncates the file at context creation, so
+    // the previous run's trace must be mined BEFORE the model loads
+    // (the prewarm selection below) — after this run it holds this
+    // run's trace for the next one.
+    const std::string sweep_path = model_dir + "/moe_sweep.txt";
+    setenv("LLAMA_MOE_SWEEP", sweep_path.c_str(), 1);
+    report["moeSweepTrace"] = sweep_path;
+    // Prewarm table selection. First choice: a table mined from the
+    // previous run's sweep trace (this app's own routing on this
+    // phone). No previous trace (or a too-thin one) falls back to the
+    // vendor w16 table exactly as build 11 shipped it — so build 12's
+    // FIRST run prewarms with w16 and records the trace; the mined
+    // table takes over from the second run on. If neither file can
+    // be written the window still turns on; prewarm then no-ops
+    // inside the runtime and the report says so.
+    std::string prewarm_path;
+    std::string prewarm_desc;
+    long sweep_lines = 0;
+    const std::string mined = mine_prewarm_table(sweep_path, sweep_lines);
+    if (!mined.empty()) {
+        const std::string ours_path = model_dir + "/moe_prewarm_ours.txt";
+        if (FILE * pf = std::fopen(ours_path.c_str(), "w")) {
+            if (std::fputs(mined.c_str(), pf) >= 0) {
+                prewarm_path = ours_path;
+                prewarm_desc = "ours (mined from previous run sweep: " +
+                               std::to_string(sweep_lines) + " decode-step layer lines)";
+            }
+            std::fclose(pf);
+        }
     }
-    if (prewarm_written) {
+    if (prewarm_path.empty()) {
+        const std::string w16_path = model_dir + "/moe_prewarm_w16.txt";
+        if (FILE * pf = std::fopen(w16_path.c_str(), "w")) {
+            if (std::fputs(MOE_PREWARM_TABLE_W16, pf) >= 0) {
+                prewarm_path = w16_path;
+                prewarm_desc = "w16 (vendor top-16/layer)";
+            }
+            std::fclose(pf);
+        }
+    }
+    if (!prewarm_path.empty()) {
         setenv("LLAMA_MOE_PREWARM", prewarm_path.c_str(), 1);
     }
     report["moeDecodeWindow"] = MOE_DECODE_WINDOW;
-    report["moePrewarmTable"] = prewarm_written ? "w16 (vendor top-16/layer)" : "WRITE FAILED - prewarm off";
+    report["moePrewarmTable"] = prewarm_desc.empty() ? "WRITE FAILED - prewarm off" : prewarm_desc;
     emit("MoE decode window on: " + std::to_string(MOE_DECODE_WINDOW) +
-         " slots/layer, prewarm table " + (prewarm_written ? std::string("w16") : std::string("FAILED to write")));
+         " slots/layer, lookahead prefetch on, prewarm table " +
+         (prewarm_desc.empty() ? std::string("FAILED to write") : prewarm_desc));
 
     emit("Loading MiniCPM-V 4.7 main model (LES expert streaming)");
     emit_progress({{"stage", "model_load"}, {"event", "start"}, {"label", "Loading main model"}});
@@ -407,7 +671,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
                        {"generatedTokens", 0},
                        {"label", tag + ": generating answer"}});
         auto last_progress_emit = Clock::now();
-        while (generated < MAX_NEW_TOKENS) {
+        while (generated < max_tokens) {
             const llama_token token = greedy_token(ctx, vocab);
             if (llama_vocab_is_eog(vocab, token)) { ended_eos = true; break; }
             if (generated == 0) kase["ttftMs"] = ms_between(case_start, Clock::now());
@@ -432,7 +696,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
                 last_progress_emit = Clock::now();
             }
             if (generated % 32 == 0) emit(tag + ": " + std::to_string(generated) + " tokens");
-            if (generated >= MAX_NEW_TOKENS) break;
+            if (generated >= max_tokens) break;
             batch.n_tokens = 1;
             batch.token[0] = token;
             batch.pos[0] = n_past;
@@ -460,6 +724,8 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     };
 
     for (int qi = 0; qi < n_cases && fatal.empty(); qi++) {
+        // Build 12 quick mode: only the decode measurement case runs.
+        if (quick && qi + 1 != QUICK_CASE_DISPLAY) continue;
         const int display = qi + 1;
         const std::string tag = "Case " + std::to_string(display);
         const std::string question = trial_cases[qi].question;
@@ -550,6 +816,12 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
             run_generation(display, case_start, kase, n_past);
             cases.push_back(kase);
             emit(tag + " complete: " + std::to_string(kase["generatedTokens"].get<int>()) + " tokens");
+            // Build 12: hand the finished case to the service at once,
+            // so it lands in the incremental partial report even if the
+            // run is later killed by the watchdog; then refresh the
+            // [moe-ssd] counter totals in status.json.
+            emit("CASE_DONE " + kase.dump());
+            emit_counters();
             continue;
         }
 
@@ -656,6 +928,8 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         run_generation(display, case_start, kase, n_past);
         cases.push_back(kase);
         emit(tag + " complete: " + std::to_string(kase["generatedTokens"].get<int>()) + " tokens");
+        emit("CASE_DONE " + kase.dump());
+        emit_counters();
     }
 
     report["cases"] = cases;
@@ -667,6 +941,13 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     if (!fatal.empty()) return fail(fatal_phase, fatal);
     report["peakRssKb"] = peak_rss_kb();
     report["totalMs"] = ms_between(trial_start, Clock::now());
+    // Final [moe-ssd] totals. Parsed after llama_free above on purpose:
+    // the slot runtime prints its cumulative lookahead report line at
+    // teardown, and the log callback is still registered to capture it.
+    const json counters = moe_counters_json();
+    for (auto it = counters.begin(); it != counters.end(); ++it) report[it.key()] = it.value();
+    report["moeCountersSource"] = "runtime [moe-ssd] lines parsed from the captured loader log";
+    report["moeCountersTruncated"] = loader_log_snapshot().size() >= LOADER_LOG_MAX;
     report["loaderLog"] = loader_log_snapshot();
     emit("Trial complete");
     return env->NewStringUTF(report.dump(2).c_str());

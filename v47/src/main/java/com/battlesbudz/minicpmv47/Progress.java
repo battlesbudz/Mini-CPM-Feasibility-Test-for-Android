@@ -17,6 +17,25 @@ final class Progress {
     }
     // Readable phase text for a checkpoint: the native label when present,
     // otherwise the stage name ("Case 2: vision encode").
+    // Build 12: case measurements summed into the run totals as each
+    // case completes. The status fields merged above stay latest-case
+    // snapshots — they are the live in-progress view (diagnosis §16.1
+    // proved they get overwritten case to case and must not be read as
+    // totals); the totals object the service keeps in status.json and
+    // the partial report is the cumulative sum. Rates and one-shot
+    // timings (decodeTokensPerSec, ttftMs) are deliberately not summed.
+    private static final String[] TOTAL_KEYS={
+        "tokenizeMs","visionEvalMs","prefillMs","promptTokens",
+        "imageTokens","generatedTokens","decodeWallMs"
+    };
+    static void accumulate(JSONObject totals,JSONObject kase){
+        try{
+            for(String key:TOTAL_KEYS){
+                if(kase.has(key))totals.put(key,totals.optDouble(key,0)+kase.optDouble(key,0));
+            }
+            totals.put("casesCompleted",totals.optInt("casesCompleted",0)+1);
+        }catch(Exception ignored){}
+    }
     static String label(JSONObject progress){
         String label=progress.optString("label","");
         if(!label.isEmpty())return label;

@@ -64,6 +64,28 @@ public class ProgressTest {
         JSONObject progress=Progress.parse("PROGRESS {\"stage\":\"chunk_progress\",\"event\":\"progress\",\"caseIndex\":4,\"chunkIndex\":3,\"chunkTotal\":13}");
         assertEquals("Case 4: chunk progress",Progress.label(progress));
     }
+    @Test public void accumulateSumsCaseMeasurements() throws Exception {
+        JSONObject totals=new JSONObject();
+        Progress.accumulate(totals,new JSONObject("{\"tokenizeMs\":10.0,\"prefillMs\":100.0,\"promptTokens\":43,\"imageTokens\":0,\"generatedTokens\":217,\"decodeWallMs\":790900.0,\"visionEvalMs\":0.0,\"answer\":\"Paris\"}"));
+        Progress.accumulate(totals,new JSONObject("{\"tokenizeMs\":5.0,\"prefillMs\":200.0,\"promptTokens\":617,\"imageTokens\":574,\"generatedTokens\":100,\"decodeWallMs\":300000.0,\"visionEvalMs\":1233500.0}"));
+        assertEquals(15.0,totals.getDouble("tokenizeMs"),0.001);
+        assertEquals(300.0,totals.getDouble("prefillMs"),0.001);
+        assertEquals(660,totals.getInt("promptTokens"));
+        assertEquals(574,totals.getInt("imageTokens"));
+        assertEquals(317,totals.getInt("generatedTokens"));
+        assertEquals(1090900.0,totals.getDouble("decodeWallMs"),0.001);
+        assertEquals(1233500.0,totals.getDouble("visionEvalMs"),0.001);
+        assertEquals(2,totals.getInt("casesCompleted"));
+        // Non-measurement fields (the verbatim answer) are never summed in.
+        assertFalse(totals.has("answer"));
+    }
+    @Test public void accumulateIgnoresMissingKeys() throws Exception {
+        JSONObject totals=new JSONObject();
+        Progress.accumulate(totals,new JSONObject("{\"generatedTokens\":3}"));
+        assertEquals(3,totals.getInt("generatedTokens"));
+        assertEquals(1,totals.getInt("casesCompleted"));
+        assertFalse(totals.has("prefillMs"));
+    }
     @Test public void textPrefillMeasurementsMerge() throws Exception {
         JSONObject state=new JSONObject();
         Progress.merge(state,Progress.parse("PROGRESS {\"stage\":\"text_prefill\",\"event\":\"done\",\"caseIndex\":1,\"prefillMs\":42000.0,\"prefillTokensPerSec\":3.1,\"promptTokens\":130}"),9000L);
