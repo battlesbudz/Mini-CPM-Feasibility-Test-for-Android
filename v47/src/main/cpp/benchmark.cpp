@@ -1023,6 +1023,11 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     //   - the first token is sampled greedily from the prefill
     //     logits, exactly the baseline loop's first token;
     //   - each round drafts n_max tokens with the DSpark heads,
+    //     rolls the draft context's drafting scratch block back
+    //     (seq_rm from the anchor's position — the step both of the
+    //     fork's reference drivers take right after drafting;
+    //     build 15 missed it and process() collided with the scratch
+    //     block's positions, see the build 16 note in the loop),
     //     re-decodes [anchor, draft...] on the target as one verify
     //     batch, feeds that batch to common_speculative_process (it
     //     refreshes the draft context's injected features from the
@@ -1102,6 +1107,29 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
             dp.prompt = &prompt_tgt;
             dp.result = &draft;
             common_speculative_draft(spec);
+            // Build 16 fix: drafting leaves scratch KV in the DRAFT
+            // context. The dflash draft() decodes its noise block
+            // ([anchor, mask, mask] for DSpark: n_max tokens) into
+            // ctx_dft at positions anchor_pos .. anchor_pos + n_max - 1, and
+            // process() below injects the real target features at
+            // those same positions via llama_decode(ctx_dft, ...).
+            // Both of the fork's reference drivers remove the scratch
+            // block the moment drafting returns, before the verify
+            // batch: the server (server-context.cpp, right after
+            // common_speculative_draft) and speculative-simple both
+            // call seq_rm(ctx_dft, ckpt.pos_max + 1, -1), where
+            // pos_max is the target's last committed position, so
+            // pos_max + 1 is exactly the anchor's position. Build 15
+            // skipped this rollback: the noise block's last position
+            // (36 + 3 - 1 = 38) was still stored in the draft memory
+            // when process() tried to inject starting at 36, llama's
+            // M-RoPE batch check (stored last position must be <= the
+            // batch's starting position) rejected the injection
+            // decode with ret -1, and process() returned false
+            // (device: errorPhase dspark_process, X = 38, Y = 36).
+            if (!llama_memory_seq_rm(llama_get_memory(dspark_ctx), 0, anchor_pos, -1)) {
+                draft_seq_rm_failures++;
+            }
             if (draft.empty()) {
                 fatal_phase = "dspark_draft";
                 fatal = "common_speculative_draft produced no draft tokens";
