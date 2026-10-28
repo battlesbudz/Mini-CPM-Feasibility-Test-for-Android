@@ -146,6 +146,68 @@ predicted, so the runtime prints no accuracy line — the fields are
 absent, not zero). Run the normal quick check and the OFF check
 back to back and compare `decodeTokensPerSec`.
 
+## Build 15: the DSpark A/B arm
+
+The lookahead file closed with no consistent win (two A/B pairs,
+§§25–26 of the trial record), and the direction settled on the 35B
+stack with DSpark first: speculative decoding with the model's own
+trained draft heads, the strongest published lever left for this
+model on this phone. Build 15 adds a third quick button, **Quick
+decode check · DSpark (A/B)**, running the same Case 3 / 32-token
+quick run with generation driven by the fork's `draft-dspark`
+speculative implementation instead of the plain greedy loop.
+
+- **Draft model:** `dspark-MiniCPM-V-4_7-35B-A3B-Q8_0.gguf`
+  (424,572,928 B, SHA-256
+  `8c0ee456b4b6fb3b67eee42dd515d97f7c8f7353bc4be9aafe9c4ff68a780c16`)
+  from `openbmb/MiniCPM-V-4.7-35B-A3B-DSpark-gguf` @
+  `2c8f6931e5fba8a01bcc74b2964f330c62056b5e` — a separate repo from
+  the rest of the pack, so `models.json` carries a per-file source
+  override and `ModelStore` resolves it (size and hash verification
+  unchanged). The GGUF is a dense 5-layer `dflash` model
+  (block_size 15, target layers 4/12/20/28/36, confidence head);
+  it lands beside the main gguf in the model directory. Pack total
+  grows to 17,048,158,436 bytes (~17.0 GB). An existing install
+  re-runs Download once: the changed manifest makes the pack "not
+  ready" until the one new file is fetched and verified; every
+  existing file is hash-checked and skipped.
+- **Configuration (all before target load, vendor iOS bridge
+  pattern):** lookahead prefetch OFF (the baseline for this arm is
+  the build 14 OFF arm), decode window widened 16 → 32 with
+  `LLAMA_MOE_WINDOW_MAX_ROWS=4` so a verify batch of draft n_max+1
+  = 4 rows stays in window mode (worst-case union 4 × 8 = 32 slots,
+  exactly the window width, so the runtime's clamp leaves it at 4 —
+  the report's `moeWindowMaxRowsEffective` proves it), target
+  context `n_rs_seq = 3`, spec draft n_max = 3, draft context
+  created with `ctx_other` = target context. The draft model loads
+  with a fresh default params struct (no MoE fields: the fork
+  server clears them for the dense draft the same way).
+- **Driver:** the fork's speculative-simple flow — first token
+  sampled greedily from the prefill logits; per round, draft 3,
+  verify as one 4-row target batch, feed the batch to
+  `common_speculative_process`, accept greedily
+  (`common_sampler_sample_and_accept_n` with a top_k=1 sampler —
+  accepted ids are the target's own tokens, so acceptance is
+  exact), then `seq_rm` both contexts back to the new anchor.
+  Rollback is probed once at empty KV
+  (`common_context_can_seq_rm`): unless it returns `rs` or `part`
+  the arm fails safe — the report says DSpark disabled itself and
+  why, and no decode number is produced.
+- **Telemetry:** the case carries `dsparkRounds`,
+  `dsparkDraftedTokens`, `dsparkAcceptedTokens`,
+  `dsparkAcceptRatePct` and `dsparkAvgAcceptanceLength` (accepted
+  draft tokens per verify round) from the driver, plus the
+  runtime's own `common_speculative_print_stats` line captured
+  from the redirected common log (`dsparkSpecStatsLine` and its
+  parsed counters) as a cross-check, and `dsparkSeqRmType` with
+  the probed rollback mode. Every arm now also records
+  `generatedTokenIds` (additive field, no behavior change).
+- **Correctness gate:** the DSpark run's `generatedTokenIds` must
+  match the baseline arms' token for token over the 32-token cap.
+  Any divergence is a correctness failure, not a speed result.
+  Compare against the lookahead OFF arm (identical prefetch-off
+  configuration), run back to back.
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub
@@ -157,7 +219,9 @@ feasibility-test key, like the other modules.
 ## Run
 
 1. Install the APK, open **MiniCPM-V 4.7 Trial**.
-2. Tap **Download model pack · 16.6 GB** on Wi-Fi with ≥ 18 GB free.
+2. Tap **Download model pack · 17.0 GB** on Wi-Fi with ≥ 19 GB free.
+   (Updating from build 14 or earlier: tap Download again — only
+   the new 425 MB DSpark draft file is fetched.)
 3. For a fast decode-speed verdict, tap **Quick decode check ·
    Case 3 only** (32-token cap, 10-minute limit). For the full run,
    tap **Run phone trial**. Keep the phone awake and on the charger;

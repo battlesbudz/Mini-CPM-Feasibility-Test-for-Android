@@ -78,6 +78,34 @@
 // simply has no moeLookaheadScored/Correct/AccuracyPct fields —
 // absent, not zero-filled.
 //
+// Build 15 adds the DSpark A/B arm: does speculative decoding with
+// the model's own DSpark draft heads beat plain greedy decode on
+// this CPU path? A third quick-mode entry, mode "quick_dspark",
+// runs the exact same Case 3 / 32-token quick run, but generation
+// goes through the fork's common speculative machinery
+// (common/speculative.cpp, type draft-dspark) with the vendor's
+// DSpark draft GGUF (openbmb/MiniCPM-V-4.7-35B-A3B-DSpark-gguf,
+// Q8_0; dflash arch, block_size 15, target layers 4/12/20/28/36).
+// Configuration follows the vendor iOS bridge pattern, all set
+// before the target model loads: lookahead prefetch OFF (the
+// bridge disables MoE prediction whenever DSpark is on), decode
+// window widened 16 -> 32 with LLAMA_MOE_WINDOW_MAX_ROWS=4 so a
+// verify batch of n_max+1 = 4 rows stays in window mode, target
+// context created with n_rs_seq = 3 so recurrent-state rollback
+// covers a full round of rejected drafts, draft n_max = 3.
+// Rollback is probed once at empty KV (common_context_can_seq_rm,
+// the fork server's own probe): unless it returns RS or PART, the
+// arm fails safe — the report says DSpark disabled itself and why,
+// and no decode number is produced. Acceptance is greedy-exact
+// (top_k=1 sampler + common_sampler_sample_and_accept_n), and every
+// arm now records generatedTokenIds so the DSpark output can be
+// checked token-for-token against the baseline arms from the
+// pasted diagnostics. The case also carries the driver's own spec
+// counters (rounds / drafted / accepted / accept rate / average
+// acceptance length) plus the runtime's print_stats line captured
+// from the redirected common log. The fork patch is untouched;
+// this is app-side only, linking the already-built llama-common.
+//
 // Configuration mirrors the vendor demo defaults for this fork
 // (OpenBMB MiniCPM-V-demo-Android): 4 threads, 4096-token context,
 // image_max_slice_nums 9. Sampling is greedy (temperature 0) to match the
@@ -96,12 +124,19 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include <sys/resource.h>
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "nlohmann/json.hpp"
+// Build 15: the fork's common speculative-decoding machinery (the
+// trial CMake already builds llama-common; build 15 links it).
+#include "common.h"
+#include "log.h"
+#include "sampling.h"
+#include "speculative.h"
 
 using Clock = std::chrono::steady_clock;
 using json = nlohmann::ordered_json;
@@ -166,6 +201,27 @@ static const int    MOE_DECODE_WINDOW = 16;
 // the full trial's case list and defaults are unchanged.
 static const int    QUICK_CASE_DISPLAY = 3;
 static const int    QUICK_MAX_TOKENS   = 32;
+// Build 15 (DSpark arm): the draft GGUF sits beside the main gguf in
+// the model directory (downloaded from the DSpark repo via the
+// per-file source override in models.json / ModelStore).
+static const char * DSPARK_GGUF    = "dspark-MiniCPM-V-4_7-35B-A3B-Q8_0.gguf";
+// Draft tokens per verify round. The draft GGUF's trained block is
+// 15 wide (dflash.block_size), so 3 is far inside the trained range;
+// it also keeps a round's worst-case rollback at 3 tokens, exactly
+// the target context's n_rs_seq below. The vendor's published
+// acceptance length (3.501 at block 15) is a general-text average,
+// not a promise for this prompt.
+static const int    DSPARK_N_MAX   = 3;
+// DSpark arm decode window: widened from 16 to 32 so the clamp in
+// the slot runtime leaves room for LLAMA_MOE_WINDOW_MAX_ROWS=4
+// (n_max + 1 verify rows) — worst-case union for 4 rows is
+// 4 rows x 8 routed experts = 32 slots, exactly the window width,
+// so no clamp applies. Resident cost grows to 40 layers x 32 x
+// 1,351,680 B = ~1.65 GiB of window (from ~825 MiB at width 16 with
+// prefetch off); lookahead prefetch is OFF in this arm, so no
+// prefetch staging is added on top.
+static const int    DSPARK_DECODE_WINDOW   = 32;
+static const int    DSPARK_WINDOW_MAX_ROWS = DSPARK_N_MAX + 1;
 // The vendor app's static prewarm table for this model, top-16 experts
 // per layer, ranked by observed routing frequency (k_mb_prewarm_w16 in
 // OpenBMB/MiniCPM-V-Apps, MTMDWrapper/Bridge/MBPrewarmTable.h, generated
@@ -346,6 +402,10 @@ struct MoeCounters {
     bool lookaheadAccuracySeen = false;
     long long laScored = 0, laCorrect = 0;
     double laAccuracyPct = 0.0;
+    // Build 15: effective decode-window batch width after the slot
+    // runtime's clamp, from its "decode-cache: 窗口覆盖批宽 1..N"
+    // line (printed once at slot-runtime init). -1 = line not seen.
+    long long windowRows = -1;
 };
 static bool log_field_ll(const std::string & line, const char * key, long long & out) {
     const std::string k = std::string(key) + "=";
@@ -398,6 +458,13 @@ static MoeCounters parse_moe_counters(const std::string & log) {
                 c.laAccuracyPct = scored > 0 ? 100.0 * (double) correct / (double) scored : 0.0;
             }
         }
+        if (line.find("decode-cache:") != std::string::npos) {
+            const size_t dots = line.find("1..");
+            if (dots != std::string::npos) {
+                const long long rows = std::strtoll(line.c_str() + dots + 3, nullptr, 10);
+                if (rows > 0) c.windowRows = rows;
+            }
+        }
     }
     return c;
 }
@@ -437,7 +504,12 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // (see the build 14 header note). Everything else about the run —
     // case, cap, watchdog (service side) — is quick mode unchanged.
     const bool lookahead_off = mode == "quick_off";
-    const bool quick = mode == "quick" || lookahead_off;
+    // Build 15: "quick_dspark" is the DSpark A/B arm of quick mode
+    // (see the build 15 header note): same case, cap and watchdog,
+    // generation through the speculative driver instead of the
+    // greedy loop, with its own pre-load configuration below.
+    const bool dspark = mode == "quick_dspark";
+    const bool quick = mode == "quick" || lookahead_off || dspark;
     const int max_tokens = quick ? QUICK_MAX_TOKENS : MAX_NEW_TOKENS;
     auto listener_cls = env->GetObjectClass(listener);
     auto on_event = env->GetMethodID(listener_cls, "onEvent", "(Ljava/lang/String;)V");
@@ -492,6 +564,9 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
             fields["moeLookaheadScored"] = c.laScored;
             fields["moeLookaheadCorrect"] = c.laCorrect;
             fields["moeLookaheadAccuracyPct"] = c.laAccuracyPct;
+        }
+        if (c.windowRows >= 0) {
+            fields["moeWindowMaxRowsEffective"] = c.windowRows;
         }
         return fields;
     };
@@ -554,7 +629,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // slot runtime initializes, and LLAMA_MOE_SWEEP at context
     // creation. Overwrite unconditionally, as the vendor app does, so
     // no stale value can leak in.
-    setenv("LLAMA_MOE_DECODE_WINDOW", std::to_string(MOE_DECODE_WINDOW).c_str(), 1);
+    // Build 15: the DSpark arm widens the decode window to 32 (see
+    // DSPARK_DECODE_WINDOW above); the other arms keep build 11's 16.
+    const int decode_window = dspark ? DSPARK_DECODE_WINDOW : MOE_DECODE_WINDOW;
+    setenv("LLAMA_MOE_DECODE_WINDOW", std::to_string(decode_window).c_str(), 1);
     // Build 12 (research 2.1): lookahead prefetch ON, depth left at
     // the fork default of 8. The runtime predicts the next layer's
     // routing from the current hidden state and pre-reads those
@@ -569,9 +647,28 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // reserved in the decode tensors. The decode window (16 cache
     // slots/layer), the slot bank, prewarm, threads and every other
     // configuration value are set exactly as in the ON arm.
-    setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH", lookahead_off ? "0" : "1", 1);
-    report["moeLookaheadPrefetch"] = lookahead_off ? "off" : "on (depth default 8)";
-    report["abArm"] = lookahead_off ? "lookahead_off" : "lookahead_on";
+    // Build 15: the DSpark arm also sets the switch to "0" — the
+    // vendor iOS bridge disables MoE lookahead prediction whenever
+    // DSpark is on (the two predictors would fight over the same
+    // I/O), and the DSpark baseline is the lookahead-OFF arm.
+    setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH", (lookahead_off || dspark) ? "0" : "1", 1);
+    if (dspark) {
+        // Widen the window-mode batch coverage to n_max + 1 rows so
+        // a whole verify batch stays in the decode window (the slot
+        // runtime clamps this against the window width; width 32
+        // leaves it at 4, see the counters' moeWindowMaxRowsEffective).
+        setenv("LLAMA_MOE_WINDOW_MAX_ROWS", std::to_string(DSPARK_WINDOW_MAX_ROWS).c_str(), 1);
+    }
+    report["moeLookaheadPrefetch"] = dspark ? "off" : (lookahead_off ? "off" : "on (depth default 8)");
+    report["abArm"] = dspark ? "dspark_on" : (lookahead_off ? "lookahead_off" : "lookahead_on");
+    if (dspark) {
+        report["dsparkDraftModel"] = std::string(DSPARK_GGUF) +
+            " (openbmb/MiniCPM-V-4.7-35B-A3B-DSpark-gguf @ 2c8f6931e5fba8a01bcc74b2964f330c62056b5e)";
+        report["dsparkSpecType"] = "draft-dspark";
+        report["dsparkDraftNMax"] = DSPARK_N_MAX;
+        report["dsparkWindowMaxRows"] = DSPARK_WINDOW_MAX_ROWS;
+        report["dsparkTargetNRsSeq"] = DSPARK_N_MAX;
+    }
     // Build 12 (research 2.2/3): always record this run's routing
     // trace. The runtime truncates the file at context creation, so
     // the previous run's trace must be mined BEFORE the model loads
@@ -616,10 +713,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     if (!prewarm_path.empty()) {
         setenv("LLAMA_MOE_PREWARM", prewarm_path.c_str(), 1);
     }
-    report["moeDecodeWindow"] = MOE_DECODE_WINDOW;
+    report["moeDecodeWindow"] = decode_window;
     report["moePrewarmTable"] = prewarm_desc.empty() ? "WRITE FAILED - prewarm off" : prewarm_desc;
-    emit("MoE decode window on: " + std::to_string(MOE_DECODE_WINDOW) +
-         " slots/layer, lookahead prefetch " + std::string(lookahead_off ? "off" : "on") + ", prewarm table " +
+    emit("MoE decode window on: " + std::to_string(decode_window) +
+         " slots/layer, lookahead prefetch " + std::string((lookahead_off || dspark) ? "off" : "on") + ", prewarm table " +
          (prewarm_desc.empty() ? std::string("FAILED to write") : prewarm_desc));
 
     emit("Loading MiniCPM-V 4.7 main model (LES expert streaming)");
@@ -657,6 +754,11 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     cparams.n_ubatch = 512;
     cparams.n_threads = N_THREADS;
     cparams.n_threads_batch = N_THREADS;
+    // Build 15: only the DSpark arm asks for recurrent-state
+    // snapshots (n_rs_seq = draft n_max), so a verify round's
+    // rollback never exceeds what the context can restore. The
+    // other arms keep the default 0, byte-for-byte as before.
+    if (dspark) cparams.n_rs_seq = DSPARK_N_MAX;
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) { llama_model_free(model); return fail("context", "llama_init_from_model returned null"); }
     const double context_ms = ms_between(ctx_start, Clock::now());
@@ -666,6 +768,123 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
     llama_batch batch = llama_batch_init(1, 0, 1);
+
+    // Build 15: DSpark arm setup — draft model, draft context,
+    // rollback probe, speculative init. Everything here happens
+    // after the target context exists and before any case runs, in
+    // the fork server's own order (tools/server/server-context.cpp).
+    // Any failure is a fail-safe stop: the report names the phase
+    // and the reason, and no case (hence no decode number) is ever
+    // produced. The other arms skip this block entirely.
+    const std::string dspark_path = model_dir + "/" + DSPARK_GGUF;
+    std::string dspark_spec_log_path;
+    llama_model * dspark_model = nullptr;
+    llama_context * dspark_ctx = nullptr;
+    common_speculative * spec = nullptr;
+    common_sampler * dspark_sampler = nullptr;
+    auto free_dspark = [&]() {
+        if (dspark_sampler) { common_sampler_free(dspark_sampler); dspark_sampler = nullptr; }
+        if (spec) { common_speculative_free(spec); spec = nullptr; }
+        if (dspark_ctx) { llama_free(dspark_ctx); dspark_ctx = nullptr; }
+        if (dspark_model) { llama_model_free(dspark_model); dspark_model = nullptr; }
+    };
+    if (dspark) {
+        emit("Loading DSpark draft model");
+        emit_progress({{"stage", "dspark_setup"}, {"event", "start"}, {"label", "Loading DSpark draft model"}});
+        // The runtime's speculative stats are printed through the
+        // common log (common_speculative_print_stats), which writes
+        // to stderr by default and would be lost on Android.
+        // Redirect the main common log to a file in the model
+        // directory so the stats line can be read back at teardown
+        // and parsed into the report; colors/prefix/timestamps off
+        // so the line is plain text.
+        dspark_spec_log_path = model_dir + "/dspark_common.log";
+        common_log_set_colors(common_log_main(), LOG_COLORS_DISABLED);
+        common_log_set_prefix(common_log_main(), false);
+        common_log_set_timestamps(common_log_main(), false);
+        common_log_set_file(common_log_main(), dspark_spec_log_path.c_str());
+        // Draft model load, the fork server's way: a fresh default
+        // params struct, i.e. no MoE fields at all — the server
+        // explicitly clears the MoE params for the draft because
+        // draft models are dense (the DSpark GGUF is a 5-layer
+        // dflash model), so there is no experts path and no slot
+        // bank interaction.
+        const auto dspark_load_start = Clock::now();
+        llama_model_params dparams = llama_model_default_params();
+        dparams.n_gpu_layers = 0;
+        dparams.use_mmap = true;
+        dspark_model = llama_model_load_from_file(dspark_path.c_str(), dparams);
+        if (!dspark_model) {
+            free_dspark();
+            return fail("dspark_draft_load", "DSpark disabled itself: llama_model_load_from_file returned null for " + dspark_path);
+        }
+        report["dsparkDraftLoadMs"] = ms_between(dspark_load_start, Clock::now());
+        // Draft context with ctx_other = target context: the
+        // dflash/DSpark implementation reads the target's extracted
+        // layer embeddings through it (common/speculative.cpp).
+        llama_context_params dcparams = llama_context_default_params();
+        dcparams.n_ctx = N_CTX;
+        dcparams.n_batch = N_BATCH;
+        dcparams.n_ubatch = 512;
+        dcparams.n_threads = N_THREADS;
+        dcparams.n_threads_batch = N_THREADS;
+        dcparams.ctx_other = ctx;
+        dspark_ctx = llama_init_from_model(dspark_model, dcparams);
+        if (!dspark_ctx) {
+            free_dspark();
+            return fail("dspark_draft_context", "DSpark disabled itself: llama_init_from_model returned null for the DSpark draft model");
+        }
+        // Rollback probe, once, at empty KV, exactly the fork
+        // server's gate: speculative decoding is only attempted
+        // when the target context can remove partial sequences.
+        // RS (bounded by n_rs_seq) is the expected answer for
+        // qwen35moe; PART is equally usable by this driver. FULL
+        // would need the server's checkpoint save/restore path,
+        // which this build deliberately does not port, and NO
+        // means no rollback at all — both fail safe here.
+        const common_context_seq_rm_type rm_type = common_context_can_seq_rm(ctx);
+        const std::string rm_name = rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ? "rs"
+                                  : rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ? "part"
+                                  : rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ? "full" : "no";
+        report["dsparkSeqRmType"] = rm_name;
+        if (rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO || rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+            free_dspark();
+            return fail("dspark_probe", "DSpark disabled itself: target context seq_rm probe returned \"" + rm_name +
+                        "\"; speculative rollback needs \"rs\" (bounded by n_rs_seq) or \"part\" on this build, and the checkpoint path for \"full\" is not ported");
+        }
+        common_params_speculative sparams;
+        sparams.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
+        sparams.draft.n_max = DSPARK_N_MAX;
+        sparams.draft.n_min = 0;
+        sparams.draft.p_min = 0.0f; // confidence-head truncation off: always draft the full n_max
+        sparams.draft.mparams.path = dspark_path;
+        sparams.draft.ctx_tgt = ctx;
+        sparams.draft.ctx_dft = dspark_ctx;
+        try {
+            spec = common_speculative_init(sparams, 1);
+        } catch (...) {
+            spec = nullptr;
+        }
+        if (!spec) {
+            free_dspark();
+            return fail("dspark_init", "DSpark disabled itself: common_speculative_init failed for spec type draft-dspark (see loaderLog)");
+        }
+        // Greedy-exact verify sampler: a top_k=1 chain, the same
+        // construction the fork's own draft implementations use.
+        common_params_sampling verify_sampling;
+        verify_sampling.top_k = 1;
+        verify_sampling.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+        dspark_sampler = common_sampler_init(model, verify_sampling);
+        if (!dspark_sampler) {
+            free_dspark();
+            return fail("dspark_init", "DSpark disabled itself: common_sampler_init failed for the verify sampler");
+        }
+        report["dsparkEnabled"] = true;
+        emit_progress({{"stage", "dspark_setup"}, {"event", "done"}, {"label", "DSpark ready"},
+                       {"dsparkSeqRmType", rm_name}, {"dsparkDraftNMax", DSPARK_N_MAX}});
+        emit("DSpark ready: draft-dspark, n_max " + std::to_string(DSPARK_N_MAX) +
+             ", seq_rm probe \"" + rm_name + "\"");
+    }
 
     // Build 10 case list. Text-only cases first (indices 1-3), then the
     // original image cases (indices 4-6, prompts and image unchanged).
@@ -731,6 +950,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         const std::string tag = "Case " + std::to_string(display);
         const auto gen_start = Clock::now();
         std::string answer;
+        // Build 15: the counted token ids, recorded in every arm
+        // (additive field only) so a DSpark run's output can be
+        // checked token-for-token against the baseline arms.
+        std::vector<llama_token> gen_ids;
         int generated = 0;
         bool ended_eos = false;
         double decode_calls_ms = 0.0;
@@ -743,6 +966,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
             if (llama_vocab_is_eog(vocab, token)) { ended_eos = true; break; }
             if (generated == 0) kase["ttftMs"] = ms_between(case_start, Clock::now());
             answer += token_piece(vocab, token);
+            gen_ids.push_back(token);
             generated++;
             if (generated == 1) {
                 emit_progress({{"stage", "decode"}, {"event", "first_token"}, {"caseIndex", display},
@@ -788,6 +1012,179 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
                        {"label", tag + " complete"}});
         kase["peakRssKb"] = peak_rss_kb();
         kase["answer"] = answer;
+        json id_array = json::array();
+        for (const llama_token t : gen_ids) id_array.push_back(t);
+        kase["generatedTokenIds"] = id_array;
+    };
+
+    // Build 15: speculative generation for the DSpark arm, following
+    // the fork's own speculative-simple example flow (the server loop
+    // with a single slot reduces to the same steps):
+    //   - the first token is sampled greedily from the prefill
+    //     logits, exactly the baseline loop's first token;
+    //   - each round drafts n_max tokens with the DSpark heads,
+    //     re-decodes [anchor, draft...] on the target as one verify
+    //     batch, feeds that batch to common_speculative_process (it
+    //     refreshes the draft context's injected features from the
+    //     target's extracted layer embeddings), and accepts greedily
+    //     with common_sampler_sample_and_accept_n — result ids are
+    //     the target's own tokens, so acceptance is exact;
+    //   - both contexts are then rolled back with seq_rm from the
+    //     new anchor's position: rejected draft KV (and the anchor's
+    //     own verify-row KV, which the next round's verify batch
+    //     re-decodes) is dropped. Worst-case rollback per round is
+    //     n_max tokens, the n_rs_seq the context was created with.
+    // Case fields mirror run_generation's, plus the spec counters.
+    // On any runtime failure it sets fatal/fatal_phase and returns
+    // with the partial counts recorded, like the greedy loop does.
+    auto run_generation_dspark = [&](int display, const Clock::time_point & case_start,
+                                     json & kase, const std::vector<llama_token> & prompt_tokens) {
+        const std::string tag = "Case " + std::to_string(display);
+        const auto gen_start = Clock::now();
+        std::string answer;
+        std::vector<llama_token> gen_ids;
+        int generated = 0;
+        bool ended_eos = false;
+        double decode_calls_ms = 0.0;
+        long long rounds = 0, drafted = 0, accepted_tokens = 0, draft_seq_rm_failures = 0;
+        emit_progress({{"stage", "decode"}, {"event", "start"}, {"caseIndex", display},
+                       {"generatedTokens", 0},
+                       {"label", tag + ": generating answer (DSpark)"}});
+        auto last_progress_emit = Clock::now();
+        // Emit one accepted token with the baseline loop's semantics:
+        // an EOG token ends generation and is never counted; the cap
+        // is checked by the callers. Returns false when generation
+        // must stop after this token.
+        auto emit_token = [&](llama_token token) -> bool {
+            if (llama_vocab_is_eog(vocab, token)) { ended_eos = true; return false; }
+            if (generated == 0) kase["ttftMs"] = ms_between(case_start, Clock::now());
+            answer += token_piece(vocab, token);
+            gen_ids.push_back(token);
+            generated++;
+            if (generated == 1) {
+                emit_progress({{"stage", "decode"}, {"event", "first_token"}, {"caseIndex", display},
+                               {"generatedTokens", generated},
+                               {"ttftMs", kase["ttftMs"].get<double>()},
+                               {"label", tag + ": generating answer (DSpark)"}});
+                last_progress_emit = Clock::now();
+            } else if (ms_between(last_progress_emit, Clock::now()) >= 1000.0) {
+                const double decode_elapsed_ms = ms_between(gen_start, Clock::now());
+                emit_progress({{"stage", "decode"}, {"event", "progress"}, {"caseIndex", display},
+                               {"generatedTokens", generated},
+                               {"decodeElapsedMs", decode_elapsed_ms},
+                               {"decodeTokensPerSec", decode_elapsed_ms > 0 ? generated / (decode_elapsed_ms / 1000.0) : 0.0},
+                               {"label", tag + ": generating answer (DSpark)"}});
+                last_progress_emit = Clock::now();
+            }
+            return generated < max_tokens;
+        };
+
+        // prompt_tgt tracks the committed tokens EXCLUDING the
+        // anchor (the DSpark draft params' prompt pointer; the
+        // dflash implementation itself only needs n_past/id_last,
+        // but the API contract is kept whole).
+        llama_tokens prompt_tgt(prompt_tokens.begin(), prompt_tokens.end());
+        common_speculative_begin(spec, 0, prompt_tgt);
+        llama_token anchor = greedy_token(ctx, vocab);
+        llama_pos anchor_pos = (llama_pos) prompt_tokens.size();
+        bool keep_going = emit_token(anchor);
+
+        llama_batch verify_batch = llama_batch_init(DSPARK_N_MAX + 1, 0, 1);
+        llama_tokens draft;
+        while (keep_going && !ended_eos && fatal.empty()) {
+            const auto round_start = Clock::now();
+            draft.clear();
+            common_speculative_draft_params & dp = common_speculative_get_draft_params(spec, 0);
+            dp.drafting = true;
+            dp.n_max = DSPARK_N_MAX;
+            dp.n_past = anchor_pos;
+            dp.id_last = anchor;
+            dp.prompt = &prompt_tgt;
+            dp.result = &draft;
+            common_speculative_draft(spec);
+            if (draft.empty()) {
+                fatal_phase = "dspark_draft";
+                fatal = "common_speculative_draft produced no draft tokens";
+                break;
+            }
+            rounds++;
+            drafted += (long long) draft.size();
+            common_batch_clear(verify_batch);
+            common_batch_add(verify_batch, anchor, anchor_pos, { 0 }, true);
+            for (size_t i = 0; i < draft.size(); i++) {
+                common_batch_add(verify_batch, draft[i], anchor_pos + 1 + (llama_pos) i, { 0 }, true);
+            }
+            if (llama_decode(ctx, verify_batch) != 0) {
+                fatal_phase = "decode";
+                fatal = "llama_decode failed during DSpark verify";
+                break;
+            }
+            if (!common_speculative_process(spec, verify_batch)) {
+                fatal_phase = "dspark_process";
+                fatal = "common_speculative_process failed on the DSpark verify batch";
+                break;
+            }
+            const std::vector<llama_token> ids =
+                common_sampler_sample_and_accept_n(dspark_sampler, ctx, draft);
+            if (ids.empty()) {
+                fatal_phase = "dspark_accept";
+                fatal = "common_sampler_sample_and_accept_n returned no tokens";
+                break;
+            }
+            const long long n_accepted = (long long) ids.size() - 1;
+            accepted_tokens += n_accepted;
+            common_speculative_accept(spec, 0, (uint16_t) n_accepted);
+            // Commit: the new anchor is the last accepted id, at
+            // position anchor_pos + ids.size(); everything before it
+            // joins prompt_tgt. Roll both contexts back to the
+            // anchor's position (the anchor itself is re-decoded as
+            // the next verify batch's first row).
+            prompt_tgt.push_back(anchor);
+            for (size_t i = 0; i + 1 < ids.size(); i++) prompt_tgt.push_back(ids[i]);
+            anchor = ids.back();
+            anchor_pos += (llama_pos) ids.size();
+            if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, anchor_pos, -1)) {
+                fatal_phase = "dspark_rollback";
+                fatal = "llama_memory_seq_rm failed on the target context after DSpark acceptance";
+                break;
+            }
+            if (!llama_memory_seq_rm(llama_get_memory(dspark_ctx), 0, anchor_pos, -1)) {
+                draft_seq_rm_failures++;
+            }
+            decode_calls_ms += ms_between(round_start, Clock::now());
+            for (const llama_token token : ids) {
+                if (generated >= max_tokens) { keep_going = false; break; }
+                if (!emit_token(token)) { keep_going = false; break; }
+            }
+        }
+        llama_batch_free(verify_batch);
+        const double gen_wall_ms = ms_between(gen_start, Clock::now());
+        kase["decodeWallMs"] = gen_wall_ms;
+        kase["decodeCallsMs"] = decode_calls_ms;
+        kase["generatedTokens"] = generated;
+        kase["decodeTokensPerSec"] = gen_wall_ms > 0 ? generated / (gen_wall_ms / 1000.0) : 0.0;
+        kase["endedByEos"] = ended_eos;
+        kase["dsparkRounds"] = rounds;
+        kase["dsparkDraftedTokens"] = drafted;
+        kase["dsparkAcceptedTokens"] = accepted_tokens;
+        kase["dsparkAcceptRatePct"] = drafted > 0 ? 100.0 * (double) accepted_tokens / (double) drafted : 0.0;
+        kase["dsparkAvgAcceptanceLength"] = rounds > 0 ? (double) accepted_tokens / (double) rounds : 0.0;
+        kase["dsparkDraftSeqRmFailures"] = draft_seq_rm_failures;
+        emit_progress({{"stage", "decode"}, {"event", "done"}, {"caseIndex", display},
+                       {"generatedTokens", generated}, {"decodeWallMs", gen_wall_ms},
+                       {"decodeTokensPerSec", kase["decodeTokensPerSec"].get<double>()},
+                       {"label", tag + " complete"}});
+        emit_progress({{"stage", "dspark_stats"}, {"event", "done"}, {"caseIndex", display},
+                       {"dsparkRounds", rounds}, {"dsparkDraftedTokens", drafted},
+                       {"dsparkAcceptedTokens", accepted_tokens},
+                       {"dsparkAcceptRatePct", kase["dsparkAcceptRatePct"].get<double>()},
+                       {"dsparkAvgAcceptanceLength", kase["dsparkAvgAcceptanceLength"].get<double>()},
+                       {"label", tag + ": DSpark speculative stats"}});
+        kase["peakRssKb"] = peak_rss_kb();
+        kase["answer"] = answer;
+        json id_array = json::array();
+        for (const llama_token t : gen_ids) id_array.push_back(t);
+        kase["generatedTokenIds"] = id_array;
     };
 
     for (int qi = 0; qi < n_cases && fatal.empty(); qi++) {
@@ -848,6 +1245,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
                            {"label", tag + " (text): evaluating prompt"}});
             const auto prefill_start = Clock::now();
             bool prefill_ok = true;
+            bool dspark_prefill_process_failed = false;
             for (size_t off = 0; off < tokens.size(); ) {
                 const int32_t chunk_n = (int32_t) std::min<size_t>((size_t) N_BATCH, tokens.size() - off);
                 prefill_batch.n_tokens = chunk_n;
@@ -860,12 +1258,26 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
                     prefill_batch.logits[i] = (off + (size_t) i + 1 == tokens.size()) ? 1 : 0;
                 }
                 if (llama_decode(ctx, prefill_batch) != 0) { prefill_ok = false; break; }
+                // Build 15: feed the DSpark draft context from this
+                // chunk's target embeddings before any later decode
+                // overwrites them — process() gathers the extracted
+                // layer inputs of the decode that just finished.
+                if (dspark && !common_speculative_process(spec, prefill_batch)) {
+                    prefill_ok = false;
+                    dspark_prefill_process_failed = true;
+                    break;
+                }
                 off += (size_t) chunk_n;
             }
             const double prefill_ms = ms_between(prefill_start, Clock::now());
             if (!prefill_ok) {
-                fatal_phase = "prefill";
-                fatal = "llama_decode failed during text prefill in case " + std::to_string(display);
+                if (dspark_prefill_process_failed) {
+                    fatal_phase = "dspark_process";
+                    fatal = "common_speculative_process failed on the text prefill batch in case " + std::to_string(display);
+                } else {
+                    fatal_phase = "prefill";
+                    fatal = "llama_decode failed during text prefill in case " + std::to_string(display);
+                }
                 break;
             }
             n_past = (llama_pos) tokens.size();
@@ -880,7 +1292,8 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
                            {"promptTokens", tokens.size()}, {"stageElapsedMs", prefill_ms},
                            {"label", tag + " (text): generating answer"}});
 
-            run_generation(display, case_start, kase, n_past);
+            if (dspark) run_generation_dspark(display, case_start, kase, tokens);
+            else run_generation(display, case_start, kase, n_past);
             cases.push_back(kase);
             emit(tag + " complete: " + std::to_string(kase["generatedTokens"].get<int>()) + " tokens");
             // Build 12: hand the finished case to the service at once,
@@ -1000,6 +1413,50 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     }
 
     report["cases"] = cases;
+    // Build 15: DSpark teardown. Print the runtime's own speculative
+    // stats (common_speculative_print_stats) into the redirected
+    // common log, read the "statistics draft-dspark" line back and
+    // parse its counters into the report as the runtime's own
+    // cross-check of the driver's counters in the case. The common
+    // log is asynchronous (a worker thread drains a ring buffer),
+    // so poll the file briefly for the line; if it never lands, the
+    // fields are simply absent and the driver's counters stand.
+    if (dspark && spec) {
+        common_speculative_print_stats(spec);
+        std::string stats_line;
+        for (int attempt = 0; attempt < 40 && stats_line.empty(); attempt++) {
+            if (FILE * lf = std::fopen(dspark_spec_log_path.c_str(), "r")) {
+                std::string content;
+                char buf[8192];
+                size_t n;
+                while ((n = std::fread(buf, 1, sizeof(buf), lf)) > 0) content.append(buf, n);
+                std::fclose(lf);
+                size_t pos = 0;
+                while (pos < content.size()) {
+                    const size_t eol = content.find('\n', pos);
+                    const std::string line = content.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+                    pos = eol == std::string::npos ? content.size() : eol + 1;
+                    if (line.find("statistics") != std::string::npos &&
+                        line.find("draft-dspark") != std::string::npos) {
+                        stats_line = line;
+                        break;
+                    }
+                }
+            }
+            if (stats_line.empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+        if (!stats_line.empty()) {
+            report["dsparkSpecStatsLine"] = stats_line;
+            long long v;
+            if (log_field_ll(stats_line, "#gen drafts ", v)) report["dsparkSpecGenDrafts"] = v;
+            if (log_field_ll(stats_line, "#acc drafts ", v)) report["dsparkSpecAccDrafts"] = v;
+            if (log_field_ll(stats_line, "#gen tokens ", v)) report["dsparkSpecGenTokens"] = v;
+            if (log_field_ll(stats_line, "#acc tokens ", v)) report["dsparkSpecAccTokens"] = v;
+        }
+    }
+    free_dspark();
     llama_batch_free(batch);
     llama_batch_free(prefill_batch);
     llama_free(ctx);

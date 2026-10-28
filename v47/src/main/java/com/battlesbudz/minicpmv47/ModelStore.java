@@ -11,6 +11,12 @@ import java.util.Locale;
 // following the same store pattern as the MiniCPM-o feasibility module.
 // Files land in files/models/<repo path>, exactly the layout the native
 // LES runtime expects (experts/ sibling of the main gguf).
+// Build 15: one file (the DSpark draft GGUF) lives in a different
+// Hugging Face repo than the rest of the pack. A manifest entry may
+// carry per-file "repository" / "revision" / "remotePath" overrides;
+// the local path, size and SHA-256 stay in the entry as usual, and
+// entries without overrides resolve against the manifest-level
+// repository/revision exactly as before.
 final class ModelStore {
     interface Progress {void update(String text);}
     private final Context context;
@@ -41,7 +47,10 @@ final class ModelStore {
             if(existing>item.getLong("size")){part.delete();existing=0;}
             if(root.getUsableSpace()<item.getLong("size")-existing+256L*1024*1024)throw new IOException("Not enough free storage to install "+path);
             progress.update("Installing "+path+" ("+(i+1)+" / "+list.length()+")");
-            URL url=new URL("https://huggingface.co/"+manifest.getString("repository")+"/resolve/"+manifest.getString("revision")+"/"+path);
+            String repository=item.optString("repository",manifest.getString("repository"));
+            String revision=item.optString("revision",manifest.getString("revision"));
+            String remotePath=item.optString("remotePath",path);
+            URL url=new URL("https://huggingface.co/"+repository+"/resolve/"+revision+"/"+remotePath);
             HttpURLConnection connection=(HttpURLConnection)url.openConnection();connection.setConnectTimeout(30000);connection.setReadTimeout(30000);
             if(existing>0)connection.setRequestProperty("Range","bytes="+existing+"-");
             int code=connection.getResponseCode();

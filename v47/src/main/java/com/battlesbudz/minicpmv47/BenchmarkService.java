@@ -22,6 +22,13 @@ public final class BenchmarkService extends Service {
     private final JSONArray partialCases=new JSONArray();
     private final JSONObject runTotals=new JSONObject();
     @Override public IBinder onBind(Intent intent){return null;}
+    // Build 15: the report/state arm labels for every mode, in one
+    // place (build 14 inlined the quick_off ternaries in three
+    // spots). quick_dspark is the DSpark arm: prefetch off like
+    // quick_off, but its own abArm so the arms can never be
+    // confused in a pasted diagnostics dump.
+    private String lookaheadPrefetch(){return "quick_off".equals(mode)||"quick_dspark".equals(mode)?"off":"on";}
+    private String abArm(){return "quick_dspark".equals(mode)?"dspark_on":"quick_off".equals(mode)?"lookahead_off":"lookahead_on";}
     private synchronized void state(String phase,String status){
         currentPhase=phase;
         try{state.put("phase",phase).put("status",status).put("updatedAtMs",System.currentTimeMillis()).put("pid",android.os.Process.myPid());write(new File(getFilesDir(),"status.json"),state.toString(2));}
@@ -60,7 +67,7 @@ public final class BenchmarkService extends Service {
     private void writePartialReport(){
         try{
             JSONObject p=new JSONObject();
-            p.put("schemaVersion",2).put("partial",true).put("mode",mode).put("moeLookaheadPrefetch","quick_off".equals(mode)?"off":"on").put("abArm","quick_off".equals(mode)?"lookahead_off":"lookahead_on").put("build",BuildConfig.VERSION_NAME).put("sourceCommit",BuildConfig.SOURCE_COMMIT).put("device",Build.MODEL).put("startedAtMs",state==null?0:state.optLong("startedAtMs",0)).put("updatedAtMs",System.currentTimeMillis());
+            p.put("schemaVersion",2).put("partial",true).put("mode",mode).put("moeLookaheadPrefetch",lookaheadPrefetch()).put("abArm",abArm()).put("build",BuildConfig.VERSION_NAME).put("sourceCommit",BuildConfig.SOURCE_COMMIT).put("device",Build.MODEL).put("startedAtMs",state==null?0:state.optLong("startedAtMs",0)).put("updatedAtMs",System.currentTimeMillis());
             synchronized(this){p.put("totals",new JSONObject(runTotals.toString()));p.put("cases",new JSONArray(partialCases.toString()));}
             write(new File(getFilesDir(),"report-partial.json"),p.toString(2));
         }catch(Exception ignored){}
@@ -74,7 +81,7 @@ public final class BenchmarkService extends Service {
         if(intent!=null&&"STOP".equals(intent.getAction())){if(state!=null)state("Stopped by user","CANCELLED");retire();return START_NOT_STICKY;}
         if(started)return START_NOT_STICKY;started=true;
         String requestedMode=intent==null?null:intent.getStringExtra("mode");
-        mode="quick".equals(requestedMode)||"quick_off".equals(requestedMode)?requestedMode:"full";
+        mode="quick".equals(requestedMode)||"quick_off".equals(requestedMode)||"quick_dspark".equals(requestedMode)?requestedMode:"full";
         NotificationManager nm=getSystemService(NotificationManager.class);
         nm.createNotificationChannel(new NotificationChannel("bench","MiniCPM-V trial",NotificationManager.IMPORTANCE_LOW));
         PendingIntent stop=PendingIntent.getService(this,1,new Intent(this,BenchmarkService.class).setAction("STOP"),PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT);
@@ -84,7 +91,7 @@ public final class BenchmarkService extends Service {
         wake=pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"MiniCPMV47:trial");wake.acquire(120*60*1000L);
         heartbeat=SystemClock.elapsedRealtime();
         run=new File(getFilesDir(),"last-run");run.mkdirs();state=new JSONObject();
-        try{state.put("startedAtMs",System.currentTimeMillis()).put("profile","minicpm-v47-phone-trial-v1").put("contextTokens",4096).put("batchTokens",2048).put("mode",mode).put("moeLookaheadPrefetch","quick_off".equals(mode)?"off":"on").put("abArm","quick_off".equals(mode)?"lookahead_off":"lookahead_on").put("maxNewTokens",!"full".equals(mode)?32:512).put("threads",4).put("build",BuildConfig.VERSION_NAME).put("sourceCommit",BuildConfig.SOURCE_COMMIT).put("device",Build.MANUFACTURER+" "+Build.MODEL).put("sdk",Build.VERSION.SDK_INT);}catch(Exception ignored){}
+        try{state.put("startedAtMs",System.currentTimeMillis()).put("profile","minicpm-v47-phone-trial-v1").put("contextTokens",4096).put("batchTokens",2048).put("mode",mode).put("moeLookaheadPrefetch",lookaheadPrefetch()).put("abArm",abArm()).put("maxNewTokens",!"full".equals(mode)?32:512).put("threads",4).put("build",BuildConfig.VERSION_NAME).put("sourceCommit",BuildConfig.SOURCE_COMMIT).put("device",Build.MANUFACTURER+" "+Build.MODEL).put("sdk",Build.VERSION.SDK_INT);}catch(Exception ignored){}
         state("Starting","RUNNING");
         writePartialReport();
         chargeStart=getSystemService(BatteryManager.class).getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER);
@@ -120,7 +127,7 @@ public final class BenchmarkService extends Service {
             JSONArray cases=report.optJSONArray("cases");int answered=0;
             if(cases!=null)for(int i=0;i<cases.length();i++){JSONObject c=cases.optJSONObject(i);if(c!=null&&c.optInt("generatedTokens",0)>0)answered++;}
             String verdict=TrialVerdict.classify(report.has("error"),report.optString("error"),answered,cases==null?0:cases.length());
-            report.put("verdict",verdict).put("peakWorkerPssKb",peakPssKb).put("peakThermalStatus",peakThermal).put("build",BuildConfig.VERSION_NAME).put("sourceCommit",BuildConfig.SOURCE_COMMIT).put("device",Build.MODEL).put("batteryChargeChangeUah",getSystemService(BatteryManager.class).getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)-chargeStart).put("limitations","quick_off".equals(mode)?"Quick mode, A/B lookahead OFF arm (build 14): Case 3 only (the long bicycle text question), 32-token decode cap, 10-minute watchdog, lookahead prefetch OFF via the runtime's own LLAMA_MOE_LOOKAHEAD_PREFETCH=0; every other setting identical to the normal quick decode check. An A/B decode-speed check only; it says nothing about the other cases.":"quick".equals(mode)?"Quick mode (build 12): Case 3 only (the long bicycle text question), 32-token decode cap, 10-minute watchdog. A decode-speed check only; it says nothing about the other cases. Same model pack and CPU path as the full trial.":"Three text-only questions, then a single photo with three fixed questions, greedy sampling, thinking disabled. CPU path only (vendor demo defaults: 4 threads, 4096 context). First run on this device class; no prior Android LES result exists to compare against.");
+            report.put("verdict",verdict).put("peakWorkerPssKb",peakPssKb).put("peakThermalStatus",peakThermal).put("build",BuildConfig.VERSION_NAME).put("sourceCommit",BuildConfig.SOURCE_COMMIT).put("device",Build.MODEL).put("batteryChargeChangeUah",getSystemService(BatteryManager.class).getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)-chargeStart).put("limitations","quick_dspark".equals(mode)?"Quick mode, DSpark A/B arm (build 15): Case 3 only (the long bicycle text question), 32-token decode cap, 10-minute watchdog. Generation is speculative: the model's DSpark draft heads propose 3 tokens per round and the target verifies them with greedy-exact acceptance, so the generated token ids must match the plain greedy arms token for token; any divergence is a correctness failure, not a speed result. Lookahead prefetch OFF (the DSpark baseline is the lookahead OFF arm), decode window widened to 32 with 4 verify rows in window mode; prompt, threads, context, slot bank and prewarm identical to the other quick checks. An A/B decode-speed check only; it says nothing about the other cases.":"quick_off".equals(mode)?"Quick mode, A/B lookahead OFF arm (build 14): Case 3 only (the long bicycle text question), 32-token decode cap, 10-minute watchdog, lookahead prefetch OFF via the runtime's own LLAMA_MOE_LOOKAHEAD_PREFETCH=0; every other setting identical to the normal quick decode check. An A/B decode-speed check only; it says nothing about the other cases.":"quick".equals(mode)?"Quick mode (build 12): Case 3 only (the long bicycle text question), 32-token decode cap, 10-minute watchdog. A decode-speed check only; it says nothing about the other cases. Same model pack and CPU path as the full trial.":"Three text-only questions, then a single photo with three fixed questions, greedy sampling, thinking disabled. CPU path only (vendor demo defaults: 4 threads, 4096 context). First run on this device class; no prior Android LES result exists to compare against.");
             write(new File(getFilesDir(),"report.json"),report.toString(2));new File(getFilesDir(),"report-partial.json").delete();state(verdict,verdict);
         }catch(Throwable error){state(error.getClass().getSimpleName()+": "+error.getMessage(),"ERROR");}
         finally{retire();}

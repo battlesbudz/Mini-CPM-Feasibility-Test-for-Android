@@ -48,5 +48,9 @@ add_library(minicpm_v47_bench SHARED benchmark.cpp)
 target_include_directories(minicpm_v47_bench PRIVATE
     "${OMNI_ROOT}" "${OMNI_ROOT}/common" "${OMNI_ROOT}/include"
     "${OMNI_ROOT}/ggml/include" "${OMNI_ROOT}/tools/mtmd" "${OMNI_ROOT}/vendor")
-target_link_libraries(minicpm_v47_bench PRIVATE mtmd llama android log)
+# Build 15: llama-common for the fork's speculative-decoding machinery
+# (common/speculative.cpp: draft-dspark implementation, sampler and
+# seq_rm probe helpers). LLAMA_BUILD_COMMON has always built it; the
+# trial simply never linked it before.
+target_link_libraries(minicpm_v47_bench PRIVATE mtmd llama llama-common android log)
 target_link_options(minicpm_v47_bench PRIVATE "-Wl,-z,max-page-size=16384")

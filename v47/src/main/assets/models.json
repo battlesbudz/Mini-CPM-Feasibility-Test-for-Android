@@ -216,6 +216,14 @@
       "path": "MiniCPM-V-4.7-35B-A3B/mmproj-model-f16.gguf",
       "size": 1119575840,
       "sha256": "bff3b688e14c300eca273092c37c50a0ddfcc2054e079af1a0480edeed5d20f1"
+    },
+    {
+      "path": "MiniCPM-V-4.7-35B-A3B/dspark-MiniCPM-V-4_7-35B-A3B-Q8_0.gguf",
+      "size": 424572928,
+      "sha256": "8c0ee456b4b6fb3b67eee42dd515d97f7c8f7353bc4be9aafe9c4ff68a780c16",
+      "repository": "openbmb/MiniCPM-V-4.7-35B-A3B-DSpark-gguf",
+      "revision": "2c8f6931e5fba8a01bcc74b2964f330c62056b5e",
+      "remotePath": "dspark-MiniCPM-V-4_7-35B-A3B-Q8_0.gguf"
     }
   ]
 }
