@@ -89,19 +89,25 @@
 // Configuration follows the vendor iOS bridge pattern, all set
 // before the target model loads: lookahead prefetch OFF (the
 // bridge disables MoE prediction whenever DSpark is on), decode
-// window widened 16 -> 32 with LLAMA_MOE_WINDOW_MAX_ROWS=4 so a
-// verify batch of n_max+1 = 4 rows stays in window mode, target
-// context created with n_rs_seq = 3 so recurrent-state rollback
-// covers a full round of rejected drafts, draft n_max = 3.
+// window widened 16 -> 64 with LLAMA_MOE_WINDOW_MAX_ROWS=8 so a
+// verify batch of n_max+1 = 8 rows stays in window mode, target
+// context created with n_rs_seq = 7 so recurrent-state rollback
+// covers a full round of rejected drafts, draft n_max = 7.
+// (Builds 15-16 ran this arm at n_max = 3 with window 32 / rows 4;
+// build 17 widens only the draft depth and its window, nothing
+// else in the arm changes.)
 // Rollback is probed once at empty KV (common_context_can_seq_rm,
 // the fork server's own probe): unless it returns RS or PART, the
 // arm fails safe — the report says DSpark disabled itself and why,
 // and no decode number is produced. Acceptance is greedy-exact
-// (top_k=1 sampler + common_sampler_sample_and_accept_n), and every
-// arm now records generatedTokenIds so the DSpark output can be
-// checked token-for-token against the baseline arms from the
-// pasted diagnostics. The case also carries the driver's own spec
-// counters (rounds / drafted / accepted / accept rate / average
+// (top_k=1 sampler + common_sampler_sample_and_accept_n: every
+// emitted token is the target's own batched argmax), and every
+// arm records generatedTokenIds. DSpark output is judged on
+// fluency and decode speed, not token-for-token identity with
+// the baseline arms — the runtime does not guarantee bit-identical
+// logits across batch sizes (Battles's call, 2026-10-28). The
+// case also carries the driver's own spec counters (rounds /
+// drafted / accepted / accept rate / average
 // acceptance length) plus the runtime's print_stats line captured
 // from the redirected common log. The fork patch is untouched;
 // this is app-side only, linking the already-built llama-common.
@@ -206,21 +212,22 @@ static const int    QUICK_MAX_TOKENS   = 32;
 // per-file source override in models.json / ModelStore).
 static const char * DSPARK_GGUF    = "dspark-MiniCPM-V-4_7-35B-A3B-Q8_0.gguf";
 // Draft tokens per verify round. The draft GGUF's trained block is
-// 15 wide (dflash.block_size), so 3 is far inside the trained range;
-// it also keeps a round's worst-case rollback at 3 tokens, exactly
+// 15 wide (dflash.block_size), so 7 is inside the trained range;
+// it also keeps a round's worst-case rollback at 7 tokens, exactly
 // the target context's n_rs_seq below. The vendor's published
 // acceptance length (3.501 at block 15) is a general-text average,
-// not a promise for this prompt.
-static const int    DSPARK_N_MAX   = 3;
-// DSpark arm decode window: widened from 16 to 32 so the clamp in
-// the slot runtime leaves room for LLAMA_MOE_WINDOW_MAX_ROWS=4
-// (n_max + 1 verify rows) — worst-case union for 4 rows is
-// 4 rows x 8 routed experts = 32 slots, exactly the window width,
-// so no clamp applies. Resident cost grows to 40 layers x 32 x
-// 1,351,680 B = ~1.65 GiB of window (from ~825 MiB at width 16 with
-// prefetch off); lookahead prefetch is OFF in this arm, so no
-// prefetch staging is added on top.
-static const int    DSPARK_DECODE_WINDOW   = 32;
+// not a promise for this prompt. (Builds 15-16: n_max = 3.)
+static const int    DSPARK_N_MAX   = 7;
+// DSpark arm decode window: widened from 16 to 64 so the clamp in
+// the slot runtime leaves room for LLAMA_MOE_WINDOW_MAX_ROWS=8
+// (n_max + 1 verify rows) — worst-case union for 8 rows is
+// 8 rows x 8 routed experts = 64 slots, exactly the window width,
+// so no clamp applies. Resident cost grows to 40 layers x 64 x
+// 1,351,680 B = ~3.3 GiB of window (from ~1.65 GiB at width 32 in
+// builds 15-16, ~825 MiB at width 16 with prefetch off); lookahead
+// prefetch is OFF in this arm, so no prefetch staging is added on
+// top.
+static const int    DSPARK_DECODE_WINDOW   = 64;
 static const int    DSPARK_WINDOW_MAX_ROWS = DSPARK_N_MAX + 1;
 // The vendor app's static prewarm table for this model, top-16 experts
 // per layer, ranked by observed routing frequency (k_mb_prewarm_w16 in

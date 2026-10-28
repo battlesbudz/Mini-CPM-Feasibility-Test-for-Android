@@ -208,6 +208,23 @@ speculative implementation instead of the plain greedy loop.
   Compare against the lookahead OFF arm (identical prefetch-off
   configuration), run back to back.
 
+## Build 17: DSpark widened to 7 draft tokens
+
+Build 16 proved the DSpark arm end to end on device (12 rounds,
+52.8% acceptance at n_max = 3, decode 1.538 tok/s), and the
+token-for-token gate above was then retired: batched verification
+does not guarantee bit-identical logits, so DSpark output — the
+target's own batched argmax at every position — is judged on
+fluency and speed instead. Build 17 changes only the DSpark arm's
+depth: draft n_max 3 → 7, decode window 32 → 64 with
+`LLAMA_MOE_WINDOW_MAX_ROWS` 4 → 8 (an 8-row verify batch's
+worst-case union is 8 × 8 = 64 slots, exactly the window width),
+target `n_rs_seq` 3 → 7. Window residency grows to ~3.3 GiB.
+Everything else — draft model, prefetch off, prewarm, fail-safe
+probe, telemetry, the other two quick arms — is unchanged from
+build 16, and `models.json` is byte-identical, so installing over
+build 16 needs no new download.
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub
