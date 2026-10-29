@@ -169,6 +169,22 @@
 // status.json, so one DSpark run plus one Copy diagnostics
 // paste now names the abort site or the fault.
 //
+// Build 20 reverts ONLY the DSpark widening: draft n_max 7 -> 3,
+// decode window 64 -> 32, LLAMA_MOE_WINDOW_MAX_ROWS 8 -> 4,
+// target n_rs_seq 7 -> 3 — build 16's configuration is the
+// standing one again. Build 19's device run (PHONE_TRIAL.md
+// section 46) completed the widened arm for the first time but
+// decoded at 0.640 tok/s, slower than build 16's depth-3 DSpark
+// (1.538 tok/s) and slower than the plain OFF arms: acceptance
+// length rose to 2.1 from 1.583, but each 8-row verify round
+// costs ~5.0 s against ~1.73 s at depth 3, because the wider
+// batch pulls a much larger expert union from flash and draft
+// generation costs ~505 ms per round against ~106 ms. Battles
+// called the widening on that evidence (2026-10-29). Build 18's
+// try/catch and build 19's crash recorder stay exactly as
+// shipped — both are purely additive instrumentation. The quick
+// and quick_off arms are untouched.
+//
 // Configuration mirrors the vendor demo defaults for this fork
 // (OpenBMB MiniCPM-V-demo-Android): 4 threads, 4096-token context,
 // image_max_slice_nums 9. Sampling is greedy (temperature 0) to match the
@@ -275,22 +291,23 @@ static const int    QUICK_MAX_TOKENS   = 32;
 // per-file source override in models.json / ModelStore).
 static const char * DSPARK_GGUF    = "dspark-MiniCPM-V-4_7-35B-A3B-Q8_0.gguf";
 // Draft tokens per verify round. The draft GGUF's trained block is
-// 15 wide (dflash.block_size), so 7 is inside the trained range;
-// it also keeps a round's worst-case rollback at 7 tokens, exactly
+// 15 wide (dflash.block_size), so 3 is inside the trained range;
+// it also keeps a round's worst-case rollback at 3 tokens, exactly
 // the target context's n_rs_seq below. The vendor's published
 // acceptance length (3.501 at block 15) is a general-text average,
-// not a promise for this prompt. (Builds 15-16: n_max = 3.)
-static const int    DSPARK_N_MAX   = 7;
-// DSpark arm decode window: widened from 16 to 64 so the clamp in
-// the slot runtime leaves room for LLAMA_MOE_WINDOW_MAX_ROWS=8
-// (n_max + 1 verify rows) — worst-case union for 8 rows is
-// 8 rows x 8 routed experts = 64 slots, exactly the window width,
-// so no clamp applies. Resident cost grows to 40 layers x 64 x
-// 1,351,680 B = ~3.3 GiB of window (from ~1.65 GiB at width 32 in
-// builds 15-16, ~825 MiB at width 16 with prefetch off); lookahead
+// not a promise for this prompt. (Builds 17-19 widened this to 7;
+// build 20 reverts to 3 — see the build 20 header note.)
+static const int    DSPARK_N_MAX   = 3;
+// DSpark arm decode window: widened from 16 to 32 so the clamp in
+// the slot runtime leaves room for LLAMA_MOE_WINDOW_MAX_ROWS=4
+// (n_max + 1 verify rows) — worst-case union for 4 rows is
+// 4 rows x 8 routed experts = 32 slots, exactly the window width,
+// so no clamp applies. Resident cost is 40 layers x 32 x
+// 1,351,680 B = ~1.65 GiB of window (builds 17-19 ran width 64 at
+// ~3.3 GiB; width 16 with prefetch off is ~825 MiB); lookahead
 // prefetch is OFF in this arm, so no prefetch staging is added on
 // top.
-static const int    DSPARK_DECODE_WINDOW   = 64;
+static const int    DSPARK_DECODE_WINDOW   = 32;
 static const int    DSPARK_WINDOW_MAX_ROWS = DSPARK_N_MAX + 1;
 // The vendor app's static prewarm table for this model, top-16 experts
 // per layer, ranked by observed routing frequency (k_mb_prewarm_w16 in

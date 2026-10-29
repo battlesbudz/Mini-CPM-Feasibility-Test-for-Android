@@ -317,6 +317,44 @@ names the throw; a NATIVE CRASH section with signal 11
 fault; no crash record at all points at an external kill
 (LMKD). No OFF-baseline run is needed.
 
+## Build 20 — the widening is called; DSpark back to depth 3
+
+Build 19's device run settled the widening question the other
+way from what builds 17-18 suggested: the widened DSpark arm
+**completed** all 32 tokens for the first time (10 rounds, 70
+drafted, 21 accepted, average acceptance length 2.1, answer
+token-for-token identical to build 16's DSpark output, no crash
+for the recorder to record) — but it decoded at **0.640 tok/s**,
+slower than build 16's depth-3 DSpark (1.538 tok/s) and slower
+than the plain lookahead-OFF arms (1.325-1.480 tok/s). The
+round economics are decisive: at depth 7 each round costs
+~5.0 s (~505 ms of draft generation plus an 8-row verify batch
+that pulls a much larger expert union from flash) against
+~1.73 s at depth 3, and the acceptance-length gain (2.1 vs
+1.583) does not cover a ~3x round cost. Peak worker PSS was
+also the highest yet (~6.2 GB). Battles called the widening on
+that evidence (2026-10-29).
+
+Build 20 therefore reverts **only** the four widening settings
+to build 16's values, which are the standing DSpark
+configuration again: draft `n_max` 7 → 3,
+`LLAMA_MOE_DECODE_WINDOW` 64 → 32, `LLAMA_MOE_WINDOW_MAX_ROWS`
+8 → 4, target `n_rs_seq` 7 → 3. Build 18's try/catch and
+build 19's crash recorder stay exactly as shipped — both are
+purely additive instrumentation and remain as standing safety
+nets. The quick and quick_off arms are unchanged, the fork
+patch and `scripts/prepare_v47.py` are untouched, and
+`models.json` is byte-identical, so installing over build 19
+needs no new download.
+
+**Device protocol for build 20:** install over build 19, do
+NOT tap Download, tap **Quick decode check · DSpark (A/B)**
+once, let it finish, then **Copy diagnostics** and paste. The
+expected result is a completed depth-3 run at build 16's speed
+class (~1.5 tok/s); the report's `dsparkWindowMaxRows` /
+`moeWindowMaxRowsEffective` should read 4 and
+`dsparkDraftNMax` 3.
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub
