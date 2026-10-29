@@ -112,6 +112,25 @@
 // from the redirected common log. The fork patch is untouched;
 // this is app-side only, linking the already-built llama-common.
 //
+// Build 18 changes no configuration: the DSpark arm stays at
+// build 17's widened settings (n_max = 7, window 64, rows 8,
+// n_rs_seq = 7). It wraps the DSpark round loop in a try/catch.
+// The section 41 diagnosis (PHONE_TRIAL.md) proved build 17's
+// widened arm kills the :benchmark process natively during an
+// early verify round — the in-process memory sampler and the
+// 10-minute watchdog froze with it, and no report was ever
+// written — and named the leading vehicle an uncaught C++
+// exception (an MoE slot-runtime throw): there is no handler
+// anywhere from the ggml custom op through llama_decode to this
+// driver. The catch converts such a throw into the driver's
+// existing fatal path (errorPhase "dspark_exception"), with the
+// exception's what() text kept in the case as
+// dsparkCaughtException, so the run ends with a finished report
+// naming the throwing site instead of a silent process death.
+// A GGML_ASSERT abort cannot be caught this way: if a build 18
+// DSpark run still dies silently, that convicts the assert
+// branch instead. The quick and quick_off arms are untouched.
+//
 // Configuration mirrors the vendor demo defaults for this fork
 // (OpenBMB MiniCPM-V-demo-Android): 4 threads, 4096-token context,
 // image_max_slice_nums 9. Sampling is greedy (temperature 0) to match the
@@ -128,6 +147,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -1049,6 +1069,9 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // Case fields mirror run_generation's, plus the spec counters.
     // On any runtime failure it sets fatal/fatal_phase and returns
     // with the partial counts recorded, like the greedy loop does.
+    // Build 18: the round loop runs under a try/catch (see the
+    // header note); a caught exception takes the same fatal path
+    // with errorPhase "dspark_exception".
     auto run_generation_dspark = [&](int display, const Clock::time_point & case_start,
                                      json & kase, const std::vector<llama_token> & prompt_tokens) {
         const std::string tag = "Case " + std::to_string(display);
@@ -1059,6 +1082,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         bool ended_eos = false;
         double decode_calls_ms = 0.0;
         long long rounds = 0, drafted = 0, accepted_tokens = 0, draft_seq_rm_failures = 0;
+        std::string caught_exception; // build 18: what() of a caught round exception, "" if none
         emit_progress({{"stage", "decode"}, {"event", "start"}, {"caseIndex", display},
                        {"generatedTokens", 0},
                        {"label", tag + ": generating answer (DSpark)"}});
@@ -1103,94 +1127,117 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
 
         llama_batch verify_batch = llama_batch_init(DSPARK_N_MAX + 1, 0, 1);
         llama_tokens draft;
-        while (keep_going && !ended_eos && fatal.empty()) {
-            const auto round_start = Clock::now();
-            draft.clear();
-            common_speculative_draft_params & dp = common_speculative_get_draft_params(spec, 0);
-            dp.drafting = true;
-            dp.n_max = DSPARK_N_MAX;
-            dp.n_past = anchor_pos;
-            dp.id_last = anchor;
-            dp.prompt = &prompt_tgt;
-            dp.result = &draft;
-            common_speculative_draft(spec);
-            // Build 16 fix: drafting leaves scratch KV in the DRAFT
-            // context. The dflash draft() decodes its noise block
-            // ([anchor, mask, mask] for DSpark: n_max tokens) into
-            // ctx_dft at positions anchor_pos .. anchor_pos + n_max - 1, and
-            // process() below injects the real target features at
-            // those same positions via llama_decode(ctx_dft, ...).
-            // Both of the fork's reference drivers remove the scratch
-            // block the moment drafting returns, before the verify
-            // batch: the server (server-context.cpp, right after
-            // common_speculative_draft) and speculative-simple both
-            // call seq_rm(ctx_dft, ckpt.pos_max + 1, -1), where
-            // pos_max is the target's last committed position, so
-            // pos_max + 1 is exactly the anchor's position. Build 15
-            // skipped this rollback: the noise block's last position
-            // (36 + 3 - 1 = 38) was still stored in the draft memory
-            // when process() tried to inject starting at 36, llama's
-            // M-RoPE batch check (stored last position must be <= the
-            // batch's starting position) rejected the injection
-            // decode with ret -1, and process() returned false
-            // (device: errorPhase dspark_process, X = 38, Y = 36).
-            if (!llama_memory_seq_rm(llama_get_memory(dspark_ctx), 0, anchor_pos, -1)) {
-                draft_seq_rm_failures++;
+        // Build 18 safety catch: every native call in a round —
+        // the speculative draft, the draft-context seq_rm (the
+        // build 16 fix), the target verify decode,
+        // common_speculative_process and the sampler accept —
+        // runs under this catch. Build 17's widened arm died
+        // silently mid-round with no report (section 41
+        // diagnosis): an uncaught slot-runtime throw has no
+        // handler anywhere below this driver, so it terminated
+        // the process. Here it becomes a named fatal with the
+        // exception text preserved, and the normal report path
+        // runs. A GGML_ASSERT abort is not catchable and would
+        // still kill the process — that outcome is itself the
+        // discriminator the diagnosis named.
+        try {
+            while (keep_going && !ended_eos && fatal.empty()) {
+                const auto round_start = Clock::now();
+                draft.clear();
+                common_speculative_draft_params & dp = common_speculative_get_draft_params(spec, 0);
+                dp.drafting = true;
+                dp.n_max = DSPARK_N_MAX;
+                dp.n_past = anchor_pos;
+                dp.id_last = anchor;
+                dp.prompt = &prompt_tgt;
+                dp.result = &draft;
+                common_speculative_draft(spec);
+                // Build 16 fix: drafting leaves scratch KV in the DRAFT
+                // context. The dflash draft() decodes its noise block
+                // ([anchor, mask, mask] for DSpark: n_max tokens) into
+                // ctx_dft at positions anchor_pos .. anchor_pos + n_max - 1, and
+                // process() below injects the real target features at
+                // those same positions via llama_decode(ctx_dft, ...).
+                // Both of the fork's reference drivers remove the scratch
+                // block the moment drafting returns, before the verify
+                // batch: the server (server-context.cpp, right after
+                // common_speculative_draft) and speculative-simple both
+                // call seq_rm(ctx_dft, ckpt.pos_max + 1, -1), where
+                // pos_max is the target's last committed position, so
+                // pos_max + 1 is exactly the anchor's position. Build 15
+                // skipped this rollback: the noise block's last position
+                // (36 + 3 - 1 = 38) was still stored in the draft memory
+                // when process() tried to inject starting at 36, llama's
+                // M-RoPE batch check (stored last position must be <= the
+                // batch's starting position) rejected the injection
+                // decode with ret -1, and process() returned false
+                // (device: errorPhase dspark_process, X = 38, Y = 36).
+                if (!llama_memory_seq_rm(llama_get_memory(dspark_ctx), 0, anchor_pos, -1)) {
+                    draft_seq_rm_failures++;
+                }
+                if (draft.empty()) {
+                    fatal_phase = "dspark_draft";
+                    fatal = "common_speculative_draft produced no draft tokens";
+                    break;
+                }
+                rounds++;
+                drafted += (long long) draft.size();
+                common_batch_clear(verify_batch);
+                common_batch_add(verify_batch, anchor, anchor_pos, { 0 }, true);
+                for (size_t i = 0; i < draft.size(); i++) {
+                    common_batch_add(verify_batch, draft[i], anchor_pos + 1 + (llama_pos) i, { 0 }, true);
+                }
+                if (llama_decode(ctx, verify_batch) != 0) {
+                    fatal_phase = "decode";
+                    fatal = "llama_decode failed during DSpark verify";
+                    break;
+                }
+                if (!common_speculative_process(spec, verify_batch)) {
+                    fatal_phase = "dspark_process";
+                    fatal = "common_speculative_process failed on the DSpark verify batch";
+                    break;
+                }
+                const std::vector<llama_token> ids =
+                    common_sampler_sample_and_accept_n(dspark_sampler, ctx, draft);
+                if (ids.empty()) {
+                    fatal_phase = "dspark_accept";
+                    fatal = "common_sampler_sample_and_accept_n returned no tokens";
+                    break;
+                }
+                const long long n_accepted = (long long) ids.size() - 1;
+                accepted_tokens += n_accepted;
+                common_speculative_accept(spec, 0, (uint16_t) n_accepted);
+                // Commit: the new anchor is the last accepted id, at
+                // position anchor_pos + ids.size(); everything before it
+                // joins prompt_tgt. Roll both contexts back to the
+                // anchor's position (the anchor itself is re-decoded as
+                // the next verify batch's first row).
+                prompt_tgt.push_back(anchor);
+                for (size_t i = 0; i + 1 < ids.size(); i++) prompt_tgt.push_back(ids[i]);
+                anchor = ids.back();
+                anchor_pos += (llama_pos) ids.size();
+                if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, anchor_pos, -1)) {
+                    fatal_phase = "dspark_rollback";
+                    fatal = "llama_memory_seq_rm failed on the target context after DSpark acceptance";
+                    break;
+                }
+                if (!llama_memory_seq_rm(llama_get_memory(dspark_ctx), 0, anchor_pos, -1)) {
+                    draft_seq_rm_failures++;
+                }
+                decode_calls_ms += ms_between(round_start, Clock::now());
+                for (const llama_token token : ids) {
+                    if (generated >= max_tokens) { keep_going = false; break; }
+                    if (!emit_token(token)) { keep_going = false; break; }
+                }
             }
-            if (draft.empty()) {
-                fatal_phase = "dspark_draft";
-                fatal = "common_speculative_draft produced no draft tokens";
-                break;
-            }
-            rounds++;
-            drafted += (long long) draft.size();
-            common_batch_clear(verify_batch);
-            common_batch_add(verify_batch, anchor, anchor_pos, { 0 }, true);
-            for (size_t i = 0; i < draft.size(); i++) {
-                common_batch_add(verify_batch, draft[i], anchor_pos + 1 + (llama_pos) i, { 0 }, true);
-            }
-            if (llama_decode(ctx, verify_batch) != 0) {
-                fatal_phase = "decode";
-                fatal = "llama_decode failed during DSpark verify";
-                break;
-            }
-            if (!common_speculative_process(spec, verify_batch)) {
-                fatal_phase = "dspark_process";
-                fatal = "common_speculative_process failed on the DSpark verify batch";
-                break;
-            }
-            const std::vector<llama_token> ids =
-                common_sampler_sample_and_accept_n(dspark_sampler, ctx, draft);
-            if (ids.empty()) {
-                fatal_phase = "dspark_accept";
-                fatal = "common_sampler_sample_and_accept_n returned no tokens";
-                break;
-            }
-            const long long n_accepted = (long long) ids.size() - 1;
-            accepted_tokens += n_accepted;
-            common_speculative_accept(spec, 0, (uint16_t) n_accepted);
-            // Commit: the new anchor is the last accepted id, at
-            // position anchor_pos + ids.size(); everything before it
-            // joins prompt_tgt. Roll both contexts back to the
-            // anchor's position (the anchor itself is re-decoded as
-            // the next verify batch's first row).
-            prompt_tgt.push_back(anchor);
-            for (size_t i = 0; i + 1 < ids.size(); i++) prompt_tgt.push_back(ids[i]);
-            anchor = ids.back();
-            anchor_pos += (llama_pos) ids.size();
-            if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, anchor_pos, -1)) {
-                fatal_phase = "dspark_rollback";
-                fatal = "llama_memory_seq_rm failed on the target context after DSpark acceptance";
-                break;
-            }
-            if (!llama_memory_seq_rm(llama_get_memory(dspark_ctx), 0, anchor_pos, -1)) {
-                draft_seq_rm_failures++;
-            }
-            decode_calls_ms += ms_between(round_start, Clock::now());
-            for (const llama_token token : ids) {
-                if (generated >= max_tokens) { keep_going = false; break; }
-                if (!emit_token(token)) { keep_going = false; break; }
-            }
+        } catch (const std::exception & e) {
+            fatal_phase = "dspark_exception";
+            caught_exception = e.what();
+            fatal = "DSpark decode round threw an exception: " + caught_exception;
+        } catch (...) {
+            fatal_phase = "dspark_exception";
+            caught_exception = "unknown non-std exception";
+            fatal = "DSpark decode round threw an unknown non-std exception";
         }
         llama_batch_free(verify_batch);
         const double gen_wall_ms = ms_between(gen_start, Clock::now());
@@ -1205,6 +1252,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         kase["dsparkAcceptRatePct"] = drafted > 0 ? 100.0 * (double) accepted_tokens / (double) drafted : 0.0;
         kase["dsparkAvgAcceptanceLength"] = rounds > 0 ? (double) accepted_tokens / (double) rounds : 0.0;
         kase["dsparkDraftSeqRmFailures"] = draft_seq_rm_failures;
+        // Build 18: the caught round exception's text ("" when
+        // the catch never fired), so it survives into the report
+        // and the pasted Copy diagnostics bundle.
+        kase["dsparkCaughtException"] = caught_exception;
         emit_progress({{"stage", "decode"}, {"event", "done"}, {"caseIndex", display},
                        {"generatedTokens", generated}, {"decodeWallMs", gen_wall_ms},
                        {"decodeTokensPerSec", kase["decodeTokensPerSec"].get<double>()},

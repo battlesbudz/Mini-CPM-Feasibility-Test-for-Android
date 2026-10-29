@@ -225,6 +225,25 @@ probe, telemetry, the other two quick arms — is unchanged from
 build 16, and `models.json` is byte-identical, so installing over
 build 16 needs no new download.
 
+## Build 18: a safety catch around the DSpark rounds
+
+Build 17's widened arm died silently on device: the `:benchmark`
+worker process was killed natively during an early verify round
+and no report was ever written (PHONE_TRIAL.md section 41). The
+diagnosis named the leading vehicle an uncaught C++ exception —
+an MoE slot-runtime throw with no handler anywhere from the ggml
+custom op through `llama_decode` to the app's driver. Build 18
+changes no configuration (the arm stays at n_max = 7, window 64,
+rows 8, `n_rs_seq` = 7); it wraps the DSpark round loop in
+benchmark.cpp in a try/catch that converts a throw into the
+existing fatal report path with errorPhase `dspark_exception`,
+keeping the exception's `what()` text in the case as
+`dsparkCaughtException`. A catchable throw now ends the run with
+a finished report naming the throwing site; if a build 18 run
+still dies silently, that convicts the uncatchable GGML_ASSERT
+branch instead. `models.json` is byte-identical, so installing
+over build 17 needs no new download.
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub
