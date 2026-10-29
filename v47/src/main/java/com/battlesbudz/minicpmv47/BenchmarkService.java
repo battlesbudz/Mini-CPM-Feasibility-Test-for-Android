@@ -92,6 +92,20 @@ public final class BenchmarkService extends Service {
         heartbeat=SystemClock.elapsedRealtime();
         run=new File(getFilesDir(),"last-run");run.mkdirs();state=new JSONObject();
         try{state.put("startedAtMs",System.currentTimeMillis()).put("profile","minicpm-v47-phone-trial-v1").put("contextTokens",4096).put("batchTokens",2048).put("mode",mode).put("moeLookaheadPrefetch",lookaheadPrefetch()).put("abArm",abArm()).put("maxNewTokens",!"full".equals(mode)?32:512).put("threads",4).put("build",BuildConfig.VERSION_NAME).put("sourceCommit",BuildConfig.SOURCE_COMMIT).put("device",Build.MANUFACTURER+" "+Build.MODEL).put("sdk",Build.VERSION.SDK_INT);}catch(Exception ignored){}
+        // Build 19: if a previous run died natively, the crash
+        // recorder's file survives in the files dir (the process
+        // that wrote it is gone, and this new run's native side
+        // does not delete it). Carry a bounded copy into this
+        // run's status.json so the record stays visible in every
+        // diagnostics paste even after a new run starts.
+        try{
+            File crash=new File(getFilesDir(),"native_crash.txt");
+            if(crash.isFile()&&crash.length()>0){
+                String text=Io.read(crash.toPath());
+                if(text.length()>4096)text=text.substring(text.length()-4096);
+                state.put("previousNativeCrash",text);
+            }
+        }catch(Exception ignored){}
         state("Starting","RUNNING");
         writePartialReport();
         chargeStart=getSystemService(BatteryManager.class).getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER);

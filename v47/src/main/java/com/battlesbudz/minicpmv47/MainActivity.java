@@ -58,6 +58,21 @@ public final class MainActivity extends Activity {
         catch(Exception e){return false;}
     }
     private String fileText(String name){try{return Io.read(new File(getFilesDir(),name).toPath());}catch(Exception e){return "";}}
+    // Build 19: the tail of the native stderr log. The log is a
+    // full run's stderr (loader output included), so only its
+    // last bytes are pasted — a crash's assert/terminate lines
+    // are the final thing the process ever wrote.
+    private String fileTail(String name,int maxBytes){
+        try{
+            File f=new File(getFilesDir(),name);if(!f.isFile()||f.length()==0)return "";
+            long len=f.length();long skip=Math.max(0,len-maxBytes);
+            try(RandomAccessFile raf=new RandomAccessFile(f,"r")){
+                raf.seek(skip);byte[] buf=new byte[(int)(len-skip)];raf.readFully(buf);
+                String tail=new String(buf,java.nio.charset.StandardCharsets.UTF_8);
+                return skip>0?"[…earlier stderr omitted…]\n"+tail:tail;
+            }
+        }catch(Exception e){return "";}
+    }
     private String diagnostics(){
         StringBuilder out=new StringBuilder();
         out.append("Build: ").append(BuildConfig.VERSION_NAME).append(" · Source: ").append(BuildConfig.SOURCE_COMMIT).append("\n");
@@ -65,13 +80,24 @@ public final class MainActivity extends Activity {
         String s=fileText("status.json");if(!s.isEmpty())out.append("STATUS\n").append(s).append("\n\n");
         String r=fileText("report.json");if(!r.isEmpty())out.append("REPORT\n").append(r).append("\n\n");
         String p=fileText("report-partial.json");if(!p.isEmpty())out.append("PARTIAL REPORT (latest run did not finish; per-case results saved so far)\n").append(p).append("\n\n");
-        String m=fileText("last-run/memory.json");if(!m.isEmpty())out.append("MEMORY\n").append(m);
+        String m=fileText("last-run/memory.json");if(!m.isEmpty())out.append("MEMORY\n").append(m).append("\n\n");
+        // Build 19: the native crash recorder's evidence. The
+        // record names the moment itself (a ggml assert's
+        // file:line message and/or the fatal signal with its
+        // fault address and registers); the stderr tail carries
+        // the same text in the process's own output order.
+        File crashFile=new File(getFilesDir(),"native_crash.txt");
+        String crash=fileText("native_crash.txt");
+        if(!crash.isEmpty())out.append("NATIVE CRASH (recorded ").append(new java.util.Date(crashFile.lastModified())).append(")\n").append(crash).append("\n\n");
+        String tail=fileTail("native_stderr.log",32*1024);
+        if(!tail.isEmpty())out.append("NATIVE STDERR TAIL (last 32 KiB of the latest run)\n").append(tail);
         return out.toString();
     }
     private void refresh(){
         if(destroyed||status==null)return;boolean running=workerAlive();
         for(Button b:controls)b.setEnabled(!busy&&!running);
         StringBuilder text=new StringBuilder(local);
+        if(new File(getFilesDir(),"native_crash.txt").length()>0)text.append("\n\nA native crash was recorded — Copy diagnostics includes the crash record and the native stderr tail.");
         String s=fileText("status.json");
         if(!s.isEmpty()){try{JSONObject o=new JSONObject(s);text.append("\n\nPhase: ").append(o.optString("phase")).append("\nStatus: ").append(o.optString("status"));}catch(Exception ignored){}}
         String r=fileText("report.json");

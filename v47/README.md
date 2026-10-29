@@ -244,6 +244,79 @@ still dies silently, that convicts the uncatchable GGML_ASSERT
 branch instead. `models.json` is byte-identical, so installing
 over build 17 needs no new download.
 
+## Build 19 — the crash recorder (no configuration change)
+
+Build 18's DSpark run died silently exactly like build 17's
+(PHONE_TRIAL.md section 44): the safety catch never fired, so
+the killer is an uncatchable native abort — a GGML_ASSERT /
+GGML_ABORT, a slot-runtime throw whose unwind never reaches
+the driver through ggml's C dispatch frames, or a hard fault —
+and the source hunt (ABORT_HUNT.md) could not convict one
+specific line by reading. Build 19 changes no configuration
+and no behavior (the DSpark arm stays widened at n_max = 7,
+window 64, rows 8, `n_rs_seq` = 7, under build 18's catch);
+it adds an in-process **native crash recorder** in
+benchmark.cpp, installed at the very top of the JNI entry,
+before model load, so the next death names itself from the
+phone (Android's own tombstones are not readable from an app
+without adb). Three channels, all landing in the app files
+dir:
+
+- **Signal handlers** for SIGABRT, SIGSEGV, SIGBUS, SIGILL
+  and SIGFPE append a record to `native_crash.txt` using
+  async-signal-safe calls only (open/write/close, hand-rolled
+  formatting): signal number and name, si_code, fault address,
+  timestamp, and the PC/LR/SP registers from the ucontext plus
+  a frame-pointer return-address chain. (`<execinfo.h>`'s
+  `backtrace()` is best-effort at best across NDK/API levels,
+  so the record carries registers and raw addresses instead;
+  they resolve against the shipped `.so`.) The handler then
+  restores the default disposition and re-raises — the process
+  still dies exactly as it would have without the recorder.
+- **A ggml abort callback** (`ggml_set_abort_callback`)
+  preserves a GGML assert's own `file:line: GGML_ASSERT(...)`
+  message into `native_crash.txt` and onto the captured stderr
+  before `ggml_abort()` raises the SIGABRT the handler records.
+  A `std::terminate` handler (installed after
+  `llama_backend_init`, so it is not overwritten by ggml's own)
+  likewise keeps an uncaught exception's `what()` text.
+- **stderr redirected** to `native_stderr.log` (fresh per
+  run), so ggml's assert printout, a terminate line, and the
+  runtime's `[moe-ssd]` stderr lines survive the process. The
+  trial's existing captures are not disturbed: the loader log
+  arrives through the llama log callback, not fd 2 (and
+  `moe_log` mirrors every line through `LLAMA_LOG_INFO`, so
+  the parsed counters keep flowing), and the DSpark common log
+  already has its own file.
+
+Surfacing: **Copy diagnostics** gains a `NATIVE CRASH`
+section (the record, with its file timestamp) and a
+`NATIVE STDERR TAIL` section (the last 32 KiB of the latest
+run's stderr — a crash's assert/terminate text is the last
+thing the process wrote). The app also shows a "native crash
+recorded" line on screen when a record exists, and
+BenchmarkService carries a previous run's record (bounded to
+4 KiB) into the next run's status.json as
+`previousNativeCrash`, so the evidence survives in pastes even
+after a new run starts. The recorder never deletes a record
+at run start; only a new crash overwrites it. `models.json`
+is byte-identical, so installing over build 18 needs no new
+download.
+
+**Device protocol for build 19:** install over build 18, do
+NOT tap Download, tap **Quick decode check · DSpark (A/B)**
+once, let it run its course (it is expected to die again,
+silently, inside the first minute of decode), then **Copy
+diagnostics** and paste. The paste should now carry the crash
+record and/or the assert's stderr text naming the site: a
+`file:line: GGML_ASSERT` line convicts the assert family and
+names the line; a `terminate called` / `exception what():`
+line naming a MoE slot error convicts the throw family and
+names the throw; a NATIVE CRASH section with signal 11
+(SIGSEGV) and no assert/terminate text points at a raw memory
+fault; no crash record at all points at an external kill
+(LMKD). No OFF-baseline run is needed.
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub

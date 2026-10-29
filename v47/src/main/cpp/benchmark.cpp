@@ -131,6 +131,44 @@
 // DSpark run still dies silently, that convicts the assert
 // branch instead. The quick and quick_off arms are untouched.
 //
+// Build 19 changes no configuration and no behavior either: the
+// DSpark arm stays at build 17's widened settings under build
+// 18's try/catch. It adds an in-process native crash recorder,
+// installed at the very top of the JNI entry, before model load.
+// Build 18's DSpark run died silently exactly like build 17's
+// (PHONE_TRIAL.md section 44): the catch never fired, so the
+// killer is not an exception that unwinds to this driver — it
+// is an uncatchable native abort (a GGML_ASSERT/GGML_ABORT, a
+// throw whose unwind dies in ggml's C dispatch frames, or a
+// hard fault), and the source hunt (ABORT_HUNT.md) could not
+// convict one specific line by reading. The recorder exists to
+// name it from the phone itself, because Android keeps native
+// crash records (tombstones) where an app without adb cannot
+// read them. Three capture channels, all writing into the app
+// files dir: (1) signal handlers for SIGABRT / SIGSEGV / SIGBUS
+// / SIGILL / SIGFPE that append the signal, fault address,
+// timestamp and register/backtrace info to native_crash.txt
+// using async-signal-safe calls only, then re-raise so the
+// process still dies the same way; (2) a ggml abort callback
+// (ggml_set_abort_callback) that preserves the assert's own
+// "file:line: GGML_ASSERT(...) failed" message into the same
+// file before ggml_abort() raises SIGABRT into channel (1);
+// (3) the process's stderr redirected to native_stderr.log, so
+// ggml's own assert printout, a std::terminate "throwing an
+// instance of ..." line, and the runtime's [moe-ssd] stderr
+// lines survive the process. A std::terminate handler keeps the
+// throwing exception's what() text for the same reason. The
+// captured loader log is NOT stderr — it arrives through the
+// llama log callback above — and the DSpark common log already
+// has its own file, so neither mechanism is disturbed by the
+// redirect; moe_log also mirrors every line through
+// LLAMA_LOG_INFO, so the parsed [moe-ssd] counters are intact.
+// The service and the UI surface both files in the diagnostics
+// bundle (NATIVE CRASH / NATIVE STDERR TAIL sections), and the
+// service carries a previous run's record into the next run's
+// status.json, so one DSpark run plus one Copy diagnostics
+// paste now names the abort site or the fault.
+//
 // Configuration mirrors the vendor demo defaults for this fork
 // (OpenBMB MiniCPM-V-demo-Android): 4 threads, 4096-token context,
 // image_max_slice_nums 9. Sampling is greedy (temperature 0) to match the
@@ -147,12 +185,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+#include <fcntl.h>
+#include <signal.h>
 #include <sys/resource.h>
+#include <ucontext.h>
+#include <unistd.h>
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -342,6 +385,232 @@ static std::string loader_log_snapshot() {
     return g_loader_log;
 }
 
+// ------------------------------------------------------------------
+// Build 19: native crash recorder (see the header note). Installed
+// at the top of the JNI entry, before model load. Everything the
+// signal handler touches is async-signal-safe: open/write/close,
+// time, and hand-rolled number formatting — no snprintf, no
+// malloc, no stdio inside the handler. The backtrace is a manual
+// frame-pointer walk (return addresses only): <execinfo.h>'s
+// backtrace() is not reliably linkable across NDK/API levels for
+// this target, so the record carries the signal, the fault
+// address, and the PC/LR/SP registers from the ucontext plus the
+// return-address chain, which is enough to name the faulting
+// function against the shipped .so later.
+static char g_crash_record_path[512] = {};
+static char g_native_stderr_path[512] = {};
+static volatile sig_atomic_t g_crash_recorded = 0;
+
+static void crash_write_str(int fd, const char * s) {
+    size_t n = 0;
+    while (s[n]) n++;
+    const ssize_t ignored = write(fd, s, n);
+    (void) ignored;
+}
+static void crash_write_u64(int fd, unsigned long long v) {
+    char buf[20];
+    int i = (int) sizeof(buf);
+    if (v == 0) buf[--i] = '0';
+    while (v) { buf[--i] = (char) ('0' + (v % 10)); v /= 10; }
+    const ssize_t ignored = write(fd, buf + i, (size_t) ((int) sizeof(buf) - i));
+    (void) ignored;
+}
+static void crash_write_hex(int fd, unsigned long long v) {
+    char buf[16];
+    int i = (int) sizeof(buf);
+    if (v == 0) buf[--i] = '0';
+    while (v) {
+        const unsigned d = (unsigned) (v & 0xfu);
+        buf[--i] = (char) (d < 10 ? '0' + d : 'a' + (d - 10));
+        v >>= 4;
+    }
+    crash_write_str(fd, "0x");
+    const ssize_t ignored = write(fd, buf + i, (size_t) ((int) sizeof(buf) - i));
+    (void) ignored;
+}
+static const char * crash_signal_name(int sig) {
+    switch (sig) {
+        case SIGABRT: return "SIGABRT";
+        case SIGSEGV: return "SIGSEGV";
+        case SIGBUS:  return "SIGBUS";
+        case SIGILL:  return "SIGILL";
+        case SIGFPE:  return "SIGFPE";
+        default:      return "SIG?";
+    }
+}
+
+static void native_crash_handler(int sig, siginfo_t * info, void * uctx_v) {
+    if (!g_crash_recorded && g_crash_record_path[0]) {
+        g_crash_recorded = 1;
+        const int fd = open(g_crash_record_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            crash_write_str(fd, "\n=== native crash (signal handler) ===\n");
+            crash_write_str(fd, "signal: ");
+            crash_write_u64(fd, (unsigned long long) sig);
+            crash_write_str(fd, " (");
+            crash_write_str(fd, crash_signal_name(sig));
+            crash_write_str(fd, ")\nsi_code: ");
+            crash_write_u64(fd, (unsigned long long) (info ? info->si_code : 0));
+            crash_write_str(fd, "\nfault_address: ");
+            crash_write_hex(fd, (unsigned long long) (uintptr_t) (info ? info->si_addr : nullptr));
+            crash_write_str(fd, "\ntime_unix: ");
+            crash_write_u64(fd, (unsigned long long) time(nullptr));
+            crash_write_str(fd, "\n");
+            if (uctx_v) {
+                const ucontext_t * uc = (const ucontext_t *) uctx_v;
+#if defined(__aarch64__)
+                crash_write_str(fd, "pc: ");
+                crash_write_hex(fd, (unsigned long long) uc->uc_mcontext.pc);
+                crash_write_str(fd, "\nlr: ");
+                crash_write_hex(fd, (unsigned long long) uc->uc_mcontext.regs[30]);
+                crash_write_str(fd, "\nsp: ");
+                crash_write_hex(fd, (unsigned long long) uc->uc_mcontext.sp);
+                crash_write_str(fd, "\nbacktrace (return addresses from the frame-pointer chain):");
+                // Frame records: [fp] = previous fp, [fp+8] = return
+                // address. Walk defensively: aligned, strictly
+                // increasing, bounded count; a corrupt chain just
+                // ends the walk early.
+                unsigned long long fp = (unsigned long long) uc->uc_mcontext.regs[29];
+                for (int i = 0; i < 32 && fp && (fp & 0xfull) == 0; i++) {
+                    const unsigned long long * frame = (const unsigned long long *) (uintptr_t) fp;
+                    const unsigned long long next_fp = frame[0];
+                    const unsigned long long ret = frame[1];
+                    crash_write_str(fd, "\n  ");
+                    crash_write_hex(fd, ret);
+                    if (!next_fp || next_fp <= fp) break;
+                    fp = next_fp;
+                }
+                crash_write_str(fd, "\n");
+#elif defined(__arm__)
+                crash_write_str(fd, "pc: ");
+                crash_write_hex(fd, (unsigned long long) uc->uc_mcontext.arm_pc);
+                crash_write_str(fd, "\nlr: ");
+                crash_write_hex(fd, (unsigned long long) uc->uc_mcontext.arm_lr);
+                crash_write_str(fd, "\nsp: ");
+                crash_write_hex(fd, (unsigned long long) uc->uc_mcontext.arm_sp);
+                crash_write_str(fd, "\n");
+#elif defined(__x86_64__)
+                crash_write_str(fd, "pc: ");
+                crash_write_hex(fd, (unsigned long long) uc->uc_mcontext.gregs[REG_RIP]);
+                crash_write_str(fd, "\nsp: ");
+                crash_write_hex(fd, (unsigned long long) uc->uc_mcontext.gregs[REG_RSP]);
+                crash_write_str(fd, "\n");
+#endif
+            }
+            close(fd);
+        }
+    }
+    // Die the same way the process would have died without the
+    // recorder: restore the default disposition and re-raise.
+    signal(sig, SIG_DFL);
+    raise(sig);
+    _exit(128 + sig);
+}
+
+// ggml_abort() calls this INSTEAD of printing its
+// "file:line: GGML_ASSERT(...) failed" message, then abort()s.
+// Runs in normal execution context (not a signal handler), so
+// stdio/string calls are fine here. The message is preserved to
+// the captured stderr AND to the crash record; the SIGABRT that
+// follows appends the handler's own section to the record.
+static void native_crash_ggml_abort(const char * message) {
+    static const char prefix[] = "\n=== ggml_abort ===\n";
+    const ssize_t w1 = write(STDERR_FILENO, prefix, sizeof(prefix) - 1);
+    (void) w1;
+    if (message) {
+        const ssize_t w2 = write(STDERR_FILENO, message, strlen(message));
+        (void) w2;
+        const ssize_t w3 = write(STDERR_FILENO, "\n", 1);
+        (void) w3;
+    }
+    if (g_crash_record_path[0]) {
+        const int fd = open(g_crash_record_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            crash_write_str(fd, prefix);
+            if (message) {
+                crash_write_str(fd, message);
+                crash_write_str(fd, "\n");
+            }
+            close(fd);
+        }
+    }
+}
+
+// An uncaught C++ exception anywhere below this driver (the MoE
+// slot runtime throws from inside ggml graph execution) ends in
+// std::terminate. Keep the exception's what() text — it names
+// the throwing site — on the captured stderr and in the crash
+// record, then abort into the signal handler as usual. ggml
+// registers its own terminate handler (a backtrace printer);
+// this one is installed after llama_backend_init so it is the
+// one in effect during generation, and its evidence lands in
+// the same two places either way.
+static void native_crash_terminate() {
+    static const char note[] = "\n=== std::terminate called ===\n";
+    const ssize_t w1 = write(STDERR_FILENO, note, sizeof(note) - 1);
+    (void) w1;
+    char what_buf[512] = {};
+    const std::exception_ptr ep = std::current_exception();
+    if (ep) {
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception & e) {
+            const char * w = e.what();
+            size_t n = 0;
+            if (w) { while (w[n] && n < sizeof(what_buf) - 1) { what_buf[n] = w[n]; n++; } }
+            what_buf[n] = '\0';
+        } catch (...) {
+            const char * w = "(non-std exception)";
+            size_t n = 0;
+            while (w[n] && n < sizeof(what_buf) - 1) { what_buf[n] = w[n]; n++; }
+            what_buf[n] = '\0';
+        }
+    }
+    if (what_buf[0]) {
+        const ssize_t w2 = write(STDERR_FILENO, "exception what(): ", 18);
+        (void) w2;
+        const ssize_t w3 = write(STDERR_FILENO, what_buf, strlen(what_buf));
+        (void) w3;
+        const ssize_t w4 = write(STDERR_FILENO, "\n", 1);
+        (void) w4;
+        if (g_crash_record_path[0]) {
+            const int fd = open(g_crash_record_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) {
+                crash_write_str(fd, note);
+                crash_write_str(fd, "exception what(): ");
+                crash_write_str(fd, what_buf);
+                crash_write_str(fd, "\n");
+                close(fd);
+            }
+        }
+    }
+    std::abort();
+}
+
+static void install_crash_recorder(const std::string & files_dir) {
+    std::snprintf(g_crash_record_path, sizeof(g_crash_record_path), "%s/native_crash.txt", files_dir.c_str());
+    std::snprintf(g_native_stderr_path, sizeof(g_native_stderr_path), "%s/native_stderr.log", files_dir.c_str());
+    // Redirect the process's stderr to a fresh per-run log BEFORE
+    // anything else can print. This does not disturb the trial's
+    // other captures: the loader log arrives through the llama
+    // log callback (not fd 2), moe_log mirrors every line through
+    // LLAMA_LOG_INFO as well as stderr (so the parsed [moe-ssd]
+    // counters keep flowing), the DSpark common log has its own
+    // file set later, and __android_log_print is unaffected.
+    const int fd = open(g_native_stderr_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        dup2(fd, STDERR_FILENO);
+        if (fd != STDERR_FILENO) close(fd);
+    }
+    struct sigaction sa = {};
+    sa.sa_sigaction = native_crash_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    const int sigs[] = { SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE };
+    for (const int s : sigs) sigaction(s, &sa, nullptr);
+    ggml_set_abort_callback(native_crash_ggml_abort);
+}
+
 // Build 12: mine a prewarm table from a previous run's routing trace.
 // The slot runtime's LLAMA_MOE_SWEEP dump writes one line per decode
 // step per layer: "L<layer> E:<experts actually used> P:<predicted>".
@@ -523,6 +792,17 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     const std::string image = jstr(env, jimage);
     const std::string out   = jstr(env, jout);
     (void) out; // report is returned to the service, which persists it
+    // Build 19: install the native crash recorder before anything
+    // else in this process runs — model load included. Its files
+    // live in the app files dir, the parent of the last-run output
+    // dir passed as `out`. The record from a previous run is NOT
+    // deleted here (the service carries it into this run's
+    // status.json as previousNativeCrash); only a new crash or a
+    // ggml abort overwrites/appends it.
+    {
+        const std::string::size_type slash = out.find_last_of('/');
+        install_crash_recorder(slash == std::string::npos ? out : out.substr(0, slash));
+    }
     // Build 12: run mode from the service. "quick" runs only Case 3
     // (QUICK_CASE_DISPLAY) with a QUICK_MAX_TOKENS decode cap; anything
     // else is the full six-case trial with untouched defaults.
@@ -640,6 +920,13 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
 
     llama_log_set(log_callback, nullptr);
     llama_backend_init();
+    // Build 19: install the terminate recorder only now — ggml
+    // registers its own std::terminate handler during backend
+    // init, and this one must be the handler in effect during
+    // generation (see native_crash_terminate).
+    std::set_terminate(native_crash_terminate);
+    report["nativeCrashRecord"] = g_crash_record_path;
+    report["nativeStderrLog"] = g_native_stderr_path;
 
     const std::string model_dir    = root + "/" + MODEL_SUBDIR;
     const std::string main_path    = model_dir + "/" + MAIN_GGUF;
