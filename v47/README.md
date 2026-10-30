@@ -355,6 +355,50 @@ class (~1.5 tok/s); the report's `dsparkWindowMaxRows` /
 `moeWindowMaxRowsEffective` should read 4 and
 `dsparkDraftNMax` 3.
 
+## Build 21 — the per-layer window A/B arm
+
+Build 21 adds one new quick arm, **Quick decode check · DSpark
+per-layer windows (A/B)** (mode `quick_dspark_layerwin`), Battles
+approved 2026-10-29. It is the stock DSpark arm in every respect
+(depth 3, base decode window 32, 4 verify rows, `n_rs_seq` 3,
+lookahead prefetch off, same prewarm, threads, context and slot
+bank) except that `LLAMA_MOE_LAYER_WINDOWS` is set before the
+target model loads, distributing the decode window unevenly
+across the 40 layers: floor 32 slots per layer (the slot runtime
+clamps `LLAMA_MOE_WINDOW_MAX_ROWS` against the narrowest layer,
+and 4 rows need width ≥ 32 to keep a whole verify batch in
+window mode) and exactly 1600 slots in total, against the stock
+arm's uniform 40 × 32 = 1280.
+
+**Width source:** mined from the app's own previous-run sweep
+trace (`moe_sweep.txt`) by extending the same trace parsing the
+prewarm miner uses. Each layer's score is a saturation proxy —
+the number of experts, in descending routing-frequency order,
+needed to cover 90% of that layer's observed decode routing —
+and the slots above the floor are allocated in proportion to
+the scores. If no usable trace exists (the prewarm miner's own
+trust rule: ≥ 400 decode lines, every layer seen), the scores
+fall back to the fork header's documented saturation curves
+(layer 0 ≈ 200, most layers ≈ 96), normalized to the same floor
+and total. The report states which source produced the widths
+actually used (`moeLayerWindowsSource`), alongside the full
+vector (`moeLayerWindows`, `moeLayerWindowsWidths`), the total
+(`moeLayerWindowsTotalSlots`), floor, min and max — so a device
+paste shows the distribution itself, not only the runtime's
+per-layer-widths-on log line. The stock `quick_dspark` arm is
+unchanged and remains in the same build as the paired baseline;
+the arm is judged on `decodeTokensPerSec`, answer fluency, and
+the installs/hits counters against it.
+
+**Device protocol for build 21:** install over build 20, do
+NOT tap Download (`models.json` is byte-identical), tap
+**Quick decode check · DSpark (A/B)** and paste, then tap
+**Quick decode check · DSpark per-layer windows (A/B)** and
+paste. In a good layerwin paste expect `abArm:
+"dspark_layerwin"`, `moeLayerWindowsTotalSlots: 1600`,
+`moeWindowMaxRowsEffective: 4`, and the runtime log's
+per-layer-widths line reading on.
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub

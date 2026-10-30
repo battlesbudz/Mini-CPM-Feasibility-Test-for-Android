@@ -185,6 +185,39 @@
 // shipped — both are purely additive instrumentation. The quick
 // and quick_off arms are untouched.
 //
+// Build 21 adds ONE new quick arm, mode "quick_dspark_layerwin":
+// the per-layer window A/B (PHONE_TRIAL.md section 48 recon,
+// NEXT_LEVER.md lever 3, sizing half). The arm is the stock
+// build 20 DSpark arm in every respect (n_max 3, base decode
+// window 32, LLAMA_MOE_WINDOW_MAX_ROWS 4, target n_rs_seq 3,
+// lookahead prefetch off, same prewarm, threads, context and
+// slot bank) except that LLAMA_MOE_LAYER_WINDOWS is set before
+// the target model loads, distributing the decode window
+// unevenly across the 40 layers: floor 32 slots per layer (the
+// slot runtime clamps LLAMA_MOE_WINDOW_MAX_ROWS against the
+// NARROWEST layer, and rows = 4 needs width >= 4 rows x 8 routed
+// experts = 32, so the floor is what keeps a whole verify batch
+// in window mode), total exactly LAYERWIN_TOTAL_SLOTS (1600)
+// slots against the stock arm's uniform 40 x 32 = 1280. Widths
+// are mined from the previous run's moe_sweep.txt by
+// compute_layer_windows() below: each layer's score is the
+// number of experts needed to cover 90% of that layer's observed
+// decode routing frequency (a saturation proxy in the spirit of
+// the fork header's width->miss curves), and the slots above
+// the floor are allocated in proportion to the scores. When no
+// usable sweep trace exists (first run, or a trace under the
+// prewarm miner's own trust threshold), the scores fall back to
+// the fork header's documented curves (llama-model.h: layer 0
+// saturates around c=200, most layers around c=96), normalized
+// to the same floor and total - the report's
+// moeLayerWindowsSource field states which source produced the
+// widths actually used, and moeLayerWindows carries the full
+// vector, so a device paste shows the setting itself and not
+// only the runtime's per-layer-widths-on log line. The stock
+// quick_dspark arm is unchanged and stays in this build as the
+// paired baseline. App-side only: no fork patch, and the quick
+// and quick_off arms are untouched.
+//
 // Configuration mirrors the vendor demo defaults for this fork
 // (OpenBMB MiniCPM-V-demo-Android): 4 threads, 4096-token context,
 // image_max_slice_nums 9. Sampling is greedy (temperature 0) to match the
@@ -309,6 +342,20 @@ static const int    DSPARK_N_MAX   = 3;
 // top.
 static const int    DSPARK_DECODE_WINDOW   = 32;
 static const int    DSPARK_WINDOW_MAX_ROWS = DSPARK_N_MAX + 1;
+// Build 21 (quick_dspark_layerwin arm only): per-layer decode
+// window distribution for LLAMA_MOE_LAYER_WINDOWS. The floor is
+// forced by the slot runtime's rows clamp (see the build 21
+// header note): with DSPARK_WINDOW_MAX_ROWS = 4 and 8 routed
+// experts per row, every layer needs width >= 32 or verify
+// batches partially exit window mode. The total is the
+// section 48 recon's ~1600 slots (vs the stock arm's uniform
+// 1280): +320 slots at 1,351,680 B per slot is ~+0.42 GiB of
+// window residency, inside the headroom build 20's depth-3 runs
+// showed. The cap is the fork header's documented layer-0
+// saturation point; no layer is ever given more.
+static const int    LAYERWIN_TOTAL_SLOTS = 1600;
+static const int    LAYERWIN_FLOOR       = 32;
+static const int    LAYERWIN_CAP         = 200;
 // The vendor app's static prewarm table for this model, top-16 experts
 // per layer, ranked by observed routing frequency (k_mb_prewarm_w16 in
 // OpenBMB/MiniCPM-V-Apps, MTMDWrapper/Bridge/MBPrewarmTable.h, generated
@@ -692,6 +739,117 @@ static std::string mine_prewarm_table(const std::string & sweep_path, long & lin
     return out;
 }
 
+// Build 21: derive the per-layer decode-window widths for the
+// quick_dspark_layerwin arm from the previous run's sweep trace.
+// The sweep format is the one mine_prewarm_table() parses (one
+// line per decode step per layer: "L<layer> E:<experts used>
+// P:<predicted>"). A layer's score is its saturation proxy: the
+// number of distinct experts, taken in descending routing
+// frequency order, needed to cover 90% of that layer's observed
+// routing - layers whose routing spreads over more experts get
+// wider windows. Slots are allocated deterministically: every
+// layer starts at LAYERWIN_FLOOR, then the remaining slots
+// (LAYERWIN_TOTAL_SLOTS - 40 x floor) are dealt one at a time to
+// the layer with the highest score / (width + 1) ratio (ties to
+// the lowest layer index), capped at LAYERWIN_CAP, so the total
+// is exact and reproducible from the same trace. A trace is
+// trusted under exactly the prewarm miner's rule (>= 400 decode
+// lines and every layer seen); otherwise the scores fall back
+// to the fork header's documented saturation curves
+// (llama-model.h: layer 0 saturates around c=200, most layers
+// around c=96) and `source` says so - the fallback is a
+// documented-curve distribution normalized to the same floor
+// and total, never a silent substitute.
+struct LayerWindows {
+    std::string env;              // "0:40,1:38,..." for LLAMA_MOE_LAYER_WINDOWS
+    std::vector<int> widths;      // per layer, in layer order
+    int total = 0;                // sum of widths
+    std::string source;           // which score source produced the widths
+};
+static LayerWindows compute_layer_windows(const std::string & sweep_path) {
+    static const int N_LAYERS = 40, N_EXPERTS = 256;
+    long counts[N_LAYERS][N_EXPERTS] = {};
+    long layer_lines[N_LAYERS] = {};
+    long total_lines = 0;
+    bool sweep_ok = false;
+    if (FILE * fp = std::fopen(sweep_path.c_str(), "r")) {
+        char buf[8192];
+        while (std::fgets(buf, sizeof(buf), fp)) {
+            if (buf[0] != 'L') continue;
+            char * p = buf + 1;
+            char * end = nullptr;
+            const long layer = std::strtol(p, &end, 10);
+            if (end == p || layer < 0 || layer >= N_LAYERS) continue;
+            const char * e = std::strstr(end, "E:");
+            if (!e) continue;
+            e += 2;
+            layer_lines[layer]++;
+            total_lines++;
+            while (*e) {
+                while (*e == ' ' || *e == ',' || *e == '\t') e++;
+                if (*e == 'P' && e[1] == ':') break;
+                if (!*e || *e == '\n' || *e == '\r') break;
+                char * idend = nullptr;
+                const long id = std::strtol(e, &idend, 10);
+                if (idend == e) break;
+                if (id >= 0 && id < N_EXPERTS) counts[layer][id]++;
+                e = idend;
+            }
+        }
+        std::fclose(fp);
+        sweep_ok = total_lines >= 400;
+        for (int l = 0; l < N_LAYERS; l++) if (layer_lines[l] == 0) sweep_ok = false;
+    }
+    std::vector<double> scores(N_LAYERS, 0.0);
+    std::string source;
+    if (sweep_ok) {
+        for (int l = 0; l < N_LAYERS; l++) {
+            std::array<int, N_EXPERTS> ids;
+            for (int i = 0; i < N_EXPERTS; i++) ids[i] = i;
+            std::sort(ids.begin(), ids.end(), [&](int a, int b) {
+                return counts[l][a] != counts[l][b] ? counts[l][a] > counts[l][b] : a < b;
+            });
+            long layer_total = 0;
+            for (int i = 0; i < N_EXPERTS; i++) layer_total += counts[l][i];
+            long covered = 0;
+            int k = 0;
+            while (k < N_EXPERTS && covered * 10 < layer_total * 9) { covered += counts[l][ids[k]]; k++; }
+            scores[l] = (double) std::max(k, 1);
+        }
+        source = "sweep-mined (previous run moe_sweep.txt: " + std::to_string(total_lines) +
+                 " decode-step layer lines; per-layer 90% routing-coverage saturation proxy)";
+    } else {
+        // Documented-curve fallback (fork header, llama-model.h):
+        // layer 0 saturates around c=200, most layers around c=96.
+        for (int l = 0; l < N_LAYERS; l++) scores[l] = l == 0 ? 200.0 : 96.0;
+        source = "documented-curve fallback (fork header llama-model.h: layer 0 saturates ~200, "
+                 "most layers ~96; no usable previous sweep trace)";
+    }
+    std::vector<int> widths(N_LAYERS, LAYERWIN_FLOOR);
+    int remaining = LAYERWIN_TOTAL_SLOTS - N_LAYERS * LAYERWIN_FLOOR;
+    while (remaining > 0) {
+        int best = -1;
+        double best_ratio = -1.0;
+        for (int l = 0; l < N_LAYERS; l++) {
+            if (widths[l] >= LAYERWIN_CAP) continue;
+            const double ratio = scores[l] / (double) (widths[l] + 1);
+            if (ratio > best_ratio) { best_ratio = ratio; best = l; }
+        }
+        if (best < 0) break; // every layer capped; cannot happen at this total
+        widths[best]++;
+        remaining--;
+    }
+    LayerWindows out;
+    out.widths = widths;
+    out.source = source;
+    for (int l = 0; l < N_LAYERS; l++) {
+        out.total += widths[l];
+        if (l) out.env += ",";
+        out.env += std::to_string(l) + ":" + std::to_string(widths[l]);
+    }
+    return out;
+}
+
 // Build 12: the runtime's own counters, recovered from its [moe-ssd]
 // log lines (the trial already captures the full llama log stream).
 // The per-ubatch flush lines carry DELTAS (miss/hit/pfhit/pfread/
@@ -832,7 +990,12 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // (see the build 15 header note): same case, cap and watchdog,
     // generation through the speculative driver instead of the
     // greedy loop, with its own pre-load configuration below.
-    const bool dspark = mode == "quick_dspark";
+    // Build 21: "quick_dspark_layerwin" is the per-layer window
+    // A/B arm: it IS the DSpark arm (every dspark-gated path below
+    // engages identically), plus the LLAMA_MOE_LAYER_WINDOWS
+    // setting computed and applied before the target model loads.
+    const bool dspark_layerwin = mode == "quick_dspark_layerwin";
+    const bool dspark = mode == "quick_dspark" || dspark_layerwin;
     const bool quick = mode == "quick" || lookahead_off || dspark;
     const int max_tokens = quick ? QUICK_MAX_TOKENS : MAX_NEW_TOKENS;
     auto listener_cls = env->GetObjectClass(listener);
@@ -964,6 +1127,11 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // DSPARK_DECODE_WINDOW above); the other arms keep build 11's 16.
     const int decode_window = dspark ? DSPARK_DECODE_WINDOW : MOE_DECODE_WINDOW;
     setenv("LLAMA_MOE_DECODE_WINDOW", std::to_string(decode_window).c_str(), 1);
+    // Build 21: per-layer widths exist only in the layerwin arm
+    // (set below, from the sweep trace, still before model load);
+    // clear any stale value everywhere else so no arm can inherit
+    // a distribution it did not choose.
+    if (!dspark_layerwin) unsetenv("LLAMA_MOE_LAYER_WINDOWS");
     // Build 12 (research 2.1): lookahead prefetch ON, depth left at
     // the fork default of 8. The runtime predicts the next layer's
     // routing from the current hidden state and pre-reads those
@@ -991,7 +1159,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         setenv("LLAMA_MOE_WINDOW_MAX_ROWS", std::to_string(DSPARK_WINDOW_MAX_ROWS).c_str(), 1);
     }
     report["moeLookaheadPrefetch"] = dspark ? "off" : (lookahead_off ? "off" : "on (depth default 8)");
-    report["abArm"] = dspark ? "dspark_on" : (lookahead_off ? "lookahead_off" : "lookahead_on");
+    report["abArm"] = dspark_layerwin ? "dspark_layerwin" : (dspark ? "dspark_on" : (lookahead_off ? "lookahead_off" : "lookahead_on"));
     if (dspark) {
         report["dsparkDraftModel"] = std::string(DSPARK_GGUF) +
             " (openbmb/MiniCPM-V-4.7-35B-A3B-DSpark-gguf @ 2c8f6931e5fba8a01bcc74b2964f330c62056b5e)";
@@ -1008,6 +1176,42 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     const std::string sweep_path = model_dir + "/moe_sweep.txt";
     setenv("LLAMA_MOE_SWEEP", sweep_path.c_str(), 1);
     report["moeSweepTrace"] = sweep_path;
+    // Build 21: the layerwin arm's one difference from the stock
+    // DSpark arm. The widths are computed from the previous run's
+    // trace (still on disk here - the runtime truncates it only
+    // at this run's context creation) and set BEFORE the target
+    // model loads, because the fork builds the per-layer decode
+    // tensor layout from LLAMA_MOE_LAYER_WINDOWS at load time.
+    // The full vector and its source land in the report and in a
+    // progress checkpoint, so status.json and report.json from a
+    // device paste show the distribution itself, not only the
+    // runtime's per-layer-widths-on log line.
+    if (dspark_layerwin) {
+        const LayerWindows lw = compute_layer_windows(sweep_path);
+        setenv("LLAMA_MOE_LAYER_WINDOWS", lw.env.c_str(), 1);
+        const auto mm = std::minmax_element(lw.widths.begin(), lw.widths.end());
+        json widths_json = json::array();
+        for (const int w : lw.widths) widths_json.push_back(w);
+        report["moeLayerWindows"] = lw.env;
+        report["moeLayerWindowsWidths"] = widths_json;
+        report["moeLayerWindowsTotalSlots"] = lw.total;
+        report["moeLayerWindowsFloor"] = LAYERWIN_FLOOR;
+        report["moeLayerWindowsMin"] = *mm.first;
+        report["moeLayerWindowsMax"] = *mm.second;
+        report["moeLayerWindowsSource"] = lw.source;
+        emit_progress({{"stage", "layer_windows"}, {"event", "progress"},
+                       {"label", "Per-layer decode windows"},
+                       {"moeLayerWindows", lw.env},
+                       {"moeLayerWindowsTotalSlots", lw.total},
+                       {"moeLayerWindowsFloor", LAYERWIN_FLOOR},
+                       {"moeLayerWindowsMin", *mm.first},
+                       {"moeLayerWindowsMax", *mm.second},
+                       {"moeLayerWindowsSource", lw.source}});
+        emit("Per-layer decode windows on: total " + std::to_string(lw.total) +
+             " slots across 40 layers, floor " + std::to_string(LAYERWIN_FLOOR) +
+             ", min " + std::to_string(*mm.first) + ", max " + std::to_string(*mm.second) +
+             "; source: " + lw.source);
+    }
     // Prewarm table selection. First choice: a table mined from the
     // previous run's sweep trace (this app's own routing on this
     // phone). No previous trace (or a too-thin one) falls back to the
