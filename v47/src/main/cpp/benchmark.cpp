@@ -185,83 +185,34 @@
 // shipped — both are purely additive instrumentation. The quick
 // and quick_off arms are untouched.
 //
-// Build 21 adds ONE new quick arm, mode "quick_dspark_layerwin":
-// the per-layer window A/B (PHONE_TRIAL.md section 48 recon,
-// NEXT_LEVER.md lever 3, sizing half). The arm is the stock
-// build 20 DSpark arm in every respect (n_max 3, base decode
-// window 32, LLAMA_MOE_WINDOW_MAX_ROWS 4, target n_rs_seq 3,
-// lookahead prefetch off, same prewarm, threads, context and
-// slot bank) except that LLAMA_MOE_LAYER_WINDOWS is set before
-// the target model loads, distributing the decode window
-// unevenly across the 40 layers: floor 32 slots per layer (the
-// slot runtime clamps LLAMA_MOE_WINDOW_MAX_ROWS against the
-// NARROWEST layer, and rows = 4 needs width >= 4 rows x 8 routed
-// experts = 32, so the floor is what keeps a whole verify batch
-// in window mode), total exactly LAYERWIN_TOTAL_SLOTS (1600)
-// slots against the stock arm's uniform 40 x 32 = 1280. Widths
-// are mined from the previous run's moe_sweep.txt by
-// compute_layer_windows() below: each layer's score is the
-// number of experts needed to cover 90% of that layer's observed
-// decode routing frequency (a saturation proxy in the spirit of
-// the fork header's width->miss curves), and the slots above
-// the floor are allocated in proportion to the scores. When no
-// usable sweep trace exists (first run, or a trace under the
-// prewarm miner's own trust threshold), the scores fall back to
-// the fork header's documented curves (llama-model.h: layer 0
-// saturates around c=200, most layers around c=96), normalized
-// to the same floor and total - the report's
-// moeLayerWindowsSource field states which source produced the
-// widths actually used, and moeLayerWindows carries the full
-// vector, so a device paste shows the setting itself and not
-// only the runtime's per-layer-widths-on log line. The stock
-// quick_dspark arm is unchanged and stays in this build as the
-// paired baseline. App-side only: no fork patch, and the quick
-// and quick_off arms are untouched.
-//
-// Build 22 keeps every build 21 arm and adds three, all from the
-// Strata/Avalon scoping plan (STRATA_AVALON_SCOPING_PLAN.md
-// section 4, items 1, 3, 4 and 6):
-//
-// (a) The layerwin miner is fixed. Build 21's device run fell
-// back to the documented curves, and the cause is structural,
-// not a thin trace: the slot runtime's sweep dump chooses its
-// decode branch on `const bool decode = n_rows == 1`
-// (llama-moe-slot.cpp, process()), while a DSpark verify batch
-// runs 4 rows wide, so every DSpark run records its decode
-// routing as prefill-format "P<layer>" lines (each carrying the
-// batch's last-token experts, sweep_write_prefill) and leaves
-// ~zero "L<layer>" decode lines behind. After any DSpark run
-// the old miner's >= 400 L-line trust rule could never pass.
-// compute_layer_windows() now mines those batch samples when
-// the L-line rule fails, under their own trust rule (>= 400
-// batch samples in total, >= 8 per layer), and
-// moeLayerWindowsSource states the basis either way; the
-// prewarm miner is deliberately NOT changed, so the stock
-// baseline's prewarm behaviour is identical to builds 12-21.
-// (b) "quick_dspark_layerwin1920" is the layerwin arm at a
-// 1920-slot total (the plan's probe of whether window memory
-// is still buying misses at ~2.4 GiB); floor 32 still binds.
-// (c) "quick_dspark_split" and "quick_dspark_io8" stack ONE
-// env lever each on the 1600-slot layerwin configuration (the
-// plan tests both against the item-1 winner config):
-// LLAMA_MOE_MATMUL_SPLIT=2 (the fork's A2 deferred-install
-// overlap, read by the slot runtime at model load) and
-// LLAMA_MOE_IO_THREADS=8 (install read parallelism; the fork
-// reads it once per process, and the benchmark process exits
-// after every run, so the per-run env applies cleanly - the
-// runtime's init log line carries the engaged io_threads
-// value). Both variables are unset in every other arm so no
-// stale value can leak into a baseline run.
-// (d) The trial CMake compiles ggml-cpu with
-// GGML_CPU_ARM_ARCH=armv8.2-a+dotprod+i8mm, so the fork's
-// compile-time feature macros stop reading 0 and its KleidiAI
-// kernels can engage (they cover Q4_0/Q8_0 only in this fork,
-// so the expected effect is confined to the Q8_0 DSpark draft
-// path). That raises the binary's floor: the ggml-cpu objects
-// will SIGILL on a pre-armv8.2 phone. The Fold6 (Snapdragon 8
-// Gen 3) is far past that floor; the caveat is written in the
-// module README. No fork file changes in this build - the
-// patch stack and prepare_v47.py are byte-identical.
+// Build 21 added the per-layer window arm (LLAMA_MOE_LAYER_WINDOWS
+// distributing the decode window unevenly across the 40 layers,
+// widths mined from the previous run's sweep trace); build 22
+// fixed that miner for DSpark batch traces and added the
+// 1920-slot variant plus two arms stacked on the 1600-slot
+// configuration, matmul split (LLAMA_MOE_MATMUL_SPLIT=2) and I/O
+// threads 8 (LLAMA_MOE_IO_THREADS=8), alongside the KleidiAI arch
+// floor in the trial CMake. Build 22's device protocol
+// (PHONE_TRIAL.md section 52) judged all of it, and build 23
+// prunes on Battles's direction: remove every setting that
+// improved no stage of the pipeline, keep any setting that
+// improved any stage. Per-layer windows at neither total cut
+// installs or decode time against stock, and matmul split's
+// install reduction never became speed anywhere (its decode ran
+// slowest of the session), so those arms, their env wiring and
+// the width miner are removed here. I/O threads 8 stays: both of
+// its build 22 runs posted the session's fastest prefills (~29%
+// under stock) even though its decode showed no proven gain.
+// Because build 22's io8 arm ran stacked on the layer-window
+// configuration, build 23's io8 arm is the stock DSpark
+// configuration plus LLAMA_MOE_IO_THREADS=8 - the io8-on-stock
+// combination, untested until a device run measures it. The
+// KleidiAI arch floor stays (it is build-wide in CMake and was
+// build 22's decode win via the stock arm), so build 22's
+// SIGILL caveat still applies: the ggml-cpu objects require
+// armv8.2-a+dotprod+i8mm, fine on the Fold6. No fork file
+// changes in this build - the patch stack and prepare_v47.py
+// are byte-identical.
 //
 // Configuration mirrors the vendor demo defaults for this fork
 // (OpenBMB MiniCPM-V-demo-Android): 4 threads, 4096-token context,
@@ -387,31 +338,6 @@ static const int    DSPARK_N_MAX   = 3;
 // top.
 static const int    DSPARK_DECODE_WINDOW   = 32;
 static const int    DSPARK_WINDOW_MAX_ROWS = DSPARK_N_MAX + 1;
-// Build 21 (quick_dspark_layerwin arm only): per-layer decode
-// window distribution for LLAMA_MOE_LAYER_WINDOWS. The floor is
-// forced by the slot runtime's rows clamp (see the build 21
-// header note): with DSPARK_WINDOW_MAX_ROWS = 4 and 8 routed
-// experts per row, every layer needs width >= 32 or verify
-// batches partially exit window mode. The total is the
-// section 48 recon's ~1600 slots (vs the stock arm's uniform
-// 1280): +320 slots at 1,351,680 B per slot is ~+0.42 GiB of
-// window residency, inside the headroom build 20's depth-3 runs
-// showed. The cap is the fork header's documented layer-0
-// saturation point; no layer is ever given more.
-static const int    LAYERWIN_TOTAL_SLOTS = 1600;
-static const int    LAYERWIN_FLOOR       = 32;
-static const int    LAYERWIN_CAP         = 200;
-// Build 22 (quick_dspark_layerwin1920 arm only): the probe
-// total from the scoping plan - whether window memory is still
-// buying misses at ~1920 slots (~2.4 GiB of window residency).
-// Same floor and cap; only the total changes.
-static const int    LAYERWIN1920_TOTAL_SLOTS = 1920;
-// Build 22 trust rule for the batch-sample mining path in
-// compute_layer_windows(): a DSpark trace is trusted as a
-// width source when it holds at least this many prefill-format
-// batch samples per layer (a 32-token quick DSpark run leaves
-// ~13: one prompt-prefill sample plus one per verify round).
-static const int    LAYERWIN_BATCH_MIN_PER_LAYER = 8;
 // The vendor app's static prewarm table for this model, top-16 experts
 // per layer, ranked by observed routing frequency (k_mb_prewarm_w16 in
 // OpenBMB/MiniCPM-V-Apps, MTMDWrapper/Bridge/MBPrewarmTable.h, generated
@@ -795,172 +721,6 @@ static std::string mine_prewarm_table(const std::string & sweep_path, long & lin
     return out;
 }
 
-// Build 21: derive the per-layer decode-window widths for the
-// quick_dspark_layerwin arm from the previous run's sweep trace.
-// The sweep format is the one mine_prewarm_table() parses (one
-// line per decode step per layer: "L<layer> E:<experts used>
-// P:<predicted>"). A layer's score is its saturation proxy: the
-// number of distinct experts, taken in descending routing
-// frequency order, needed to cover 90% of that layer's observed
-// routing - layers whose routing spreads over more experts get
-// wider windows. Slots are allocated deterministically: every
-// layer starts at LAYERWIN_FLOOR, then the remaining slots
-// (total_slots - 40 x floor) are dealt one at a time to the
-// layer with the highest score / (width + 1) ratio (ties to the
-// lowest layer index), capped at LAYERWIN_CAP, so the total is
-// exact and reproducible from the same trace. A trace is
-// trusted under exactly the prewarm miner's rule (>= 400 decode
-// lines and every layer seen); otherwise the scores fall back
-// to the fork header's documented saturation curves
-// (llama-model.h: layer 0 saturates around c=200, most layers
-// around c=96) and `source` says so - the fallback is a
-// documented-curve distribution normalized to the same floor
-// and total, never a silent substitute.
-//
-// Build 22: the trace a DSpark run leaves behind holds ~zero
-// L-lines, by construction in the fork: the sweep dump's decode
-// branch keys on `decode = n_rows == 1` (llama-moe-slot.cpp,
-// process()), and a DSpark verify batch is 4 rows wide, so
-// every verify step is recorded through sweep_write_prefill as
-// a "P<layer> E:<ids>" line carrying the batch's LAST row's
-// routed experts (the prompt-prefill chunks land in the same
-// format, one sample per chunk). Those last rows are real
-// generated-sequence positions - exactly the routing the
-// decode window serves during verification - so when the
-// L-line rule fails, this miner falls back to the batch
-// samples under their own trust rule (>= 400 batch samples in
-// total and >= LAYERWIN_BATCH_MIN_PER_LAYER per layer; a
-// 32-token quick DSpark run leaves ~13 per layer). The sample
-// basis is thinner than a single-token trace (one position per
-// verify round instead of one per token), which is why the
-// source string and the report's moeLayerWindowsTrace* fields
-// state exactly what was mined; the documented-curve fallback
-// now engages only when neither basis is usable. The prewarm
-// miner above is NOT given this path on purpose: the stock
-// baseline's prewarm behaviour must stay identical to builds
-// 12-21 for the A/B to mean anything.
-struct LayerWindows {
-    std::string env;              // "0:40,1:38,..." for LLAMA_MOE_LAYER_WINDOWS
-    std::vector<int> widths;      // per layer, in layer order
-    int total = 0;                // sum of widths
-    std::string source;           // which score source produced the widths
-    long decode_lines = 0;        // L-lines found in the trace
-    long batch_samples = 0;       // P-lines found in the trace
-    long batch_samples_min = 0;   // fewest P-lines on any one layer
-};
-static LayerWindows compute_layer_windows(const std::string & sweep_path, int total_slots) {
-    static const int N_LAYERS = 40, N_EXPERTS = 256;
-    long counts[N_LAYERS][N_EXPERTS] = {};
-    long layer_lines[N_LAYERS] = {};
-    long total_lines = 0;
-    long pcounts[N_LAYERS][N_EXPERTS] = {};
-    long player_lines[N_LAYERS] = {};
-    long ptotal_lines = 0;
-    bool sweep_ok = false;
-    bool batch_ok = false;
-    if (FILE * fp = std::fopen(sweep_path.c_str(), "r")) {
-        char buf[8192];
-        while (std::fgets(buf, sizeof(buf), fp)) {
-            const bool is_decode = buf[0] == 'L';
-            const bool is_batch  = buf[0] == 'P';
-            if (!is_decode && !is_batch) continue;
-            char * p = buf + 1;
-            char * end = nullptr;
-            const long layer = std::strtol(p, &end, 10);
-            if (end == p || layer < 0 || layer >= N_LAYERS) continue;
-            const char * e = std::strstr(end, "E:");
-            if (!e) continue;
-            e += 2;
-            long (* cnt)[N_EXPERTS] = is_decode ? counts : pcounts;
-            if (is_decode) { layer_lines[layer]++; total_lines++; }
-            else           { player_lines[layer]++; ptotal_lines++; }
-            while (*e) {
-                while (*e == ' ' || *e == ',' || *e == '\t') e++;
-                if (*e == 'P' && e[1] == ':') break;
-                if (!*e || *e == '\n' || *e == '\r') break;
-                char * idend = nullptr;
-                const long id = std::strtol(e, &idend, 10);
-                if (idend == e) break;
-                if (id >= 0 && id < N_EXPERTS) cnt[layer][id]++;
-                e = idend;
-            }
-        }
-        std::fclose(fp);
-        sweep_ok = total_lines >= 400;
-        for (int l = 0; l < N_LAYERS; l++) if (layer_lines[l] == 0) sweep_ok = false;
-        batch_ok = ptotal_lines >= 400;
-        for (int l = 0; l < N_LAYERS; l++) if (player_lines[l] < LAYERWIN_BATCH_MIN_PER_LAYER) batch_ok = false;
-    }
-    std::vector<double> scores(N_LAYERS, 0.0);
-    std::string source;
-    auto saturation_scores = [&](const long cnt[N_LAYERS][N_EXPERTS]) {
-        for (int l = 0; l < N_LAYERS; l++) {
-            std::array<int, N_EXPERTS> ids;
-            for (int i = 0; i < N_EXPERTS; i++) ids[i] = i;
-            std::sort(ids.begin(), ids.end(), [&](int a, int b) {
-                return cnt[l][a] != cnt[l][b] ? cnt[l][a] > cnt[l][b] : a < b;
-            });
-            long layer_total = 0;
-            for (int i = 0; i < N_EXPERTS; i++) layer_total += cnt[l][i];
-            long covered = 0;
-            int k = 0;
-            while (k < N_EXPERTS && covered * 10 < layer_total * 9) { covered += cnt[l][ids[k]]; k++; }
-            scores[l] = (double) std::max(k, 1);
-        }
-    };
-    long batch_min = 0;
-    if (batch_ok || ptotal_lines > 0) {
-        batch_min = player_lines[0];
-        for (int l = 0; l < N_LAYERS; l++) batch_min = std::min(batch_min, player_lines[l]);
-    }
-    if (sweep_ok) {
-        saturation_scores(counts);
-        source = "sweep-mined (previous run moe_sweep.txt: " + std::to_string(total_lines) +
-                 " decode-step layer lines; per-layer 90% routing-coverage saturation proxy)";
-    } else if (batch_ok) {
-        saturation_scores(pcounts);
-        source = "sweep-mined (previous run moe_sweep.txt: only " + std::to_string(total_lines) +
-                 " decode-step layer lines - DSpark verify batches run 4 rows wide and the runtime "
-                 "records multi-row steps as prefill-format lines carrying each batch's last-token "
-                 "routing; mined " + std::to_string(ptotal_lines) + " batch samples, min " +
-                 std::to_string(batch_min) + " per layer; per-layer 90% routing-coverage "
-                 "saturation proxy)";
-    } else {
-        // Documented-curve fallback (fork header, llama-model.h):
-        // layer 0 saturates around c=200, most layers around c=96.
-        for (int l = 0; l < N_LAYERS; l++) scores[l] = l == 0 ? 200.0 : 96.0;
-        source = "documented-curve fallback (fork header llama-model.h: layer 0 saturates ~200, "
-                 "most layers ~96; no usable previous sweep trace: " + std::to_string(total_lines) +
-                 " decode-step lines, " + std::to_string(ptotal_lines) + " batch samples)";
-    }
-    std::vector<int> widths(N_LAYERS, LAYERWIN_FLOOR);
-    int remaining = total_slots - N_LAYERS * LAYERWIN_FLOOR;
-    while (remaining > 0) {
-        int best = -1;
-        double best_ratio = -1.0;
-        for (int l = 0; l < N_LAYERS; l++) {
-            if (widths[l] >= LAYERWIN_CAP) continue;
-            const double ratio = scores[l] / (double) (widths[l] + 1);
-            if (ratio > best_ratio) { best_ratio = ratio; best = l; }
-        }
-        if (best < 0) break; // every layer capped; cannot happen at these totals
-        widths[best]++;
-        remaining--;
-    }
-    LayerWindows out;
-    out.widths = widths;
-    out.source = source;
-    out.decode_lines = total_lines;
-    out.batch_samples = ptotal_lines;
-    out.batch_samples_min = batch_min;
-    for (int l = 0; l < N_LAYERS; l++) {
-        out.total += widths[l];
-        if (l) out.env += ",";
-        out.env += std::to_string(l) + ":" + std::to_string(widths[l]);
-    }
-    return out;
-}
-
 // Build 12: the runtime's own counters, recovered from its [moe-ssd]
 // log lines (the trial already captures the full llama log stream).
 // The per-ubatch flush lines carry DELTAS (miss/hit/pfhit/pfread/
@@ -1101,23 +861,18 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // (see the build 15 header note): same case, cap and watchdog,
     // generation through the speculative driver instead of the
     // greedy loop, with its own pre-load configuration below.
-    // Build 21: "quick_dspark_layerwin" is the per-layer window
-    // A/B arm: it IS the DSpark arm (every dspark-gated path below
-    // engages identically), plus the LLAMA_MOE_LAYER_WINDOWS
-    // setting computed and applied before the target model loads.
-    // Build 22: three more arms join the layerwin family.
-    // "quick_dspark_layerwin1920" is the same arm at a 1920-slot
-    // total. "quick_dspark_split" and "quick_dspark_io8" stack
-    // ONE env lever each (LLAMA_MOE_MATMUL_SPLIT=2 /
-    // LLAMA_MOE_IO_THREADS=8) on the 1600-slot layerwin
-    // configuration, so each is a one-variable A/B against the
-    // plain layerwin arm.
-    const bool dspark_layerwin     = mode == "quick_dspark_layerwin";
-    const bool dspark_layerwin1920 = mode == "quick_dspark_layerwin1920";
-    const bool dspark_split        = mode == "quick_dspark_split";
+    // Build 21: "quick_dspark_layerwin" joined as the per-layer
+    // window A/B arm; build 22 added the 1920 variant plus the
+    // matmul-split and I/O-threads arms stacked on it. Build 23
+    // removes the three non-winning arms (section 53 verdicts):
+    // per-layer windows at neither total, and matmul split,
+    // improved no stage of the pipeline. "quick_dspark_io8"
+    // stays, rebased onto the stock configuration: it is the
+    // DSpark arm (every dspark-gated path below engages
+    // identically) plus LLAMA_MOE_IO_THREADS=8, kept for its
+    // repeated prefill improvement in build 22's device runs.
     const bool dspark_io8          = mode == "quick_dspark_io8";
-    const bool layerwin_family     = dspark_layerwin || dspark_layerwin1920 || dspark_split || dspark_io8;
-    const bool dspark = mode == "quick_dspark" || layerwin_family;
+    const bool dspark = mode == "quick_dspark" || dspark_io8;
     const bool quick = mode == "quick" || lookahead_off || dspark;
     const int max_tokens = quick ? QUICK_MAX_TOKENS : MAX_NEW_TOKENS;
     auto listener_cls = env->GetObjectClass(listener);
@@ -1249,19 +1004,15 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // DSPARK_DECODE_WINDOW above); the other arms keep build 11's 16.
     const int decode_window = dspark ? DSPARK_DECODE_WINDOW : MOE_DECODE_WINDOW;
     setenv("LLAMA_MOE_DECODE_WINDOW", std::to_string(decode_window).c_str(), 1);
-    // Build 21: per-layer widths exist only in the layerwin arm
-    // (set below, from the sweep trace, still before model load);
-    // clear any stale value everywhere else so no arm can inherit
-    // a distribution it did not choose.
-    if (!layerwin_family) unsetenv("LLAMA_MOE_LAYER_WINDOWS");
-    // Build 22: the split and io8 levers exist only in their own
-    // arms. Both are read by the slot runtime (split at model
-    // load; io threads once per process, and this process exits
-    // after every run), and both default to off/4 when unset -
-    // so set or clear each one explicitly in every arm, exactly
-    // like LLAMA_MOE_LAYER_WINDOWS above.
-    if (dspark_split) setenv("LLAMA_MOE_MATMUL_SPLIT", "2", 1);
-    else              unsetenv("LLAMA_MOE_MATMUL_SPLIT");
+    // Build 23: the layer-window and matmul-split settings are
+    // gone with their arms; both variables are cleared
+    // unconditionally so no stale value can leak into any run.
+    // The io8 lever exists only in its own arm. It is read by
+    // the slot runtime once per process, and this process exits
+    // after every run, so the per-run env applies cleanly -
+    // set or clear it explicitly in every arm.
+    unsetenv("LLAMA_MOE_LAYER_WINDOWS");
+    unsetenv("LLAMA_MOE_MATMUL_SPLIT");
     if (dspark_io8)   setenv("LLAMA_MOE_IO_THREADS", "8", 1);
     else              unsetenv("LLAMA_MOE_IO_THREADS");
     // Build 12 (research 2.1): lookahead prefetch ON, depth left at
@@ -1291,8 +1042,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         setenv("LLAMA_MOE_WINDOW_MAX_ROWS", std::to_string(DSPARK_WINDOW_MAX_ROWS).c_str(), 1);
     }
     report["moeLookaheadPrefetch"] = dspark ? "off" : (lookahead_off ? "off" : "on (depth default 8)");
-    report["abArm"] = dspark_layerwin1920 ? "dspark_layerwin1920" : (dspark_split ? "dspark_split" : (dspark_io8 ? "dspark_io8" : (dspark_layerwin ? "dspark_layerwin" : (dspark ? "dspark_on" : (lookahead_off ? "lookahead_off" : "lookahead_on")))));
-    if (dspark_split) report["moeMatmulSplit"] = 2;
+    report["abArm"] = dspark_io8 ? "dspark_io8" : (dspark ? "dspark_on" : (lookahead_off ? "lookahead_off" : "lookahead_on"));
     if (dspark_io8)   report["moeIoThreads"] = 8;
     if (dspark) {
         report["dsparkDraftModel"] = std::string(DSPARK_GGUF) +
@@ -1310,54 +1060,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     const std::string sweep_path = model_dir + "/moe_sweep.txt";
     setenv("LLAMA_MOE_SWEEP", sweep_path.c_str(), 1);
     report["moeSweepTrace"] = sweep_path;
-    // Build 21: the layerwin arm's one difference from the stock
-    // DSpark arm. The widths are computed from the previous run's
-    // trace (still on disk here - the runtime truncates it only
-    // at this run's context creation) and set BEFORE the target
-    // model loads, because the fork builds the per-layer decode
-    // tensor layout from LLAMA_MOE_LAYER_WINDOWS at load time.
-    // The full vector and its source land in the report and in a
-    // progress checkpoint, so status.json and report.json from a
-    // device paste show the distribution itself, not only the
-    // runtime's per-layer-widths-on log line.
-    if (layerwin_family) {
-        const int layerwin_total = dspark_layerwin1920 ? LAYERWIN1920_TOTAL_SLOTS : LAYERWIN_TOTAL_SLOTS;
-        const LayerWindows lw = compute_layer_windows(sweep_path, layerwin_total);
-        setenv("LLAMA_MOE_LAYER_WINDOWS", lw.env.c_str(), 1);
-        const auto mm = std::minmax_element(lw.widths.begin(), lw.widths.end());
-        json widths_json = json::array();
-        for (const int w : lw.widths) widths_json.push_back(w);
-        report["moeLayerWindows"] = lw.env;
-        report["moeLayerWindowsWidths"] = widths_json;
-        report["moeLayerWindowsTotalSlots"] = lw.total;
-        report["moeLayerWindowsFloor"] = LAYERWIN_FLOOR;
-        report["moeLayerWindowsMin"] = *mm.first;
-        report["moeLayerWindowsMax"] = *mm.second;
-        report["moeLayerWindowsSource"] = lw.source;
-        // Build 22: the trace basis behind the widths, so a paste
-        // shows whether the distribution came from decode lines,
-        // from DSpark batch samples, or from neither.
-        report["moeLayerWindowsTraceDecodeLines"] = lw.decode_lines;
-        report["moeLayerWindowsTraceBatchSamples"] = lw.batch_samples;
-        report["moeLayerWindowsTraceBatchSamplesMin"] = lw.batch_samples_min;
-        emit_progress({{"stage", "layer_windows"}, {"event", "progress"},
-                       {"label", "Per-layer decode windows"},
-                       {"moeLayerWindows", lw.env},
-                       {"moeLayerWindowsTotalSlots", lw.total},
-                       {"moeLayerWindowsFloor", LAYERWIN_FLOOR},
-                       {"moeLayerWindowsMin", *mm.first},
-                       {"moeLayerWindowsMax", *mm.second},
-                       {"moeLayerWindowsSource", lw.source},
-                       {"moeLayerWindowsTraceDecodeLines", lw.decode_lines},
-                       {"moeLayerWindowsTraceBatchSamples", lw.batch_samples},
-                       {"moeLayerWindowsTraceBatchSamplesMin", lw.batch_samples_min}});
-        emit("Per-layer decode windows on: total " + std::to_string(lw.total) +
-             " slots across 40 layers, floor " + std::to_string(LAYERWIN_FLOOR) +
-             ", min " + std::to_string(*mm.first) + ", max " + std::to_string(*mm.second) +
-             "; source: " + lw.source);
-        if (dspark_split) emit("MoE matmul split on: LLAMA_MOE_MATMUL_SPLIT=2 (deferred installs overlap matmul)");
-        if (dspark_io8)   emit("MoE I/O threads: LLAMA_MOE_IO_THREADS=8 (fork default is 4)");
-    }
+    // Build 23: io8's one difference from the stock DSpark arm,
+    // announced in the run log like the other arm differences.
+    if (dspark_io8) emit("MoE I/O threads: LLAMA_MOE_IO_THREADS=8 (fork default is 4)");
+
     // Prewarm table selection. First choice: a table mined from the
     // previous run's sweep trace (this app's own routing on this
     // phone). No previous trace (or a too-thin one) falls back to the

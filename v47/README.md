@@ -475,6 +475,40 @@ then the 1920 arm against the 1600 arm, then matmul split
 and I/O threads 8 against the plain layerwin arm. A win must
 beat the ±20% single-run noise band on both pairs.
 
+## Build 23 — the prune: non-winning arms removed, io8 rebased on stock
+
+Battles directed 2026-11-05, after build 22's full device
+protocol (PHONE_TRIAL.md section 52): remove every build 22
+setting that improved no stage of the pipeline, and keep any
+setting that improved any stage, not only end-result decode
+speed. Removed: **per-layer windows** at both totals (1600 and
+1920) — neither cut installs or decode time against stock —
+and **matmul split**, whose install reduction never became
+speed anywhere and whose decode ran slowest of the session.
+Their modes, buttons, env wiring and the sweep width miner
+are gone; the stock arm's prewarm miner is untouched. Kept:
+the stock **DSpark** arm (build 22's decode winner, on the
+KleidiAI arch floor, which stays) and **I/O threads 8**, whose
+two build 22 prefills were the fastest of the session (~29%
+under stock) even though its decode showed no proven gain.
+
+One consequence to state plainly: build 22's io8 arm ran
+stacked on the 1600-slot per-layer window configuration, so
+with that configuration removed, build 23's io8 arm is the
+stock DSpark configuration plus `LLAMA_MOE_IO_THREADS=8` —
+the io8-on-stock combination, untested until a device run
+measures it. `models.json` is byte-identical again, so
+installing over build 22 needs no new download.
+
+**Device protocol for build 23:** install over build 22, do
+NOT tap Download. The mode list should now show only the
+full trial, quick, Lookahead OFF, DSpark, and DSpark I/O
+threads 8. Optional check: run **Quick decode check · DSpark
+I/O threads 8 (A/B)** twice and paste — its readings are the
+first measurement of io8 on the stock configuration (prefill
+is the number to watch; decode is judged against stock's
+2.340 tok/s build 22 mean under the ±20% band).
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub
