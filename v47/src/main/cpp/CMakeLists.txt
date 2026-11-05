@@ -21,6 +21,22 @@ set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
 if(ANDROID_ABI STREQUAL "arm64-v8a")
     set(GGML_CPU_KLEIDIAI ON CACHE BOOL "" FORCE)
     set(GGML_OPENMP ON CACHE BOOL "" FORCE)
+    # Build 22: arch floor for ggml-cpu. With GGML_NATIVE off, the
+    # fork's ggml-cpu CMake compiles the whole backend at plain
+    # armv8-a unless GGML_CPU_ARM_ARCH is set, so the compile-time
+    # feature macros the fork's KleidiAI selection reads
+    # (__ARM_FEATURE_DOTPROD / __ARM_FEATURE_MATMUL_INT8 in
+    # ggml-cpu.c) all read 0 and the loader log prints
+    # "kleidiai: no compatible q4 kernels found for CPU features
+    # mask 0" - the kernels never engage even on silicon that has
+    # the features (the Fold6's Cortex-X4/A720 do). Setting the
+    # floor to armv8.2-a+dotprod+i8mm makes this the ONLY -march
+    # flag on the ggml-cpu target (the fork appends exactly
+    # -march=${GGML_CPU_ARM_ARCH} in the non-native path).
+    # CAVEAT: the ggml-cpu objects will SIGILL on a pre-armv8.2
+    # phone. Acceptable for this single-device trial (Snapdragon
+    # 8 Gen 3 is armv9.2-class); noted in the module README.
+    set(GGML_CPU_ARM_ARCH "armv8.2-a+dotprod+i8mm" CACHE STRING "" FORCE)
 endif()
 add_subdirectory("${OMNI_ROOT}" upstream EXCLUDE_FROM_ALL)
 if(ANDROID)

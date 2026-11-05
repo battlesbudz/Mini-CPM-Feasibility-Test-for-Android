@@ -399,6 +399,82 @@ paste. In a good layerwin paste expect `abArm:
 `moeWindowMaxRowsEffective: 4`, and the runtime log's
 per-layer-widths line reading on.
 
+## Build 22 — miner fix, the 1920 probe, split and I/O arms, KleidiAI arch floor
+
+Build 22 keeps every build 21 arm and adds three, from the
+Strata/Avalon scoping plan (items 1, 3, 4 and 6). Battles
+approved 2026-11-05. The pinned fork and its patch stack are
+byte-identical to build 21; everything below is app-side.
+
+**The layerwin miner is fixed.** Build 21's device run fell
+back to the documented curves. The cause is structural in the
+fork: the slot runtime's sweep dump takes its decode branch
+only for single-row steps (`decode = n_rows == 1` in
+`llama-moe-slot.cpp`), and a DSpark verify batch is 4 rows
+wide, so a DSpark run records its decode routing as
+prefill-format `P<layer>` lines — each carrying the batch's
+last-token routed experts — and leaves ~zero `L<layer>`
+decode lines. The build 21 miner's ≥ 400 L-line trust rule
+could therefore never pass after a DSpark run.
+`compute_layer_windows()` now mines those batch samples when
+the L-line rule fails, under their own trust rule (≥ 400
+batch samples in total, ≥ 8 per layer; a 32-token quick
+DSpark run leaves ~13 per layer), and `moeLayerWindowsSource`
+states the basis, with the trace counts in the report's
+`moeLayerWindowsTrace*` fields. The prewarm miner is
+deliberately unchanged, so the stock arm's prewarm behaviour
+is identical to builds 12–21.
+
+**New arms** (all are the stock DSpark configuration — depth
+3, base window 32, 4 verify rows, lookahead off — plus the
+stated difference):
+
+- **Quick decode check · DSpark per-layer windows 1920
+  (A/B)** (`quick_dspark_layerwin1920`): the layerwin
+  distribution at a 1920-slot total instead of 1600, floor 32
+  unchanged. Probes whether window memory is still buying
+  misses at ~2.4 GiB of window residency; watch the run's
+  peak PSS.
+- **Quick decode check · DSpark matmul split (A/B)**
+  (`quick_dspark_split`): the 1600-slot layerwin
+  configuration plus `LLAMA_MOE_MATMUL_SPLIT=2` — the last 2
+  rank positions' missing experts install deferred, so their
+  flash reads overlap the matmul of resident experts. A/B
+  against the plain layerwin arm.
+- **Quick decode check · DSpark I/O threads 8 (A/B)**
+  (`quick_dspark_io8`): the 1600-slot layerwin configuration
+  plus `LLAMA_MOE_IO_THREADS=8` (fork default 4) for install
+  read parallelism. The runtime reads the value once per
+  process and the benchmark process exits after every run, so
+  the per-run setting applies cleanly; its init log line
+  prints the engaged `io_threads` value.
+
+Both env variables are explicitly unset in every other arm,
+so no stale value can leak into a baseline run.
+
+**KleidiAI arch floor.** The trial CMake now sets
+`GGML_CPU_ARM_ARCH=armv8.2-a+dotprod+i8mm` for ggml-cpu.
+Until now the backend compiled at plain armv8-a, so the
+fork's compile-time feature macros read 0 and its KleidiAI
+kernels never engaged (the loader log's "mask 0" line). The
+fork's KleidiAI covers Q4_0/Q8_0 matmuls only, so the
+expected effect is confined to the Q8_0 DSpark draft path;
+the check is the loader log printing a real kernel feature
+line instead of mask 0. **Caveat: the ggml-cpu objects will
+SIGILL on a pre-armv8.2 phone.** Fine for this trial's Fold6
+(Snapdragon 8 Gen 3); do not install this build on an older
+phone.
+
+**Device protocol for build 22:** install over build 21, do
+NOT tap Download (`models.json` is byte-identical). Run each
+A/B pair twice with the order reversed: stock DSpark vs
+per-layer windows first (in a good layerwin paste
+`moeLayerWindowsSource` now reads "sweep-mined" with the
+batch-sample basis, and `moeLayerWindowsTotalSlots: 1600`),
+then the 1920 arm against the 1600 arm, then matmul split
+and I/O threads 8 against the plain layerwin arm. A win must
+beat the ±20% single-run noise band on both pairs.
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub
