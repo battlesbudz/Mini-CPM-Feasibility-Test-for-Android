@@ -575,6 +575,59 @@ Battles's any-stage criterion. Case-3 flattery warning for
 pass proves the mechanism under the kindest conditions; a
 pin fail kills 2a outright.
 
+## Build 25 — the LFU scan fix (build 24's LFU crash)
+
+Build 24's device protocol died on its third arm: **DSpark LFU
+admission** engaged correctly and finished prefill, then aborted
+on the first DSpark verify step with the slot runtime's own
+guard, "layer 18 requires more than 32 unique experts in one
+graph". Stock and pin ran the same graph fine, so the defect was
+in the LFU allocation path, and the shipped patch text shows the
+two departures from stock that could strand an install on a
+graph that fits the 32-slot window:
+
+- A probationary install arriving when the probationary quota
+  (2/layer) was already full **skipped the free-slot scan** and
+  went straight to victim selection — so free slots could sit
+  unused while the victim scan found nobody it was allowed to
+  evict (every resident protected by the graph's own demand set)
+  and the guard fired.
+- The policy victim scan's passes were **all class-filtered**,
+  with no final class-blind fallback, so it could return no
+  victim while a non-requested resident existed.
+
+The fix, confined to `v47/patches/moe-slot-admission.patch`
+(no app code changes): probationary installs **never skip the
+free-slot scan** — free slots are tried first, exactly like
+stock, and the quota is enforced by the victim scan's class
+preference once the window is actually full; and the policy
+victim scan gains a **final class-blind LRU fallback pass**
+that picks the plain-LRU resident excluding only the graph's
+own `requested[]` set (and pending prefetch slots), regardless
+of probationary/general class. Together these restore stock's
+fit guarantee: any graph whose unique experts per layer are
+≤ the window always places, and the guard fires only when a
+graph genuinely exceeds the window. Everything else about the
+LFU contract is unchanged — probationary quota 2 of 32 as the
+steady state, promotion on re-demand while resident, demand
+counters with halving aging, pin behavior, and the combined
+pin + LFU arm through the same fixed path. With both flags off
+the path is still the original stock scan verbatim, so the
+flags-off counter regression check from build 24 must still
+reproduce exactly. `models.json` is byte-identical again, so
+installing over build 24 needs no new download.
+
+**Device protocol for build 25:** install over build 24, do
+NOT tap Download. The build 24 protocol resumes where it
+stopped: **DSpark** control run 2 (also re-proves the flags-off
+regression check on the fixed patch), **DSpark pin prewarm**
+run 2, then the **DSpark LFU admission** pair — run 1 is the
+crash retest, and merely surviving the first verify step is the
+fix's first proof; a full 32-token decode with token IDs
+matching the control exactly is the fix's pass. Then **DSpark
+pin + LFU**, two runs, which rides the same fixed LFU path.
+Pass bars are build 24's, unchanged.
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub

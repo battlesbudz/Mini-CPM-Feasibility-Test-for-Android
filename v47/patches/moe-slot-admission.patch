@@ -38,6 +38,24 @@ Two policies, both env-gated and both default OFF:
     again is promoted to general. Prewarm- and prefetch-published
     residents start as general.
 
+  LFU crash fix (trial build 25, after build 24's LFU arm aborted on
+  its first verify step with "layer 18 requires more than 32 unique
+  experts in one graph"): two departures from stock could strand an
+  install on a graph that fits the window, and both are removed.
+  (a) A probationary install whose class quota was already full used
+  to skip the free-slot scan and go straight to victim selection;
+  installs now always scan free slots first, exactly like stock, and
+  the quota is enforced by the victim scan's class preference once
+  the window is actually full. (b) Every pass of the policy victim
+  scan was class-filtered, so it could return no victim while a
+  non-requested resident existed; the scan now ends with a final
+  class-blind pass that picks the plain-LRU resident, excluding only
+  this call's requested[] set and pending slots, exactly stock's
+  last resort. Together these restore stock's fit guarantee: any
+  graph whose unique experts per layer fit the window always
+  places, and the guard fires only when a graph genuinely exceeds
+  the window. Nothing else about the policies changes.
+
 With both flags off, process() runs the original free-slot scan and
 the original two-pass LRU eviction verbatim (the policy code is
 branched around, not woven through), and the patched runtime must
@@ -49,11 +67,12 @@ the two patches touch disjoint regions of this file (that patch adds
 lookahead-accuracy telemetry around the prediction block; this one
 works around the allocation loop), and either order applies cleanly.
 
+
 diff --git a/src/llama-moe-slot.cpp b/src/llama-moe-slot.cpp
-index 28c7666..f431320 100644
+index 3a9af1d..4dc9304 100644
 --- a/src/llama-moe-slot.cpp
 +++ b/src/llama-moe-slot.cpp
-@@ -509,6 +509,10 @@ struct llama_moe_slot_runtime::impl {
+@@ -527,6 +527,10 @@ struct llama_moe_slot_runtime::impl {
          std::vector<int32_t> slot_to_expert;
          std::vector<int32_t> expert_to_slot;
          std::vector<uint64_t> slot_age;
@@ -64,7 +83,7 @@ index 28c7666..f431320 100644
          uint64_t age = 0;
          std::mutex mutex;
      };
-@@ -775,6 +779,7 @@ struct llama_moe_slot_runtime::impl {
+@@ -793,6 +797,7 @@ struct llama_moe_slot_runtime::impl {
          }
          sweep_init();
          prewarm_init();
@@ -72,7 +91,7 @@ index 28c7666..f431320 100644
      }
  
      /// 预读专用：把一个 expert 读进**目标层自己的窗口**（按窗口 LRU 挑 slot）。
-@@ -797,6 +802,9 @@ struct llama_moe_slot_runtime::impl {
+@@ -815,6 +820,9 @@ struct llama_moe_slot_runtime::impl {
          }
          // expert_to_slot 不能整体清：pending 的专家此时还没登记，所以直接全清是安全的。
          std::fill(st.expert_to_slot.begin(), st.expert_to_slot.end(), kSlotFree);
@@ -82,7 +101,7 @@ index 28c7666..f431320 100644
      }
  
      /// 预读：把一个预测专家读进**目标层自己的窗口**，与缓存共用同一片 slot 池。
-@@ -874,6 +882,9 @@ struct llama_moe_slot_runtime::impl {
+@@ -892,6 +900,9 @@ struct llama_moe_slot_runtime::impl {
          st.slot_to_expert[(size_t) slot] = expert;
          st.expert_to_slot[(size_t) expert] = slot;
          st.slot_age[(size_t) slot] = ++st.age;
@@ -92,7 +111,7 @@ index 28c7666..f431320 100644
          st.n_prefetch_published++;
          return true;
      }
-@@ -1062,6 +1073,9 @@ struct llama_moe_slot_runtime::impl {
+@@ -1080,6 +1091,9 @@ struct llama_moe_slot_runtime::impl {
                      st.slot_to_expert[(size_t) p.slot] = p.expert;
                      st.expert_to_slot[(size_t) p.expert] = p.slot;
                      st.slot_age[(size_t) p.slot] = ++st.age;
@@ -102,7 +121,7 @@ index 28c7666..f431320 100644
                  }
              };
              if ((int) p.layer == cur_layer) {
-@@ -1970,6 +1984,70 @@ struct llama_moe_slot_runtime::impl {
+@@ -1988,6 +2002,70 @@ struct llama_moe_slot_runtime::impl {
      /// park（每轮结束）也会清掉 —— 下一轮必须重新 prewarm_experts()。
      bool prewarm_ready = false;
  
@@ -173,7 +192,7 @@ index 28c7666..f431320 100644
      void prewarm_init() {
          const char * path = std::getenv("LLAMA_MOE_PREWARM");
          if (!path || !*path) {
-@@ -2416,7 +2494,16 @@ void llama_moe_slot_runtime::process(
+@@ -2434,7 +2512,16 @@ void llama_moe_slot_runtime::process(
          if (experts[i] < 0 || experts[i] >= pimpl->n_expert) {
              throw std::runtime_error("MoE expert id is out of range");
          }
@@ -191,7 +210,7 @@ index 28c7666..f431320 100644
      }
  
      if (pimpl->lookahead.enabled && !decode) {
-@@ -2507,21 +2594,66 @@ void llama_moe_slot_runtime::process(
+@@ -2552,21 +2639,67 @@ void llama_moe_slot_runtime::process(
      const int32_t split_at   = n_used_row - pimpl->matmul_split;
      const bool defer_by_rank = window_mode && pimpl->matmul_split > 0 && split_at > 0;
  
@@ -207,7 +226,10 @@ index 28c7666..f431320 100644
 +    const bool policy_on = pin_active || lfu_active;
 +    // LFU 试用段配额（每层窗口内）：试用类别的驻留数不超过它（压力下
 +    // 例外见淘汰扫描的注释 —— 安装从不被拒绝，配额只是常态上限）。
-+    constexpr int32_t kProbationSlots = 2;
++    // build 25 修复后配额不再有单独的执行点：空位扫描恢复无条件先行
++    // （见 process() 的安装处），配额由淘汰扫描的类别偏好在窗口满时
++    // 维持为常态上限；此常量保留为该上限的命名文档值。
++    [[maybe_unused]] constexpr int32_t kProbationSlots = 2;
 +
      for (size_t pos = 0; pos < count; ++pos) {
          const int32_t expert = experts[pos];
@@ -221,49 +243,43 @@ index 28c7666..f431320 100644
          }
  
          int32_t slot = -1;
--        for (int32_t candidate = alloc_lo; candidate < alloc_hi; ++candidate) {
--            if (state.slot_to_expert[candidate] == kSlotFree) {
--                slot = candidate;
--                break;
 +        // LFU（trial item 2）：先给本次安装定类别。计数严格高过窗口里
 +        // 最弱的正式驻留者 → 直接正式；否则试用。窗口里还没有正式驻留
-+        // 者时一律正式（冷启动不该把第一批条目全挤进试用位）。试用配额
-+        // 已满时跳过空位扫描 —— 不能让试用条目借空闲的正式位无限长大，
-+        // 直接去淘汰扫描里换一个试用位出来。
++        // 者时一律正式（冷启动不该把第一批条目全挤进试用位）。
++        // 空位扫描永远先行，与原版一致（build 25 修复）：早期版本在试用
++        // 配额已满时跳过空位扫描、直接去淘汰，而当窗口里的驻留者恰好全
++        // 部是本步请求集时淘汰扫描无处下手，安装被困死、触发「一图唯一
++        // 专家数超窗」守卫 —— 哪怕图本身完全装得下。试用配额由淘汰扫描
++        // 的类别偏好维持（窗口真满时试用装入优先换出试用驻留，见下面的
++        // kProbationSlots 说明），不需要也不允许靠绕过空位来执行。
 +        bool install_probation = false;
-+        bool skip_free_scan = false;
 +        if (lfu_active) {
 +            uint32_t weakest = UINT32_MAX;
-+            int32_t n_prob = 0;
 +            for (int32_t cand = alloc_lo; cand < alloc_hi; ++cand) {
 +                const int32_t res = state.slot_to_expert[(size_t) cand];
 +                if (res < 0) {
 +                    continue;
 +                }
-+                if (state.slot_prob[(size_t) cand]) {
-+                    n_prob++;
-+                } else if (pimpl->demand_count[(size_t) layer][(size_t) res] < weakest) {
++                if (!state.slot_prob[(size_t) cand] &&
++                    pimpl->demand_count[(size_t) layer][(size_t) res] < weakest) {
 +                    weakest = pimpl->demand_count[(size_t) layer][(size_t) res];
 +                }
-             }
++            }
 +            install_probation = weakest != UINT32_MAX &&
 +                pimpl->demand_count[(size_t) layer][(size_t) expert] <= weakest;
-+            skip_free_scan = install_probation && n_prob >= kProbationSlots;
++        }
+         for (int32_t candidate = alloc_lo; candidate < alloc_hi; ++candidate) {
+             if (state.slot_to_expert[candidate] == kSlotFree) {
+                 slot = candidate;
+                 break;
+             }
          }
 -        if (slot < 0) {
-+        if (!skip_free_scan) {
-+            for (int32_t candidate = alloc_lo; candidate < alloc_hi; ++candidate) {
-+                if (state.slot_to_expert[candidate] == kSlotFree) {
-+                    slot = candidate;
-+                    break;
-+                }
-+            }
-+        }
 +        if (slot < 0 && !policy_on) {
              // 淘汰时跳过 kSlotPending：那是预读 worker 正在写的 slot，
              // 动它会让 worker 把内容写到一个已经属于别人的位置。
              //
-@@ -2553,11 +2685,70 @@ void llama_moe_slot_runtime::process(
+@@ -2598,11 +2731,78 @@ void llama_moe_slot_runtime::process(
                  }
              }
          }
@@ -273,13 +289,21 @@ index 28c7666..f431320 100644
 +            //   轮次 0：跳过 keep[]（预测下一步要用）+ 跳过 pin 保护条目；
 +            //   轮次 1：只跳过 pin 保护条目；
 +            //   轮次 2（仅 pin）：保护也放宽，全候选兜底 —— 安装从不拒绝。
++            //   最后一轮（仅 LFU，build 25 修复）：类别盲选兜底 —— 不分
++            //   试用/正式、不看计数，只按 age 取最老，只排除本步请求集
++            //   与 kSlotPending，与原版最后一轮同规。前面的轮次全是类别
++            //   过滤的，极端情况下（非请求驻留者恰好全被类别过滤挡住）
++            //   可能一个受害者都挑不出来、把装得下的图误报成超窗；有了
++            //   这一轮，只要窗口里还有非请求的驻留者就必然有受害者，
++            //   「唯一专家数 ≤ 窗口必然装得下」恢复为原版的保证。
 +            // 段内顺序：本次装试用 → 先试用段（按 age 最老）；装正式 →
 +            // 先正式段（计数最低，同计数按 age 最老）。一段挑不出来
 +            // （全被本步请求占着）就退到另一段，所以试用配额是常态
 +            // 上限、不是硬墙。pin-only 时没有类别之分，只走一遍全
 +            // 范围、按 age 最老，与 LRU 同序。
-+            const int n_pass = pin_active ? 3 : 2;
++            const int n_pass = (pin_active ? 3 : 2) + (lfu_active ? 1 : 0);
 +            for (int pass = 0; pass < n_pass && slot < 0; ++pass) {
++                const bool blind = lfu_active && pass == n_pass - 1;
 +                const bool skip_keep = pass == 0;
 +                const bool skip_pin  = pass < 2;
 +                for (int seg = 0; seg < 2 && slot < 0; ++seg) {
@@ -306,10 +330,10 @@ index 28c7666..f431320 100644
 +                        }
 +                        const bool is_prob = lfu_active &&
 +                                             state.slot_prob[(size_t) cand] != 0;
-+                        if (lfu_active && is_prob != want_prob) {
++                        if (lfu_active && !blind && is_prob != want_prob) {
 +                            continue;
 +                        }
-+                        const uint32_t cnt = (lfu_active && !want_prob)
++                        const uint32_t cnt = (lfu_active && !want_prob && !blind)
 +                            ? pimpl->demand_count[(size_t) layer][(size_t) res] : 0;
 +                        const uint64_t age = state.slot_age[(size_t) cand];
 +                        if (cnt < best_cnt || (cnt == best_cnt && age < best_age)) {
