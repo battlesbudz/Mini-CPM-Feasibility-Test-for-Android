@@ -214,6 +214,29 @@
 // changes in this build - the patch stack and prepare_v47.py
 // are byte-identical.
 //
+// Build 24 (this build) tests the ranking plan's item 2,
+// frequency-aware admission, the highest-risk item build 22
+// deliberately sequenced out (ITEM2_SCOPE.md). It adds three
+// arms on top of the unchanged stock DSpark configuration
+// (depth 3, KleidiAI floor, uniform 32-slot windows, bank
+// 1024, I/O threads at the fork default of 4): quick_dspark_pin
+// sets LLAMA_MOE_PIN_PREWARM (the prewarm table's experts are
+// eviction-protected), quick_dspark_lfu sets
+// LLAMA_MOE_LFU_ADMIT (probationary admission: a miss lands in
+// a 2-of-32-slot probationary segment unless its demand count
+// beats the weakest general resident), and
+// quick_dspark_pinlfu sets both. The policies live in a new
+// fork patch, v47/patches/moe-slot-admission.patch, touching
+// only llama-moe-slot.cpp victim selection and install
+// bookkeeping - a miss always installs and always computes, so
+// no policy can change any math, and greedy token IDs must
+// match the stock arm exactly (the scope's hard gate).
+// prepare_v47.py now applies a patch list and its byte-exact
+// integrity check covers the union of both patches' files.
+// io8 is deliberately not crossed with either policy: one new
+// variable per verdict. Both env vars are set or unset in
+// every mode below, so nothing leaks between runs.
+//
 // Configuration mirrors the vendor demo defaults for this fork
 // (OpenBMB MiniCPM-V-demo-Android): 4 threads, 4096-token context,
 // image_max_slice_nums 9. Sampling is greedy (temperature 0) to match the
@@ -871,8 +894,18 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // DSpark arm (every dspark-gated path below engages
     // identically) plus LLAMA_MOE_IO_THREADS=8, kept for its
     // repeated prefill improvement in build 22's device runs.
+    // Build 24: the item-2 admission arms join here. Each is the
+    // DSpark arm (every dspark-gated path below engages
+    // identically) plus its policy env var(s), wired below:
+    // "quick_dspark_pin" sets LLAMA_MOE_PIN_PREWARM,
+    // "quick_dspark_lfu" sets LLAMA_MOE_LFU_ADMIT, and
+    // "quick_dspark_pinlfu" sets both.
     const bool dspark_io8          = mode == "quick_dspark_io8";
-    const bool dspark = mode == "quick_dspark" || dspark_io8;
+    const bool dspark_pin          = mode == "quick_dspark_pin";
+    const bool dspark_lfu          = mode == "quick_dspark_lfu";
+    const bool dspark_pinlfu       = mode == "quick_dspark_pinlfu";
+    const bool dspark = mode == "quick_dspark" || dspark_io8 ||
+                        dspark_pin || dspark_lfu || dspark_pinlfu;
     const bool quick = mode == "quick" || lookahead_off || dspark;
     const int max_tokens = quick ? QUICK_MAX_TOKENS : MAX_NEW_TOKENS;
     auto listener_cls = env->GetObjectClass(listener);
@@ -947,7 +980,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         {"profile", "minicpm-v47-phone-trial-v1"},
         {"runtime", "llama.cpp-omni (tc-mb fork, LES / MoE-SSD)"},
         {"runtimeCommit", RUNTIME_COMMIT},
-        {"runtimePatch", "v47/patches/ggml-cpu-alloc-only-buft.patch (CPU alloc-only buft + llama-model.cpp loader fix; build 13 adds lookahead-accuracy telemetry counters in llama-moe-slot.cpp)"},
+        {"runtimePatch", "v47/patches/ggml-cpu-alloc-only-buft.patch (CPU alloc-only buft + llama-model.cpp loader fix; build 13 adds lookahead-accuracy telemetry counters in llama-moe-slot.cpp) + v47/patches/moe-slot-admission.patch (build 24: item-2 admission policies in llama-moe-slot.cpp - LLAMA_MOE_PIN_PREWARM / LLAMA_MOE_LFU_ADMIT, both env-gated and default off)"},
         {"modelRepo", "tc-mb/MiniCPM-V-Apps-gguf"},
         {"modelRevision", "8716e5209f308fd53f197ccd7d50c6fdcc2dc37d"},
         {"modelFiles", "main -les gguf + mmproj f16 + experts/ (40 shards + manifest.json)"},
@@ -1015,6 +1048,15 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     unsetenv("LLAMA_MOE_MATMUL_SPLIT");
     if (dspark_io8)   setenv("LLAMA_MOE_IO_THREADS", "8", 1);
     else              unsetenv("LLAMA_MOE_IO_THREADS");
+    // Build 24: the item-2 admission policies live only in their
+    // own arms. Both variables are read by the slot runtime once
+    // at init, and this process exits after every run, so the
+    // per-run env applies cleanly - set or clear both explicitly
+    // in every arm so nothing leaks between runs.
+    if (dspark_pin || dspark_pinlfu) setenv("LLAMA_MOE_PIN_PREWARM", "1", 1);
+    else                             unsetenv("LLAMA_MOE_PIN_PREWARM");
+    if (dspark_lfu || dspark_pinlfu) setenv("LLAMA_MOE_LFU_ADMIT", "1", 1);
+    else                             unsetenv("LLAMA_MOE_LFU_ADMIT");
     // Build 12 (research 2.1): lookahead prefetch ON, depth left at
     // the fork default of 8. The runtime predicts the next layer's
     // routing from the current hidden state and pre-reads those
@@ -1042,8 +1084,17 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         setenv("LLAMA_MOE_WINDOW_MAX_ROWS", std::to_string(DSPARK_WINDOW_MAX_ROWS).c_str(), 1);
     }
     report["moeLookaheadPrefetch"] = dspark ? "off" : (lookahead_off ? "off" : "on (depth default 8)");
-    report["abArm"] = dspark_io8 ? "dspark_io8" : (dspark ? "dspark_on" : (lookahead_off ? "lookahead_off" : "lookahead_on"));
+    report["abArm"] = dspark_pinlfu ? "dspark_pinlfu" : (dspark_pin ? "dspark_pin" : (dspark_lfu ? "dspark_lfu" : (dspark_io8 ? "dspark_io8" : (dspark ? "dspark_on" : (lookahead_off ? "lookahead_off" : "lookahead_on")))));
     if (dspark_io8)   report["moeIoThreads"] = 8;
+    if (dspark) {
+        // Build 24: name both admission flags in every DSpark
+        // arm's report, control included, so a device paste
+        // proves which policies were live for that run. (Older
+        // non-DSpark reports predate the fields; the service's
+        // partial report carries the same fields for every arm.)
+        report["moePinPrewarm"] = (dspark_pin || dspark_pinlfu) ? "on" : "off";
+        report["moeLfuAdmit"]   = (dspark_lfu || dspark_pinlfu) ? "on" : "off";
+    }
     if (dspark) {
         report["dsparkDraftModel"] = std::string(DSPARK_GGUF) +
             " (openbmb/MiniCPM-V-4.7-35B-A3B-DSpark-gguf @ 2c8f6931e5fba8a01bcc74b2964f330c62056b5e)";
@@ -1063,6 +1114,9 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // Build 23: io8's one difference from the stock DSpark arm,
     // announced in the run log like the other arm differences.
     if (dspark_io8) emit("MoE I/O threads: LLAMA_MOE_IO_THREADS=8 (fork default is 4)");
+    // Build 24: the admission arms' differences, same style.
+    if (dspark_pin || dspark_pinlfu) emit("MoE admission: LLAMA_MOE_PIN_PREWARM=1 (prewarm experts eviction-protected)");
+    if (dspark_lfu || dspark_pinlfu) emit("MoE admission: LLAMA_MOE_LFU_ADMIT=1 (probationary LFU admission)");
 
     // Prewarm table selection. First choice: a table mined from the
     // previous run's sweep trace (this app's own routing on this

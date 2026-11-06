@@ -11,12 +11,23 @@ a telemetry-only lookahead-accuracy counter in the slot runtime; see
 the patch header for why) live in v47/patches/ and are applied mechanically
 below, after the pin is checked out. Any other local changes to the
 checkout are refused, exactly as before.
+
+Build 24 adds a second patch to the list: the item-2 frequency-aware
+admission policies in the slot runtime (pin the prewarm set; LFU
+admission with a probationary segment), env-gated and default off; see
+moe-slot-admission.patch's own header. It touches only
+src/llama-moe-slot.cpp, in regions disjoint from the first patch's
+hunks there, and the integrity check below covers the union of both
+patches' files byte-exactly, exactly as it covered the one patch.
 """
 import pathlib, shutil, subprocess, tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PIN = "96bbf61710d44421ea54e63f5194f9b17c20d877"
 dest = ROOT / "vendor/llama.cpp-omni-v47"
-PATCH = ROOT / "v47/patches/ggml-cpu-alloc-only-buft.patch"
+PATCHES = [
+    ROOT / "v47/patches/ggml-cpu-alloc-only-buft.patch",
+    ROOT / "v47/patches/moe-slot-admission.patch",
+]
 PATCHED_FILES = [
     "ggml/include/ggml-backend.h",
     "ggml/src/ggml-backend.cpp",
@@ -32,8 +43,8 @@ def dirty_paths():
     out = subprocess.check_output(["git", "-C", str(dest), "status", "--porcelain"], text=True)
     return {line[3:] for line in out.splitlines() if line}
 def patch_is_applied():
-    # True iff the working tree differs from HEAD by exactly our patch.
-    # Byte-exact: rebuild HEAD + patch in a scratch dir and compare, so an
+    # True iff the working tree differs from HEAD by exactly our patches.
+    # Byte-exact: rebuild HEAD + patches in a scratch dir and compare, so an
     # unrelated edit anywhere in the touched files (even outside the patch
     # hunks) is still treated as foreign and refused, never silently reset.
     if dirty_paths() != set(PATCHED_FILES):
@@ -44,8 +55,9 @@ def patch_is_applied():
             scratch = pathlib.Path(td, rel)
             scratch.parent.mkdir(parents=True, exist_ok=True)
             scratch.write_bytes(blob)
-        if subprocess.run(["git", "apply", str(PATCH)], cwd=td).returncode != 0:
-            return False
+        for patch in PATCHES:
+            if subprocess.run(["git", "apply", str(patch)], cwd=td).returncode != 0:
+                return False
         return all(pathlib.Path(td, rel).read_bytes() == (dest / rel).read_bytes()
                    for rel in PATCHED_FILES)
 if not dest.exists():
@@ -59,8 +71,10 @@ if dirty_paths():
     run("-C", str(dest), "checkout", "--", *PATCHED_FILES)
 subprocess.run(["git", "-C", str(dest), "checkout", "--detach", PIN], check=True)
 assert git("-C", str(dest), "rev-parse", "HEAD") == PIN
-run("-C", str(dest), "apply", str(PATCH))
+for patch in PATCHES:
+    run("-C", str(dest), "apply", str(patch))
 assets = ROOT / "v47/src/main/assets"
 assets.mkdir(parents=True, exist_ok=True)
 shutil.copyfile(dest / "LICENSE", assets / "NATIVE_LICENSE.txt")
-print("Prepared MiniCPM-V 4.7 native runtime", PIN, "+ patch", PATCH.name)
+print("Prepared MiniCPM-V 4.7 native runtime", PIN, "+ patches",
+      ", ".join(p.name for p in PATCHES))

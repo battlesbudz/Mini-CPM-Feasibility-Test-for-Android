@@ -1,0 +1,336 @@
+Trial patch (item 2): frequency-aware admission for the MoE slot runtime —
+pin the prewarm set, and LFU admission with a probationary segment.
+
+Everything here is confined to src/llama-moe-slot.cpp, and inside it to
+victim selection and install bookkeeping in process() plus the state
+those need. No math, no graph code, no read path changes: the policy
+decides only which experts are resident, never what is computed, so
+greedy output is bit-identical with the policies on or off (the trial
+checks this on device via token-id equality across arms).
+
+Two policies, both env-gated and both default OFF:
+
+  LLAMA_MOE_PIN_PREWARM=1 (2a)
+    The prewarm table's experts become eviction-protected in process()'s
+    victim scan (a keep[]-style skip in the policy scan's early passes).
+    If every candidate in a layer's window is protected, the last pass
+    falls back to plain LRU across all candidates — an install is never
+    refused. The protected set is exactly the prewarm table (16 experts
+    per layer in the trial's tables), built from prewarm_table at init;
+    with no table the policy is a no-op.
+
+  LLAMA_MOE_LFU_ADMIT=1 (2b)
+    One demand counter per (layer, expert), incremented once per unique
+    expert per window-mode process() call (demand-set semantics: a
+    4-row DSpark verify batch counts its union once, not per row), and
+    aged by halving all counters every 1,024 demand events.
+    A miss always installs and always computes — LES has no second
+    resident copy of an expert to compute from, so Avalon's literal
+    "install only if the count beats the victim" cannot refuse here.
+    Instead the install lands in a probationary class (quota: 2 slots
+    per layer window) unless the missed expert's counter strictly
+    beats the weakest general resident's counter, in which case it
+    installs as a general resident directly. Victim selection prefers
+    the probationary class (oldest first), then general residents by
+    lowest counter (LRU breaks ties); a segment that yields no victim
+    (all requested this call) falls through to the other, so the quota
+    is a steady-state cap, not a wall. A probationary resident demanded
+    again is promoted to general. Prewarm- and prefetch-published
+    residents start as general.
+
+With both flags off, process() runs the original free-slot scan and
+the original two-pass LRU eviction verbatim (the policy code is
+branched around, not woven through), and the patched runtime must
+reproduce the unpatched counters exactly — that is the trial's
+device-side regression check for this patch.
+
+Applied by scripts/prepare_v47.py AFTER ggml-cpu-alloc-only-buft.patch;
+the two patches touch disjoint regions of this file (that patch adds
+lookahead-accuracy telemetry around the prediction block; this one
+works around the allocation loop), and either order applies cleanly.
+
+diff --git a/src/llama-moe-slot.cpp b/src/llama-moe-slot.cpp
+index 28c7666..f431320 100644
+--- a/src/llama-moe-slot.cpp
++++ b/src/llama-moe-slot.cpp
+@@ -509,6 +509,10 @@ struct llama_moe_slot_runtime::impl {
+         std::vector<int32_t> slot_to_expert;
+         std::vector<int32_t> expert_to_slot;
+         std::vector<uint64_t> slot_age;
++        /// LFU 准入（LLAMA_MOE_LFU_ADMIT，trial item 2）下本 slot 的类别：
++        /// 1 = 试用（probation），0 = 正式驻留。与 slot_to_expert 平行；
++        /// 仅在策略打开时分配，未分配（空）即策略关闭，任何路径都不读它。
++        std::vector<uint8_t> slot_prob;
+         uint64_t age = 0;
+         std::mutex mutex;
+     };
+@@ -775,6 +779,7 @@ struct llama_moe_slot_runtime::impl {
+         }
+         sweep_init();
+         prewarm_init();
++        admission_init();
+     }
+ 
+     /// 预读专用：把一个 expert 读进**目标层自己的窗口**（按窗口 LRU 挑 slot）。
+@@ -797,6 +802,9 @@ struct llama_moe_slot_runtime::impl {
+         }
+         // expert_to_slot 不能整体清：pending 的专家此时还没登记，所以直接全清是安全的。
+         std::fill(st.expert_to_slot.begin(), st.expert_to_slot.end(), kSlotFree);
++        // LFU 类别随缓存一起清：新窗口里落位时再标。策略关闭时 slot_prob
++        // 是空 vector，这行是 no-op。
++        std::fill(st.slot_prob.begin(), st.slot_prob.end(), 0);
+     }
+ 
+     /// 预读：把一个预测专家读进**目标层自己的窗口**，与缓存共用同一片 slot 池。
+@@ -874,6 +882,9 @@ struct llama_moe_slot_runtime::impl {
+         st.slot_to_expert[(size_t) slot] = expert;
+         st.expert_to_slot[(size_t) expert] = slot;
+         st.slot_age[(size_t) slot] = ++st.age;
++        if (!st.slot_prob.empty()) {
++            st.slot_prob[(size_t) slot] = 0;   // 发布进窗口的条目算正式驻留
++        }
+         st.n_prefetch_published++;
+         return true;
+     }
+@@ -1062,6 +1073,9 @@ struct llama_moe_slot_runtime::impl {
+                     st.slot_to_expert[(size_t) p.slot] = p.expert;
+                     st.expert_to_slot[(size_t) p.expert] = p.slot;
+                     st.slot_age[(size_t) p.slot] = ++st.age;
++                    if (!st.slot_prob.empty()) {
++                        st.slot_prob[(size_t) p.slot] = 0;   // 预热条目算正式驻留
++                    }
+                 }
+             };
+             if ((int) p.layer == cur_layer) {
+@@ -1970,6 +1984,70 @@ struct llama_moe_slot_runtime::impl {
+     /// park（每轮结束）也会清掉 —— 下一轮必须重新 prewarm_experts()。
+     bool prewarm_ready = false;
+ 
++    // ── 淘汰策略（trial item 2，频率感知准入）────────────────────────────
++    // LLAMA_MOE_PIN_PREWARM=1：预热表里的专家在 process() 的淘汰扫描里受
++    // 保护（keep[] 式的跳过）；若一层窗口里所有候选都受保护，退回普通
++    // LRU 兜底 —— 安装从不被拒绝。保护集就是预热表本身（每层 16 个）。
++    // LLAMA_MOE_LFU_ADMIT=1：按 (层, 专家) 需求计数做频率准入。新装专家
++    // 先落「试用」类别，除非其计数高过窗口里最弱的正式驻留者；试用段
++    // （每层 2 个 slot 的配额）优先被淘汰，试用期内被再次需求即升格为
++    // 正式。计数每 1024 次需求事件整体减半（老化），免得旧热度锁死缓存。
++    // 与 Avalon 的字面规则（计数不够就不装）不同：LES 没有第二份驻留
++    // 副本可算，被拒绝的专家无处计算，所以这里装总是发生，只是落位
++    // 类别不同 —— 策略只决定谁住哪儿，永不改变任何计算与输出。
++    // 两者默认关闭；都关时 process() 的分配路径与未打补丁前完全一致。
++    bool pin_prewarm = false;
++    bool lfu_admit = false;
++    std::vector<std::vector<uint8_t>>  prewarm_member;  // [层][专家] 是否在预热表里
++    std::vector<std::vector<uint32_t>> demand_count;    // [层][专家] 需求计数
++    uint64_t demand_events = 0;                         // 全局需求事件数（老化节拍）
++
++    /// 记一次需求（窗口模式下、每层每步每个专家最多一次）。满 1024 次
++    /// 事件把全部计数减半。
++    void note_demand(int layer, int32_t expert) {
++        demand_count[(size_t) layer][(size_t) expert]++;
++        if (++demand_events % 1024 == 0) {
++            for (auto & per_layer : demand_count) {
++                for (auto & c : per_layer) {
++                    c >>= 1;
++                }
++            }
++        }
++    }
++
++    /// 读策略开关并建表。在 prewarm_init() 之后调用（成员表来自预热表）。
++    void admission_init() {
++        const char * pin = std::getenv("LLAMA_MOE_PIN_PREWARM");
++        pin_prewarm = pin && *pin && *pin != '0';
++        const char * lfu = std::getenv("LLAMA_MOE_LFU_ADMIT");
++        lfu_admit = lfu && *lfu && *lfu != '0';
++        if (!pin_prewarm && !lfu_admit) {
++            return;
++        }
++        if (pin_prewarm) {
++            prewarm_member.assign(layers.size(), {});
++            for (size_t il = 0; il < layers.size() && il < prewarm_table.size(); ++il) {
++                prewarm_member[il].assign((size_t) n_expert, 0);
++                for (int32_t e : prewarm_table[il]) {
++                    if (e >= 0 && e < n_expert) {
++                        prewarm_member[il][(size_t) e] = 1;
++                    }
++                }
++            }
++        }
++        if (lfu_admit) {
++            demand_count.assign(layers.size(),
++                                std::vector<uint32_t>((size_t) n_expert, 0));
++            for (auto & st : layers) {
++                if (st.enabled) {
++                    st.slot_prob.assign(st.slot_to_expert.size(), 0);
++                }
++            }
++        }
++        moe_log("admission: pin_prewarm=%s lfu_admit=%s (trial item 2)",
++                pin_prewarm ? "on" : "off", lfu_admit ? "on" : "off");
++    }
++
+     void prewarm_init() {
+         const char * path = std::getenv("LLAMA_MOE_PREWARM");
+         if (!path || !*path) {
+@@ -2416,7 +2494,16 @@ void llama_moe_slot_runtime::process(
+         if (experts[i] < 0 || experts[i] >= pimpl->n_expert) {
+             throw std::runtime_error("MoE expert id is out of range");
+         }
+-        requested[experts[i]] = 1;
++        if (!requested[experts[i]]) {
++            requested[experts[i]] = 1;
++            // LFU 需求计数（trial item 2）：需求集语义 —— 窗口模式下每层
++            // 每步每个专家最多记一次，不按位置数（投机验证的 4 行是同一个
++            // 需求集，不该把同一专家记 4 次）。纯计数，不影响本步任何决策
++            // 之外的行为；计数本身只被后面的淘汰扫描读。
++            if (window_mode && pimpl->lfu_admit) {
++                pimpl->note_demand(layer, experts[i]);
++            }
++        }
+     }
+ 
+     if (pimpl->lookahead.enabled && !decode) {
+@@ -2507,21 +2594,66 @@ void llama_moe_slot_runtime::process(
+     const int32_t split_at   = n_used_row - pimpl->matmul_split;
+     const bool defer_by_rank = window_mode && pimpl->matmul_split > 0 && split_at > 0;
+ 
++    // ── trial item 2：淘汰策略的生效判据 ──────────────────────────────
++    // pin 只保护「本层预热表非空」时的窗口淘汰；LFU 需要 slot_prob 已分配。
++    // 两者都不生效时（policy_on == false），下面的分配与淘汰走与原来
++    // 逐行相同的路径，新代码只剩这几个判据本身。
++    const bool pin_active = window_mode && pimpl->pin_prewarm &&
++                            layer < (int) pimpl->prewarm_member.size() &&
++                            !pimpl->prewarm_member[(size_t) layer].empty();
++    const bool lfu_active = window_mode && pimpl->lfu_admit &&
++                            !state.slot_prob.empty();
++    const bool policy_on = pin_active || lfu_active;
++    // LFU 试用段配额（每层窗口内）：试用类别的驻留数不超过它（压力下
++    // 例外见淘汰扫描的注释 —— 安装从不被拒绝，配额只是常态上限）。
++    constexpr int32_t kProbationSlots = 2;
++
+     for (size_t pos = 0; pos < count; ++pos) {
+         const int32_t expert = experts[pos];
+         if (state.expert_to_slot[expert] >= 0) {
+             slots[pos] = state.expert_to_slot[expert];   // 已驻留，无需读取
++            if (lfu_active && state.slot_prob[(size_t) slots[pos]]) {
++                // 试用期内被再次需求（哪怕是同一步的另一个位置）→ 升格。
++                state.slot_prob[(size_t) slots[pos]] = 0;
++            }
+             continue;
+         }
+ 
+         int32_t slot = -1;
+-        for (int32_t candidate = alloc_lo; candidate < alloc_hi; ++candidate) {
+-            if (state.slot_to_expert[candidate] == kSlotFree) {
+-                slot = candidate;
+-                break;
++        // LFU（trial item 2）：先给本次安装定类别。计数严格高过窗口里
++        // 最弱的正式驻留者 → 直接正式；否则试用。窗口里还没有正式驻留
++        // 者时一律正式（冷启动不该把第一批条目全挤进试用位）。试用配额
++        // 已满时跳过空位扫描 —— 不能让试用条目借空闲的正式位无限长大，
++        // 直接去淘汰扫描里换一个试用位出来。
++        bool install_probation = false;
++        bool skip_free_scan = false;
++        if (lfu_active) {
++            uint32_t weakest = UINT32_MAX;
++            int32_t n_prob = 0;
++            for (int32_t cand = alloc_lo; cand < alloc_hi; ++cand) {
++                const int32_t res = state.slot_to_expert[(size_t) cand];
++                if (res < 0) {
++                    continue;
++                }
++                if (state.slot_prob[(size_t) cand]) {
++                    n_prob++;
++                } else if (pimpl->demand_count[(size_t) layer][(size_t) res] < weakest) {
++                    weakest = pimpl->demand_count[(size_t) layer][(size_t) res];
++                }
+             }
++            install_probation = weakest != UINT32_MAX &&
++                pimpl->demand_count[(size_t) layer][(size_t) expert] <= weakest;
++            skip_free_scan = install_probation && n_prob >= kProbationSlots;
+         }
+-        if (slot < 0) {
++        if (!skip_free_scan) {
++            for (int32_t candidate = alloc_lo; candidate < alloc_hi; ++candidate) {
++                if (state.slot_to_expert[candidate] == kSlotFree) {
++                    slot = candidate;
++                    break;
++                }
++            }
++        }
++        if (slot < 0 && !policy_on) {
+             // 淘汰时跳过 kSlotPending：那是预读 worker 正在写的 slot，
+             // 动它会让 worker 把内容写到一个已经属于别人的位置。
+             //
+@@ -2553,11 +2685,70 @@ void llama_moe_slot_runtime::process(
+                 }
+             }
+         }
++        if (slot < 0 && policy_on) {
++            // 策略淘汰（trial item 2；原两轮 LRU 在上面的 !policy_on
++            // 分支里，一行未动）：
++            //   轮次 0：跳过 keep[]（预测下一步要用）+ 跳过 pin 保护条目；
++            //   轮次 1：只跳过 pin 保护条目；
++            //   轮次 2（仅 pin）：保护也放宽，全候选兜底 —— 安装从不拒绝。
++            // 段内顺序：本次装试用 → 先试用段（按 age 最老）；装正式 →
++            // 先正式段（计数最低，同计数按 age 最老）。一段挑不出来
++            // （全被本步请求占着）就退到另一段，所以试用配额是常态
++            // 上限、不是硬墙。pin-only 时没有类别之分，只走一遍全
++            // 范围、按 age 最老，与 LRU 同序。
++            const int n_pass = pin_active ? 3 : 2;
++            for (int pass = 0; pass < n_pass && slot < 0; ++pass) {
++                const bool skip_keep = pass == 0;
++                const bool skip_pin  = pass < 2;
++                for (int seg = 0; seg < 2 && slot < 0; ++seg) {
++                    if (!lfu_active && seg > 0) {
++                        break;
++                    }
++                    const bool want_prob = install_probation == (seg == 0);
++                    uint64_t best_age = UINT64_MAX;
++                    uint32_t best_cnt = UINT32_MAX;
++                    for (int32_t cand = alloc_lo; cand < alloc_hi; ++cand) {
++                        const int32_t res = state.slot_to_expert[(size_t) cand];
++                        if (res == kSlotPending || res < 0) {
++                            continue;
++                        }
++                        if (requested[(size_t) res]) {
++                            continue;
++                        }
++                        if (skip_keep && !keep.empty() && keep[(size_t) res]) {
++                            continue;
++                        }
++                        if (skip_pin && pin_active &&
++                            pimpl->prewarm_member[(size_t) layer][(size_t) res]) {
++                            continue;
++                        }
++                        const bool is_prob = lfu_active &&
++                                             state.slot_prob[(size_t) cand] != 0;
++                        if (lfu_active && is_prob != want_prob) {
++                            continue;
++                        }
++                        const uint32_t cnt = (lfu_active && !want_prob)
++                            ? pimpl->demand_count[(size_t) layer][(size_t) res] : 0;
++                        const uint64_t age = state.slot_age[(size_t) cand];
++                        if (cnt < best_cnt || (cnt == best_cnt && age < best_age)) {
++                            best_cnt = cnt;
++                            best_age = age;
++                            slot = cand;
++                        }
++                    }
++                }
++            }
++        }
+         if (slot < 0) {
+             throw std::runtime_error(format(
+                 "layer %d requires more than %d unique experts in one graph; reduce ubatch or increase --moe-slot-bank",
+                 layer, alloc_hi - alloc_lo));
+         }
++        if (lfu_active) {
++            // 落位类别在此一并定下：延后安装（A2）的 slot 也是在这里选的，
++            // process_deferred 发布时不必再管类别。
++            state.slot_prob[(size_t) slot] = install_probation ? 1 : 0;
++        }
+ 
+         const int32_t evicted = state.slot_to_expert[slot];
+         if (evicted >= 0) {

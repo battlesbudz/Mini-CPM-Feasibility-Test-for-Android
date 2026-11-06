@@ -509,6 +509,72 @@ first measurement of io8 on the stock configuration (prefill
 is the number to watch; decode is judged against stock's
 2.340 tok/s build 22 mean under the ±20% band).
 
+## Build 24 — item 2: frequency-aware admission (pin the prewarm set, LFU probationary admission)
+
+The ranking plan's item 2, the one build 22 deliberately
+sequenced out until the cheaper levers set a clean baseline
+(scope: `ITEM2_SCOPE.md`; the base is build 23's stock DSpark
+configuration — depth 3, KleidiAI floor, uniform 32-slot
+windows, bank 1024, I/O threads at the fork default of 4; the
+plan's original layerwin base was pruned in build 23). Two
+eviction policies for the MoE slot runtime, each env-gated
+and default off, in a new fork patch
+(`v47/patches/moe-slot-admission.patch`, applied by
+`prepare_v47.py` after the existing patch; it touches only
+`llama-moe-slot.cpp`, only victim selection and install
+bookkeeping):
+
+- **2a, pin the prewarm set** (`LLAMA_MOE_PIN_PREWARM`): the
+  prewarm table's 640 experts (16/layer × 40) are
+  eviction-protected in `process()`'s victim scan. If every
+  candidate in a layer's window were protected, the scan
+  falls back to plain LRU inside the protected set — an
+  install is never refused.
+- **2b, LFU admission** (`LLAMA_MOE_LFU_ADMIT`): one demand
+  counter per (layer, expert), counted once per unique expert
+  per decode step and aged by halving every 1,024 demand
+  events. The adaptation from Avalon's rule, stated plainly:
+  Avalon installs a miss only if its count beats the victim,
+  because it keeps a second resident copy to compute from.
+  LES has no second copy, so a refused install has nothing to
+  compute with. Here a miss **always installs and always
+  computes**; admission chooses only the residency class. A
+  miss lands in a probationary segment (2 of the layer's 32
+  window slots) unless its counter beats the weakest general
+  resident's counter, in which case it installs as a general
+  resident. Victim selection prefers probationary slots, then
+  the lowest-count general resident, LRU breaks ties; a
+  probationary expert demanded again while resident is
+  promoted to general. Policy changes residency, never math,
+  so greedy token IDs must match the stock arm exactly — that
+  equality is a hard gate on every device paste.
+
+Three new arms, each the stock DSpark configuration plus its
+flag(s): **DSpark pin prewarm**, **DSpark LFU admission**,
+**DSpark pin + LFU**. io8 is deliberately not crossed with
+either policy (one new variable per verdict). Every DSpark
+report, control included, names both flags (`moePinPrewarm`,
+`moeLfuAdmit`), and the runtime logs an `admission:` line at
+init naming the live flags. With both flags off the runtime
+must reproduce build 23's stock counters exactly — the stock
+arm in this same build is the regression check. `models.json`
+is byte-identical again, so installing over build 23 needs
+no new download.
+
+**Device protocol for build 24:** install over build 23, do
+NOT tap Download. Run pairs in this order, two runs each,
+order reversed on the second pass: **DSpark** (control,
+establishes this build's stock mean), **DSpark pin
+prewarm**, **DSpark LFU admission**, **DSpark pin + LFU**;
+paste each run. Pass bar (the plan's): an arm's decode pair
+mean beats the same build's stock pair mean by more than
+20%, both runs above the stock mean, AND installs per token
+down at least 15%. Prefill is read as a secondary stage under
+Battles's any-stage criterion. Case-3 flattery warning for
+2a: the prewarm table is mined from this same case, so a pin
+pass proves the mechanism under the kindest conditions; a
+pin fail kills 2a outright.
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub
