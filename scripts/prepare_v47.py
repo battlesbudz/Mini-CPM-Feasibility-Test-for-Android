@@ -19,6 +19,16 @@ moe-slot-admission.patch's own header. It touches only
 src/llama-moe-slot.cpp, in regions disjoint from the first patch's
 hunks there, and the integrity check below covers the union of both
 patches' files byte-exactly, exactly as it covered the one patch.
+
+Build 27 adds a third patch: the item-5 tail-skip in the slot runtime
+(a DSpark verify-batch expert routed only at the last rank is not
+installed; its contribution is zeroed for that step through a reserved
+zero slot), env-gated (LLAMA_MOE_TAIL_SKIP) and default off; see
+moe-slot-tail-skip.patch's own header. It also touches only
+src/llama-moe-slot.cpp, in regions disjoint from both earlier patches'
+hunks there (it applies onto the pristine pin standalone, and in
+either order relative to the admission patch), so PATCHED_FILES is
+unchanged and the same byte-exact check covers all three.
 """
 import pathlib, shutil, subprocess, tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -27,6 +37,7 @@ dest = ROOT / "vendor/llama.cpp-omni-v47"
 PATCHES = [
     ROOT / "v47/patches/ggml-cpu-alloc-only-buft.patch",
     ROOT / "v47/patches/moe-slot-admission.patch",
+    ROOT / "v47/patches/moe-slot-tail-skip.patch",
 ]
 PATCHED_FILES = [
     "ggml/include/ggml-backend.h",

@@ -133,6 +133,7 @@ public final class RunExporter {
             s.append("abArm: ").append(status.optString("abArm","")).append('\n');
             s.append("moePinPrewarm: ").append(status.optString("moePinPrewarm","")).append('\n');
             s.append("moeLfuAdmit: ").append(status.optString("moeLfuAdmit","")).append('\n');
+            s.append("moeTailSkip: ").append(status.optString("moeTailSkip","")).append('\n');
             s.append("phase: ").append(status.optString("phase","")).append('\n');
             s.append("status: ").append(status.optString("status","")).append('\n');
         }
@@ -147,6 +148,11 @@ public final class RunExporter {
             s.append("moeCacheHitRatePct: ").append(num(report,"moeCacheHitRatePct")).append('\n');
             s.append("moeIoReadMiB: ").append(num(report,"moeIoReadMiB")).append('\n');
             s.append("moeIoCalls: ").append(num(report,"moeIoCalls")).append('\n');
+            if(report.has("moeTailSkipBatches"))s.append("moeTailSkipBatches: ").append(num(report,"moeTailSkipBatches")).append('\n');
+            if(report.has("moeTailSkipSkipped"))s.append("moeTailSkipSkipped: ").append(num(report,"moeTailSkipSkipped")).append('\n');
+            if(report.has("moeTailSkipBytesNotReadMiB"))s.append("moeTailSkipBytesNotReadMiB: ").append(num(report,"moeTailSkipBytesNotReadMiB")).append('\n');
+            if(report.has("moeTailSkipProbeJsonValid"))s.append("moeTailSkipProbeJsonValid: ").append(report.optBoolean("moeTailSkipProbeJsonValid")).append('\n');
+            if(report.has("moeTailSkipProbeTokens"))s.append("moeTailSkipProbeTokens: ").append(num(report,"moeTailSkipProbeTokens")).append('\n');
             JSONArray cases=report.optJSONArray("cases");
             if(cases!=null)for(int i=0;i<cases.length();i++){
                 JSONObject c=cases.optJSONObject(i);if(c==null)continue;

@@ -679,6 +679,81 @@ bundles. Pin run 2 already landed on build 25 (see the trial
 record), so pin is closed: its counters repeated exactly and
 installs were up, not down.
 
+## Build 27 — item 5: tail-skip (the last ranked lever)
+
+Item 2 closed on device (build 26's record): pin failed on
+counters, LFU failed on counters and speed. This build tests
+the scoping plan's item 5, **tail-skip**, the last untested
+lever in the plan (scope: `TAILSKIP_SCOPE.md` in the trial
+records). One new arm, one new fork patch, nothing else moves.
+
+- **New fork patch** `v47/patches/moe-slot-tail-skip.patch`
+  (third in `prepare_v47.py`'s list; touches only
+  `src/llama-moe-slot.cpp`, in regions disjoint from both
+  earlier patches — it applies onto the pristine pin
+  standalone and in either order relative to the admission
+  patch, and the byte-exact integrity check covers all
+  three). Env `LLAMA_MOE_TAIL_SKIP`, default off.
+- **The rule:** in a DSpark verify batch (the decode-window
+  path, multi-row), a missing expert routed **only at rank 7**
+  — the last of the top-8 picks — by every row of the batch is
+  skipped for that step: not installed, and its contribution
+  is exactly zero. Any row routing it at ranks 0–6 installs it
+  normally. Prefill is never skipped (it does not run in
+  window mode) and neither is single-row decode.
+- **How zero is realized:** rank is read in the slot runtime
+  from the flattened id tensor (`rank = pos % n_used`, the
+  same identity the fork's A2 deferral uses). The graph reads
+  expert weights only through the runtime's slot ids, so a
+  skipped position's slot id is pointed at a **reserved zero
+  slot** — the last slot of the layer's window, evicted and
+  memset to zero (gate/up/down) when first armed in a window
+  phase, then excluded from every allocation scan until the
+  phase ends. `silu(0)*0 = 0` and `down @ 0 = 0`, so the
+  router weight multiplies an exact zero. A skipped expert is
+  temporarily marked resident at that slot for the demand
+  loop and unmarked right after, and it is subtracted from
+  the unique count so the hit/miss accounting stays truthful.
+- **Disclosed cost:** while the zero slot is armed the window
+  has 31 usable slots, not 32. A later verify batch in the
+  same generation needing 32 installs with no skippable
+  expert would hit the runtime's fit guard; observed verify
+  batches demand about 17–24 unique experts per layer.
+- **New arm** `quick_dspark_tailskip` (button "DSpark
+  tail-skip"): the stock DSpark configuration plus
+  `LLAMA_MOE_TAIL_SKIP=1`. Reports carry `moeTailSkip`
+  (on/off) in every DSpark arm, and the runtime's teardown
+  line adds `moeTailSkipBatches` (verify batches with at
+  least one skip), `moeTailSkipSkipped` (experts skipped)
+  and `moeTailSkipBytesNotReadMiB` (skips × per-expert
+  bytes). summary.txt carries the flag, the telemetry, and
+  the probe verdict.
+- **Structured-output probe (this arm only):** after Case 3
+  the arm runs a seventh case (96-token cap) demanding a
+  strict JSON-only object about the bicycle case (keys
+  `forces`, `balance_factors`, `summary`). The service
+  validates the answer with org.json and records
+  `moeTailSkipProbeJsonValid`; the answer text and token
+  count ride along as `moeTailSkipProbeAnswer` /
+  `moeTailSkipProbeTokens`. No other arm runs the probe, and
+  the full trial is unchanged.
+- **Judging:** this lever changes outputs by design, so there
+  is no token-ID gate on this arm — Case 3's token IDs are
+  expected to differ from the stock sequence. The bars are
+  the plan's: the decode pair mean must beat the stock pair
+  references by more than 20% (clean stock pair mean
+  2.340 tok/s, builds 22/23), the JSON probe must be valid,
+  and Case 3's answer gets a fluency read. With the flag off
+  the runtime is behavior-identical, so the control arm
+  (pair already complete: 6,099 installs / 2,729 hits) stays
+  the regression check if it is run again.
+
+**Device protocol for build 27:** install over build 26, do
+NOT tap Download (the model pack is unchanged). On a cool
+phone, run the **DSpark tail-skip** quick check twice; each
+run exports its bundle as usual — attach the zips. No new
+control runs are needed.
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub

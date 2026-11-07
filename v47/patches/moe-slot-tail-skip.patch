@@ -1,0 +1,270 @@
+Trial patch (item 5): tail-skip for the MoE slot runtime — skip the
+install and the compute of a verify-batch expert that is routed only
+at the last rank, and count its contribution as zero for that step.
+
+Everything here is confined to src/llama-moe-slot.cpp: candidate
+selection and slot-id assignment in process(), a reserved zero slot
+in the per-layer decode window, and the state and telemetry those
+need. The graph is NOT touched, and does not need to be: in this fork
+the graph reads router weights by the original expert ids and expert
+weights through the slot ids this runtime writes, so the slot-id
+tensor is the only contract between the two sides (see
+TAILSKIP_SCOPE.md section 3).
+
+The rule (env LLAMA_MOE_TAIL_SKIP=1, default OFF):
+
+  In a DSpark verify batch (window mode, more than one row), a
+  missing (non-resident) expert routed ONLY at the last rank
+  (rank == n_used-1, i.e. rank 7 of the top-8) by every row of the
+  batch is skipped for that step: it is not installed, and the
+  positions that routed it get the reserved zero slot as their slot
+  id. That slot's decode bindings (gate/up/down) are memset to zero
+  when the slot is armed, so the graph computes
+  silu(0)*0 = 0 and down @ 0 = 0 — the contribution is exactly the
+  zero vector, whatever the router weight. If any row routes the
+  expert at ranks 0..n_used-2 it installs normally. Prefill never
+  enters window mode and single-row decode is excluded by the
+  n_rows > 1 gate: verify batches only.
+
+Rank is read from the flattened id tensor exactly where the fork
+already reads it for the A2 deferral: pos = rank + n_used * row, so
+rank = pos % n_used with n_used = expert_ids->ne[0].
+
+The zero slot is the LAST slot of the layer's window. It is armed
+lazily, the first time a step in a window phase actually skips:
+any resident there is evicted through the normal mapping tables,
+the slot contents are zeroed, and from then on the allocation range
+in process() is clamped to exclude it and claim_slot_in_window
+skips it, until clear_layer_cache disarms it at the next phase
+transition. Disclosed cost: while armed the window has one fewer
+usable slot (31 of 32); a later batch in the same generation that
+needed 32 installs with no skippable expert would hit the fork's
+own fit guard. Observed verify batches demand ~17-24 unique experts
+per layer, far from that line.
+
+Mechanically, a skipped expert is marked resident at the zero slot
+in expert_to_slot just before the demand loop, so the loop's stock
+resident branch assigns the zero slot to its positions — the demand
+loop itself carries no tail-skip code. The markings are restored
+immediately after the loop, before the n_unique accounting.
+
+Accounting stays honest: a skipped expert is neither an install
+nor a hit. It stays in requested[] during the demand loop (victim
+scans see true routing) and is subtracted from n_unique afterward,
+so the flush lines' hit = unique - miss stays truthful. Telemetry
+is three impl atomics, printed once at teardown like the lookahead
+report: "tail-skip: batches=%llu skipped=%llu bytes=%.1fMiB"
+(batches = layer calls with at least one skip; bytes = skipped x
+the layer's decode per-expert byte sum, the reads that did not
+happen).
+
+This patch CHANGES OUTPUTS when the flag is on (a routed expert's
+contribution is dropped) — that is the lever being tested, judged
+on fluency and a structured-output probe, not token-id equality.
+With the flag off, every new branch is untaken and the runtime is
+behavior-identical to the unpatched one: the flag member is false,
+no candidate set is built, the clamp reads an armed flag that is
+never set, and the n_unique adjustment subtracts zero.
+
+diff --git a/src/llama-moe-slot.cpp b/src/llama-moe-slot.cpp
+index 4dc9304..352e2b4 100644
+--- a/src/llama-moe-slot.cpp
++++ b/src/llama-moe-slot.cpp
+@@ -501,2 +501,8 @@ struct llama_moe_slot_runtime::impl {
+     struct layer_state {
++        /// tail-skip（LLAMA_MOE_TAIL_SKIP，trial item 5）预留的零 slot：
++        /// 本层窗口的最后一个 slot，下标只在 tail_zero_armed 时有效。
++        /// 武装后任何分配路径都不得占用它（见 process() 的范围夹紧与
++        /// claim_slot_in_window 的跳过）；clear_layer_cache 时解除武装。
++        int32_t tail_zero_slot = -1;
++        bool tail_zero_armed = false;
+         bool enabled = false;
+@@ -815,2 +821,7 @@ struct llama_moe_slot_runtime::impl {
+     static void clear_layer_cache(layer_state & st) {
++        // tail-skip 的零 slot 随缓存一起解除武装：新窗口阶段第一次真
++        // 跳过时再重新武装（重新清零）。策略关闭时这两个字段恒为
++        // -1/false，这两行无副作用。
++        st.tail_zero_slot = -1;
++        st.tail_zero_armed = false;
+         for (auto & e : st.slot_to_expert) {
+@@ -863,2 +874,5 @@ struct llama_moe_slot_runtime::impl {
+         for (int32_t cand = from; cand < hi; ++cand) {
++            if (st.tail_zero_armed && cand == st.tail_zero_slot) {
++                continue;   // tail-skip 的预留零 slot，不许认领
++            }
+             if (st.slot_to_expert[(size_t) cand] == kSlotFree) {
+@@ -871,2 +885,5 @@ struct llama_moe_slot_runtime::impl {
+             for (int32_t cand = from; cand < hi; ++cand) {
++                if (st.tail_zero_armed && cand == st.tail_zero_slot) {
++                    continue;   // 同上
++                }
+                 if (st.slot_to_expert[(size_t) cand] == kSlotPending) {
+@@ -1253,2 +1270,8 @@ struct llama_moe_slot_runtime::impl {
+         lookahead.report();
++        if (tail_skip) {
++            moe_log("tail-skip: batches=%llu skipped=%llu bytes=%.1fMiB",
++                (unsigned long long) tail_batches.load(std::memory_order_relaxed),
++                (unsigned long long) tail_skipped.load(std::memory_order_relaxed),
++                (double) tail_bytes.load(std::memory_order_relaxed) / (1024.0 * 1024.0));
++        }
+         if (miss_pos_steps > 0) {
+@@ -2122,2 +2145,64 @@ struct llama_moe_slot_runtime::impl {
+ 
++    // ── tail-skip（trial item 5，见 TAILSKIP_SCOPE.md）──────────────
++    // LLAMA_MOE_TAIL_SKIP=1：DSpark 验证批次（窗口模式、多行）里，一
++    // 个缺失专家若在整批中只出现在末位名次（rank == n_used-1，即
++    // top-8 的第 8 名），本步跳过它的安装与计算，贡献按零计。任一
++    // 行在 rank 0..n_used-2 用到它就照常安装。prefill 不走窗口模
++    // 式、单行 decode 被 process() 的 n_rows>1 判据排除，都不跳。
++    //
++    // 零贡献的实现：图侧没有独立的「驻留」概念 —— 它用原始专家 id
++    // 取路由权重、用 slot id 取专家权重，slot id 是两侧唯一的契
++    // 约。所以把跳过位置的 slot id 指向本层窗口的最后一个 slot
++    // （预留零 slot）：武装时先按映射表淘汰那里的驻留者，再把每个
++    // decode binding 在该 slot 的 per-expert 跨度清零（与
++    // read_expert_directv 同一套寻址）。gate/up/down 全零 ⇒
++    // silu(0)*0=0、down@0=0，路由权重乘的恰好是零向量，贡献严格
++    // 为零。
++    //
++    // 武装是懒的：本窗口阶段第一次真跳过时才武装，此后 alloc 范围
++    // 夹紧排除该 slot，直到 clear_layer_cache 解除。代价写明：武
++    // 装后可用窗口少 1（31），若后续批次需要 32 个安装且无可跳专
++    // 家，会撞上 fork 自带的装不下守卫 —— 实测验证批次每层唯一专
++    // 家约 17-24，远未到这条线。
++    //
++    // 默认关闭；关闭时所有新分支都不进入，process() 与未打补丁前
++    // 一致（n_unique 的扣减项恒为 0）。
++    static bool tail_skip_env() {
++        const char * v = std::getenv("LLAMA_MOE_TAIL_SKIP");
++        const bool on = v && *v && *v != '0';
++        if (on) {
++            moe_log("tail-skip: on (trial item 5)");
++        }
++        return on;
++    }
++    bool tail_skip = tail_skip_env();
++    std::atomic<uint64_t> tail_batches{0};   // 有跳过的层调用次数
++    std::atomic<uint64_t> tail_skipped{0};   // 被跳过的专家数（层×步）
++    std::atomic<uint64_t> tail_bytes{0};     // 未读字节 = skipped × 本层 decode per-expert 字节和
++
++    /// 把本层窗口 slot 的 decode 内容清零（寻址与 read_expert_directv
++    /// 的 window_mode 分支一致）。调用方必须已持 state.mutex。
++    void zero_dec_slot(const layer_state & st, int32_t slot) {
++        for (const size_t oi : st.dec_pack_order) {
++            const auto & b = st.dec_bindings[oi];
++            if (!b.tensor || !b.entry) {
++                continue;
++            }
++            memset((uint8_t *) b.tensor->data + (size_t) slot * b.entry->bytes_per_expert,
++                   0, b.entry->bytes_per_expert);
++        }
++    }
++
++    /// 本层一个专家的 decode 总字节（各 family 的 bytes_per_expert 之
++    /// 和），即一次安装真正要读的字节数，遥测用。
++    static size_t dec_expert_bytes(const layer_state & st) {
++        size_t total = 0;
++        for (const auto & b : st.dec_bindings) {
++            if (b.entry) {
++                total += b.entry->bytes_per_expert;
++            }
++        }
++        return total;
++    }
++
+     void sweep_init() {
+@@ -2548,2 +2633,70 @@ void llama_moe_slot_runtime::process(
+ 
++    // ── tail-skip（trial item 5）：跳过集合的判定 ──────────────────
++    // 只在本函数这一处算：窗口模式 + 多行（DSpark 验证批次）+ 开关开。
++    // rank 由展平下标推出：pos = rank + n_used * row（ne[0] 变化最
++    // 快），与 A2 的 defer_by_rank 用的是同一个恒等式。候选 = 被请
++    // 求、未驻留、且没有任何一个位置在非末位名次用到它。
++    // tail_skip_on 为假时 skip 表为空、tail_skip_here 为 0，后面每
++    // 个用到它们的地方都退化成原行为。
++    const bool tail_skip_on = pimpl->tail_skip && window_mode && n_rows > 1;
++    std::vector<uint8_t> tail_skip_expert;
++    int tail_skip_here = 0;
++    if (tail_skip_on) {
++        const int32_t n_used_ts = (int32_t) expert_ids->ne[0];
++        const int32_t tail_rank = n_used_ts - 1;
++        std::vector<uint8_t> seen_non_tail((size_t) pimpl->n_expert, 0);
++        for (size_t pos = 0; pos < count; ++pos) {
++            if ((int32_t) (pos % (size_t) n_used_ts) != tail_rank) {
++                seen_non_tail[(size_t) experts[pos]] = 1;
++            }
++        }
++        tail_skip_expert.assign((size_t) pimpl->n_expert, 0);
++        for (int32_t e = 0; e < pimpl->n_expert; ++e) {
++            if (requested[(size_t) e] && !seen_non_tail[(size_t) e] &&
++                state.expert_to_slot[(size_t) e] < 0) {
++                tail_skip_expert[(size_t) e] = 1;
++                tail_skip_here++;
++            }
++        }
++        if (tail_skip_here > 0) {
++            if (!state.tail_zero_armed) {
++                // 武装零 slot：本层窗口的最后一个 slot。先按映射表把
++                // 那里的驻留者淘汰（它之后会被正常重装到别处），再把
++                // 内容清零。process() 在图执行中先于本层 matmul 运行
++                //（slot id 是数据依赖），同一步内清零是安全的 —— 与
++                // 安装路径在同一步写入专家字节是同一条保证。
++                const int32_t w_il_ts = state.window_width > 0
++                    ? state.window_width : (pimpl->decode_window + pimpl->prefetch_slots);
++                const int32_t z = state.window_start + w_il_ts - 1;
++                const int32_t resident = state.slot_to_expert[(size_t) z];
++                if (resident >= 0) {
++                    state.expert_to_slot[(size_t) resident] = kSlotFree;
++                }
++                state.slot_to_expert[(size_t) z] = kSlotFree;
++                if (!state.slot_prob.empty()) {
++                    state.slot_prob[(size_t) z] = 0;   // 别让 LFU 升格分支碰它
++                }
++                pimpl->zero_dec_slot(state, z);
++                state.tail_zero_slot = z;
++                state.tail_zero_armed = true;
++            }
++            pimpl->tail_batches.fetch_add(1, std::memory_order_relaxed);
++            pimpl->tail_skipped.fetch_add((uint64_t) tail_skip_here, std::memory_order_relaxed);
++            pimpl->tail_bytes.fetch_add((uint64_t) tail_skip_here *
++                (uint64_t) llama_moe_slot_runtime::impl::dec_expert_bytes(state),
++                std::memory_order_relaxed);
++            // 把候选专家临时标成「驻留于零 slot」：需求循环的驻留分支
++            // 会直接把它们的位置指向 z —— 不安装、不延后、不进
++            // pending。slot_to_expert[z] 保持 kSlotFree：z 已被夹紧排
++            // 除在分配范围外，淘汰扫描根本看不到它。循环结束后
++            //（n_unique 扣减处）立即恢复 expert_to_slot，否则下一步
++            // 会把它们误判成真驻留。
++            for (int32_t e = 0; e < pimpl->n_expert; ++e) {
++                if (tail_skip_expert[(size_t) e]) {
++                    state.expert_to_slot[(size_t) e] = state.tail_zero_slot;
++                }
++            }
++        }
++    }
++
+     // 分配范围。窗口模式下只在**本层窗口**内找空位 / 淘汰 —— 这是整个机制的要点：
+@@ -2563,2 +2716,7 @@ void llama_moe_slot_runtime::process(
+                    (pimpl->prefetch_unified ? 0 : pimpl->prefetch_slots);
++        // tail-skip：零 slot 武装后把它排除在分配范围外（它就是窗口
++        // 的最后一个 slot，夹紧 alloc_hi 即排除）。未武装时不生效。
++        if (state.tail_zero_armed) {
++            alloc_hi = std::min(alloc_hi, state.tail_zero_slot);
++        }
+     } else if (lookahead_step) {
+@@ -2831,2 +2989,15 @@ void llama_moe_slot_runtime::process(
+     }
++    // tail-skip：先恢复候选专家的映射（需求循环里它们被临时标成驻
++    // 留于零 slot），下一步必须重新把它们看成缺失；再把被跳过的专
++    // 家从 unique 里扣掉 —— 它们既不是安装也不是命中，扣掉后
++    // flush 的 hit = unique - miss 与本函数的 n_hit 才都诚实。
++    // 关闭时 tail_skip_on 为假、tail_skip_here 恒为 0，无副作用。
++    if (tail_skip_on) {
++        for (int32_t e = 0; e < pimpl->n_expert; ++e) {
++            if (tail_skip_expert[(size_t) e]) {
++                state.expert_to_slot[(size_t) e] = kSlotFree;
++            }
++        }
++    }
++    n_unique -= tail_skip_here;
+     pimpl->unique_sum.fetch_add(n_unique, std::memory_order_relaxed);

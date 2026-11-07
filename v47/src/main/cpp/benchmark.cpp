@@ -237,6 +237,28 @@
 // variable per verdict. Both env vars are set or unset in
 // every mode below, so nothing leaks between runs.
 //
+// Build 27 (this build) tests the ranking plan's item 5,
+// tail-skip, the plan's last untested lever (TAILSKIP_SCOPE.md).
+// It adds one arm on the same stock DSpark configuration:
+// quick_dspark_tailskip sets LLAMA_MOE_TAIL_SKIP, and the slot
+// runtime then skips installing a verify-batch expert that every
+// row routes only at the last rank (rank 7 of the top-8),
+// pointing those positions at a reserved all-zero window slot so
+// the expert's contribution for that step is exactly zero. This
+// lever CHANGES the math when it fires, so the arm is judged on
+// decode speed, the installs avoided (runtime telemetry:
+// moeTailSkipBatches / moeTailSkipSkipped /
+// moeTailSkipBytesNotReadMiB, from the teardown "tail-skip:"
+// line), case-3 fluency, and a structured-output probe the other
+// arms do not run: a seventh case (display index 7, a JSON-only
+// answer about the bicycle case, 96-token cap) whose answer the
+// service validates with org.json into
+// moeTailSkipProbeJsonValid. Token IDs are EXPECTED to differ
+// from the stock sequence in this arm. With the env off the
+// patched runtime is behavior-identical, so the control arm's
+// counters remain the regression check. One new variable per
+// verdict, as before.
+//
 // Configuration mirrors the vendor demo defaults for this fork
 // (OpenBMB MiniCPM-V-demo-Android): 4 threads, 4096-token context,
 // image_max_slice_nums 9. Sampling is greedy (temperature 0) to match the
@@ -338,6 +360,12 @@ static const int    MOE_DECODE_WINDOW = 16;
 // the full trial's case list and defaults are unchanged.
 static const int    QUICK_CASE_DISPLAY = 3;
 static const int    QUICK_MAX_TOKENS   = 32;
+// Build 27: the tailskip arm's structured-output probe case
+// (1-based display index) and its own decode cap. 32 tokens (the
+// shared quick cap) would truncate the JSON object mid-answer
+// and prove nothing; 96 leaves room for the small fixed object.
+static const int    PROBE_CASE_DISPLAY = 7;
+static const int    PROBE_MAX_TOKENS   = 96;
 // Build 15 (DSpark arm): the draft GGUF sits beside the main gguf in
 // the model directory (downloaded from the DSpark repo via the
 // per-file source override in models.json / ModelStore).
@@ -771,6 +799,13 @@ struct MoeCounters {
     // runtime's clamp, from its "decode-cache: 窗口覆盖批宽 1..N"
     // line (printed once at slot-runtime init). -1 = line not seen.
     long long windowRows = -1;
+    // Build 27: tail-skip telemetry, from the teardown
+    // "tail-skip:" line (whole-run atomic counters, taken whole
+    // like the lookahead-accuracy line). Seen only when the flag
+    // was on for the run.
+    bool tailSeen = false;
+    long long tailBatches = 0, tailSkipped = 0;
+    double tailBytesMiB = 0.0;
 };
 static bool log_field_ll(const std::string & line, const char * key, long long & out) {
     const std::string k = std::string(key) + "=";
@@ -821,6 +856,17 @@ static MoeCounters parse_moe_counters(const std::string & log) {
                 c.laScored = scored;
                 c.laCorrect = correct;
                 c.laAccuracyPct = scored > 0 ? 100.0 * (double) correct / (double) scored : 0.0;
+            }
+        }
+        if (line.find("tail-skip: batches=") != std::string::npos) {
+            long long batches = 0, skipped = 0;
+            double bytes = 0.0;
+            if (log_field_ll(line, "batches", batches) && log_field_ll(line, "skipped", skipped) &&
+                log_field_d(line, "bytes", bytes)) {
+                c.tailSeen = true;
+                c.tailBatches = batches;
+                c.tailSkipped = skipped;
+                c.tailBytesMiB = bytes;
             }
         }
         if (line.find("decode-cache:") != std::string::npos) {
@@ -900,14 +946,20 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // "quick_dspark_pin" sets LLAMA_MOE_PIN_PREWARM,
     // "quick_dspark_lfu" sets LLAMA_MOE_LFU_ADMIT, and
     // "quick_dspark_pinlfu" sets both.
+    // Build 27: "quick_dspark_tailskip" joins as the item-5 arm:
+    // the DSpark arm plus LLAMA_MOE_TAIL_SKIP, wired below. It is
+    // also the only arm that runs the probe case (index 7).
     const bool dspark_io8          = mode == "quick_dspark_io8";
     const bool dspark_pin          = mode == "quick_dspark_pin";
     const bool dspark_lfu          = mode == "quick_dspark_lfu";
     const bool dspark_pinlfu       = mode == "quick_dspark_pinlfu";
+    const bool dspark_tailskip     = mode == "quick_dspark_tailskip";
     const bool dspark = mode == "quick_dspark" || dspark_io8 ||
-                        dspark_pin || dspark_lfu || dspark_pinlfu;
+                        dspark_pin || dspark_lfu || dspark_pinlfu || dspark_tailskip;
     const bool quick = mode == "quick" || lookahead_off || dspark;
-    const int max_tokens = quick ? QUICK_MAX_TOKENS : MAX_NEW_TOKENS;
+    // Build 27: not const — the probe case raises the cap for its
+    // own iteration (the case loop reassigns it every iteration).
+    int max_tokens = quick ? QUICK_MAX_TOKENS : MAX_NEW_TOKENS;
     auto listener_cls = env->GetObjectClass(listener);
     auto on_event = env->GetMethodID(listener_cls, "onEvent", "(Ljava/lang/String;)V");
     auto emit = [&](const std::string & s) {
@@ -965,6 +1017,11 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         if (c.windowRows >= 0) {
             fields["moeWindowMaxRowsEffective"] = c.windowRows;
         }
+        if (c.tailSeen) {
+            fields["moeTailSkipBatches"] = c.tailBatches;
+            fields["moeTailSkipSkipped"] = c.tailSkipped;
+            fields["moeTailSkipBytesNotReadMiB"] = c.tailBytesMiB;
+        }
         return fields;
     };
     auto emit_counters = [&]() {
@@ -980,7 +1037,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         {"profile", "minicpm-v47-phone-trial-v1"},
         {"runtime", "llama.cpp-omni (tc-mb fork, LES / MoE-SSD)"},
         {"runtimeCommit", RUNTIME_COMMIT},
-        {"runtimePatch", "v47/patches/ggml-cpu-alloc-only-buft.patch (CPU alloc-only buft + llama-model.cpp loader fix; build 13 adds lookahead-accuracy telemetry counters in llama-moe-slot.cpp) + v47/patches/moe-slot-admission.patch (build 24: item-2 admission policies in llama-moe-slot.cpp - LLAMA_MOE_PIN_PREWARM / LLAMA_MOE_LFU_ADMIT, both env-gated and default off)"},
+        {"runtimePatch", "v47/patches/ggml-cpu-alloc-only-buft.patch (CPU alloc-only buft + llama-model.cpp loader fix; build 13 adds lookahead-accuracy telemetry counters in llama-moe-slot.cpp) + v47/patches/moe-slot-admission.patch (build 24: item-2 admission policies in llama-moe-slot.cpp - LLAMA_MOE_PIN_PREWARM / LLAMA_MOE_LFU_ADMIT, both env-gated and default off) + v47/patches/moe-slot-tail-skip.patch (build 27: item-5 tail-skip in llama-moe-slot.cpp - LLAMA_MOE_TAIL_SKIP, env-gated and default off)"},
         {"modelRepo", "tc-mb/MiniCPM-V-Apps-gguf"},
         {"modelRevision", "8716e5209f308fd53f197ccd7d50c6fdcc2dc37d"},
         {"modelFiles", "main -les gguf + mmproj f16 + experts/ (40 shards + manifest.json)"},
@@ -1057,6 +1114,12 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     else                             unsetenv("LLAMA_MOE_PIN_PREWARM");
     if (dspark_lfu || dspark_pinlfu) setenv("LLAMA_MOE_LFU_ADMIT", "1", 1);
     else                             unsetenv("LLAMA_MOE_LFU_ADMIT");
+    // Build 27: the tail-skip lever lives only in its own arm,
+    // set or cleared explicitly in every arm like the others (it
+    // is read by the slot runtime once at init, and this process
+    // exits after every run).
+    if (dspark_tailskip) setenv("LLAMA_MOE_TAIL_SKIP", "1", 1);
+    else                 unsetenv("LLAMA_MOE_TAIL_SKIP");
     // Build 12 (research 2.1): lookahead prefetch ON, depth left at
     // the fork default of 8. The runtime predicts the next layer's
     // routing from the current hidden state and pre-reads those
@@ -1084,7 +1147,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         setenv("LLAMA_MOE_WINDOW_MAX_ROWS", std::to_string(DSPARK_WINDOW_MAX_ROWS).c_str(), 1);
     }
     report["moeLookaheadPrefetch"] = dspark ? "off" : (lookahead_off ? "off" : "on (depth default 8)");
-    report["abArm"] = dspark_pinlfu ? "dspark_pinlfu" : (dspark_pin ? "dspark_pin" : (dspark_lfu ? "dspark_lfu" : (dspark_io8 ? "dspark_io8" : (dspark ? "dspark_on" : (lookahead_off ? "lookahead_off" : "lookahead_on")))));
+    report["abArm"] = dspark_tailskip ? "dspark_tailskip" : (dspark_pinlfu ? "dspark_pinlfu" : (dspark_pin ? "dspark_pin" : (dspark_lfu ? "dspark_lfu" : (dspark_io8 ? "dspark_io8" : (dspark ? "dspark_on" : (lookahead_off ? "lookahead_off" : "lookahead_on"))))));
     if (dspark_io8)   report["moeIoThreads"] = 8;
     if (dspark) {
         // Build 24: name both admission flags in every DSpark
@@ -1092,8 +1155,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         // proves which policies were live for that run. (Older
         // non-DSpark reports predate the fields; the service's
         // partial report carries the same fields for every arm.)
+        // Build 27: the tail-skip flag joins them, same rule.
         report["moePinPrewarm"] = (dspark_pin || dspark_pinlfu) ? "on" : "off";
         report["moeLfuAdmit"]   = (dspark_lfu || dspark_pinlfu) ? "on" : "off";
+        report["moeTailSkip"]   = dspark_tailskip ? "on" : "off";
     }
     if (dspark) {
         report["dsparkDraftModel"] = std::string(DSPARK_GGUF) +
@@ -1117,6 +1182,8 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // Build 24: the admission arms' differences, same style.
     if (dspark_pin || dspark_pinlfu) emit("MoE admission: LLAMA_MOE_PIN_PREWARM=1 (prewarm experts eviction-protected)");
     if (dspark_lfu || dspark_pinlfu) emit("MoE admission: LLAMA_MOE_LFU_ADMIT=1 (probationary LFU admission)");
+    // Build 27: the tail-skip arm's difference, same style.
+    if (dspark_tailskip) emit("MoE tail-skip: LLAMA_MOE_TAIL_SKIP=1 (verify-batch last-rank misses are zeroed, not installed)");
 
     // Prewarm table selection. First choice: a table mined from the
     // previous run's sweep trace (this app's own routing on this
@@ -1332,6 +1399,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // A text-only prompt needs no image: plain general knowledge questions,
     // the third written to produce a long answer so decode speed is
     // measured over a decent token count.
+    // Build 27: a seventh case, the tailskip arm's structured-output
+    // probe (see the build 27 header note). It runs ONLY in that arm
+    // (the quick-mode filter below admits it only there); every other
+    // arm's case list is exactly as before.
     struct TrialCase { const char * question; bool has_image; };
     const TrialCase trial_cases[] = {
         { "What is the capital of France?", false },
@@ -1340,6 +1411,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         { "Describe this image.", true },
         { "How many people are in this image?", true },
         { "How many cars are in this image?", true },
+        { "Answer with ONLY a JSON object and no other text. The object must have exactly these keys: \"forces\" (an array of short strings naming the main forces acting on a moving bicycle and rider), \"balance_factors\" (an array of short strings naming what keeps the bicycle balanced), and \"summary\" (one short string).", false },
     };
     const int n_cases = (int) (sizeof(trial_cases) / sizeof(trial_cases[0]));
     json cases = json::array();
@@ -1689,8 +1761,18 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
 
     for (int qi = 0; qi < n_cases && fatal.empty(); qi++) {
         // Build 12 quick mode: only the decode measurement case runs.
-        if (quick && qi + 1 != QUICK_CASE_DISPLAY) continue;
+        // Build 27: the probe case (7) belongs to the tailskip arm
+        // alone — skipped in every other mode, the full trial
+        // included; the tailskip arm runs it after case 3.
+        if (qi + 1 == PROBE_CASE_DISPLAY && !dspark_tailskip) continue;
+        if (quick && qi + 1 != QUICK_CASE_DISPLAY &&
+            !(dspark_tailskip && qi + 1 == PROBE_CASE_DISPLAY)) continue;
         const int display = qi + 1;
+        // Build 27: per-case decode cap (reassigned every iteration,
+        // so no state leaks between cases): the probe case gets its
+        // own cap, everything else keeps the mode's.
+        max_tokens = (dspark_tailskip && display == PROBE_CASE_DISPLAY)
+            ? PROBE_MAX_TOKENS : (quick ? QUICK_MAX_TOKENS : MAX_NEW_TOKENS);
         const std::string tag = "Case " + std::to_string(display);
         const std::string question = trial_cases[qi].question;
         const bool has_image = trial_cases[qi].has_image;
@@ -1912,6 +1994,18 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         emit_counters();
     }
 
+    // Build 27: surface the tailskip probe at top level so the
+    // service can validate the answer (org.json) and record the
+    // verdict without digging through the cases array. The probe
+    // case itself also stays in the cases array like any other.
+    if (dspark_tailskip) {
+        for (const auto & c : cases) {
+            if (c.value("index", 0) == PROBE_CASE_DISPLAY) {
+                report["moeTailSkipProbeAnswer"] = c.value("answer", std::string(""));
+                report["moeTailSkipProbeTokens"] = c.value("generatedTokens", 0);
+            }
+        }
+    }
     report["cases"] = cases;
     // Build 15: DSpark teardown. Print the runtime's own speculative
     // stats (common_speculative_print_stats) into the redirected
