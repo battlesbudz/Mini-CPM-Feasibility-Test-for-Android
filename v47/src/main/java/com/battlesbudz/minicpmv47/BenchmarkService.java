@@ -151,5 +151,11 @@ public final class BenchmarkService extends Service {
         }catch(Throwable error){state(error.getClass().getSimpleName()+": "+error.getMessage(),"ERROR");}
         finally{retire();}
     }
-    private void retire(){timers.shutdownNow();if(wake!=null&&wake.isHeld())wake.release();stopForeground(STOP_FOREGROUND_REMOVE);stopSelf();android.os.Process.killProcess(android.os.Process.myPid());}
+    // Build 26: retire() is the one funnel every terminal path
+    // (completed, error, user stop, watchdog timeout) passes
+    // through before the process is killed, so the export bundle
+    // is written here, synchronously and at most once per
+    // process. A run whose process dies outright leaves its
+    // on-disk state for the manual Export button instead.
+    private void retire(){try{RunExporter.exportOnce(this);}catch(Exception ignored){}timers.shutdownNow();if(wake!=null&&wake.isHeld())wake.release();stopForeground(STOP_FOREGROUND_REMOVE);stopSelf();android.os.Process.killProcess(android.os.Process.myPid());}
 }

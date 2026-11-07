@@ -628,6 +628,57 @@ matching the control exactly is the fix's pass. Then **DSpark
 pin + LFU**, two runs, which rides the same fixed LFU path.
 Pass bars are build 24's, unchanged.
 
+## Build 26 — the run export bundle (no more diagnostics pastes)
+
+Device pastes of the full diagnostics were tens of thousands of
+tokens, almost all of it the loader log embedded in
+`report.json`, and they flooded the working chat. Build 26
+changes no inference behavior, no arm, and no counter; it adds
+one thing: **every run exports itself as a single zip file.**
+
+- When a run reaches a terminal state (completed, error, user
+  stop, watchdog timeout), the service writes the bundle
+  automatically. The hook is `BenchmarkService.retire()`, the
+  one funnel every terminal path passes through before the
+  process is killed, and it fires at most once per process.
+- An **Export last run** button in the main screen bundles
+  whatever run state is on disk at any time, so a run whose
+  process died outright or was killed (build 25's LFU run 1
+  stopped with no completed report) still leaves a sendable
+  file. The saved bundle's filename shows in the status text.
+- The zip lands in the public **Downloads** folder via
+  MediaStore (no extra permission under scoped storage), with a
+  second copy in the app's external files `exports/` dir.
+  Filename: `minicpm-build<build>-<arm>-<yyyyMMdd-HHmmss>.zip`,
+  a fresh file per run, never overwritten.
+- Inside the zip, as separate files: `status.json`,
+  `report.json` (full), `report-slim.json` (the same report
+  with the `loaderLog` field removed), `summary.txt` (the
+  small verdict summary: build, commit, arm, pin/LFU flags,
+  verdict, tokens, decode tok/s, prefill, DSpark
+  rounds/drafted/accepted/rate, installs, hits, hit rate, IO,
+  peak thermal, peak PSS, and the full generated token ID
+  list), `memory.json` (the MEMORY snapshot), the last 32 KiB
+  of native stderr, `native_crash.txt` when one exists, and
+  `loader_log.txt` — the loader log in its own file, present
+  for crash chasing and never needed for a verdict.
+- The existing Copy diagnostics flow is unchanged. On the
+  analysis side, `extract_run.py` (in the trial records) reads
+  a bundle and prints only the summary fields, never the
+  loader log.
+
+**Device protocol for build 26:** install over build 25, do
+NOT tap Download. Run one quick arm (any arm) and confirm a
+bundle named for that arm appears in Downloads, open the app
+again and confirm the status text names the bundle, then attach
+the zip in chat instead of pasting diagnostics. After that,
+the build 25 protocol resumes on this build: control run 2
+(flags-off regression re-check on the fixed patch), a
+cool-phone LFU pair, and the pin + LFU pair, all reported as
+bundles. Pin run 2 already landed on build 25 (see the trial
+record), so pin is closed: its counters repeated exactly and
+installs were up, not down.
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub

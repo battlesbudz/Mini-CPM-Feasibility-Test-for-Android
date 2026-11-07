@@ -32,6 +32,18 @@ public final class MainActivity extends Activity {
         button(column,"Quick decode check · DSpark pin + LFU (A/B)",this::startQuickDsparkPinLfu);
         Button stop=new Button(this);stop.setText("Stop current operation");column.addView(stop);stop.setOnClickListener(v->{if(task!=null)task.cancel(true);if(workerAlive())startService(new Intent(this,BenchmarkService.class).setAction("STOP"));local="Stop requested.";refresh();});
         Button copy=new Button(this);copy.setText("Copy diagnostics");column.addView(copy);copy.setOnClickListener(v->{getSystemService(ClipboardManager.class).setPrimaryClip(ClipData.newPlainText("MiniCPM-V 4.7 diagnostics",diagnostics()));Toast.makeText(this,"Diagnostics copied",Toast.LENGTH_SHORT).show();});
+        // Build 26: manual export of the latest on-disk run
+        // state. Deliberately NOT one of the gated controls: it
+        // must work after a run that died, was killed, or is
+        // still sitting mid-run, which is exactly when the
+        // bundle matters most.
+        Button export=new Button(this);export.setText("Export last run");column.addView(export);export.setOnClickListener(v->{
+            local="Exporting last run…";refresh();
+            new Thread(()->{
+                String name=RunExporter.export(MainActivity.this);
+                ui.post(()->{local=name!=null?"Exported run bundle: "+name+" (saved in Downloads)":"Export failed: no bundle was written.";refresh();});
+            },"run-export").start();
+        });
         status=new TextView(this);status.setTextSize(13);column.addView(status);
         ui.postDelayed(new Runnable(){@Override public void run(){refresh();if(!destroyed)ui.postDelayed(this,2000);}},500);
         refresh();
@@ -105,6 +117,8 @@ public final class MainActivity extends Activity {
         if(destroyed||status==null)return;boolean running=workerAlive();
         for(Button b:controls)b.setEnabled(!busy&&!running);
         StringBuilder text=new StringBuilder(local);
+        String lastExport=fileText("export-last.txt").trim();
+        if(!lastExport.isEmpty())text.append("\n\nLast run bundle: ").append(lastExport).append(" (in Downloads)");
         if(new File(getFilesDir(),"native_crash.txt").length()>0)text.append("\n\nA native crash was recorded — Copy diagnostics includes the crash record and the native stderr tail.");
         String s=fileText("status.json");
         if(!s.isEmpty()){try{JSONObject o=new JSONObject(s);text.append("\n\nPhase: ").append(o.optString("phase")).append("\nStatus: ").append(o.optString("status"));}catch(Exception ignored){}}
