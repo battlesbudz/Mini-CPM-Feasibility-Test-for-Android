@@ -754,6 +754,16 @@ phone, run the **DSpark tail-skip** quick check twice; each
 run exports its bundle as usual — attach the zips. No new
 control runs are needed.
 
+## Build 29 — HOBBIT native stage 1: the cold-tail arm on an all-hot pack
+
+This build starts the HOBBIT native project's two-stage device protocol. Stage 1 engages the full native path with an empty cold set, so its correctness gate is exact token-ID equality with the DSpark I/O threads 8 control. It also prices the cold bank's memory on device.
+
+- **Fourth fork patch** `v47/patches/moe-slot-hobbit.patch`, fourth in `prepare_v47.py`'s patch list. It adds v2 cold-set manifest support and cold tensor creation in the expert/model loaders, then the native cold-slot runtime and dual hot/cold graph chain. `LLAMA_MOE_HOBBIT` gates the path and defaults off. Cold weights in the full design are computed directly from Q2_K; there is no install dequantization.
+- **New arm** `quick_dspark_hobbit`: the io8-on-stock DSpark setup (depth 3, slot bank 1024, uniform 32-slot windows, `LLAMA_MOE_IO_THREADS=8`) plus `LLAMA_MOE_HOBBIT=1`. It points to the stage-1 all-hot v2 manifest in the `experts-hobbit-allhot` shadow experts directory. Its 40 bin entries are symlinks to the original expert files; only the 73,805-byte manifest differs. The original pack is untouched, and `models.json` gains one entry for that manifest with SHA-256 `1303e128ea43c999eded0349bcc5b293fdeeb3a4b9c09f8f590bf2052027ffa6`. The new storage is about 74 KB.
+- The run export now includes `moe_sweep.txt`, the routing trace needed to mine the real stage-2 cold set and the prewarm table.
+
+**Device protocol for build 29:** install over build 28. Open the app once; it provisions the stage-1 manifest and shadow links itself. Tap **Download model pack** once: `models.json` gained one entry, so the store re-verifies the pack, and every file including the new 74 KB manifest verifies locally with no download. If the manifest is fetched from the network instead, report that as a defect. On a cool phone, run the **DSpark I/O threads 8** quick check (control), then the **DSpark HOBBIT cold-tail** quick check. Each run exports its bundle; attach both zips. Expected readings: the control reproduces 6,099 installs / 2,729 hits / 9,512 MiB / 7,379 calls with `moePrewarmTable` `w16 (vendor top-16/layer)` and the standard Case 3 token sequence. The HOBBIT run has token IDs identical to the control, `moeHobbit` on, `moeHobbitColdInstalls` 0, a loader log cold-bank line near 1,386 MiB, and `peakWorkerPssKb` higher by roughly the cold bank (~1.35 GiB).
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub

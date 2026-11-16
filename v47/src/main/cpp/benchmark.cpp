@@ -259,6 +259,17 @@
 // counters remain the regression check. One new variable per
 // verdict, as before.
 //
+// Build 29: HOBBIT native project's stage-1 arm. The fork gains
+// its fourth patch (prepared by Units 1–3 of that project and
+// already in this build's patch stack). The arm is io8-on-stock
+// plus LLAMA_MOE_HOBBIT=1 and the all-hot v2 pack in the shadow
+// experts dir. Stage 1 gates on token-ID equality with the io8
+// control and matching control counters: with an empty cold set
+// the dual path must be the stock model. The cold bank (~1.35 GiB)
+// is allocated in full and priced by memory fields; teardown
+// telemetry comes from the runtime's hobbit: line parsed below.
+// RunExporter carries moe_sweep.txt for stage-2 cold-set mining.
+//
 // Configuration mirrors the vendor demo defaults for this fork
 // (OpenBMB MiniCPM-V-demo-Android): 4 threads, 4096-token context,
 // image_max_slice_nums 9. Sampling is greedy (temperature 0) to match the
@@ -806,6 +817,10 @@ struct MoeCounters {
     bool tailSeen = false;
     long long tailBatches = 0, tailSkipped = 0;
     double tailBytesMiB = 0.0;
+    // Build 29: native HOBBIT cold-bank teardown counters.
+    bool hobbitSeen = false;
+    long long hobbitColdInstalls = 0, hobbitColdPositions = 0;
+    double hobbitColdBytesMiB = 0.0, hobbitFullBytesMiB = 0.0, hobbitColdInstallMs = 0.0;
 };
 static bool log_field_ll(const std::string & line, const char * key, long long & out) {
     const std::string k = std::string(key) + "=";
@@ -867,6 +882,22 @@ static MoeCounters parse_moe_counters(const std::string & log) {
                 c.tailBatches = batches;
                 c.tailSkipped = skipped;
                 c.tailBytesMiB = bytes;
+            }
+        }
+        if (line.find("hobbit: cold_installs=") != std::string::npos) {
+            long long installs = 0, positions = 0;
+            double coldBytes = 0.0, fullBytes = 0.0, installMs = 0.0;
+            if (log_field_ll(line, "cold_installs", installs) &&
+                log_field_d(line, "cold_bytes", coldBytes) &&
+                log_field_d(line, "full_bytes", fullBytes) &&
+                log_field_ll(line, "cold_positions", positions) &&
+                log_field_d(line, "cold_install_ms", installMs)) {
+                c.hobbitSeen = true;
+                c.hobbitColdInstalls = installs;
+                c.hobbitColdBytesMiB = coldBytes;
+                c.hobbitFullBytesMiB = fullBytes;
+                c.hobbitColdPositions = positions;
+                c.hobbitColdInstallMs = installMs;
             }
         }
         if (line.find("decode-cache:") != std::string::npos) {
@@ -954,8 +985,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     const bool dspark_lfu          = mode == "quick_dspark_lfu";
     const bool dspark_pinlfu       = mode == "quick_dspark_pinlfu";
     const bool dspark_tailskip     = mode == "quick_dspark_tailskip";
+    // Build 29: HOBBIT stage-1 arm is io8-on-stock plus the native cold-tail path.
+    const bool dspark_hobbit       = mode == "quick_dspark_hobbit";
     const bool dspark = mode == "quick_dspark" || dspark_io8 ||
-                        dspark_pin || dspark_lfu || dspark_pinlfu || dspark_tailskip;
+                        dspark_pin || dspark_lfu || dspark_pinlfu || dspark_tailskip || dspark_hobbit;
     const bool quick = mode == "quick" || lookahead_off || dspark;
     // Build 27: not const — the probe case raises the cap for its
     // own iteration (the case loop reassigns it every iteration).
@@ -1022,6 +1055,13 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
             fields["moeTailSkipSkipped"] = c.tailSkipped;
             fields["moeTailSkipBytesNotReadMiB"] = c.tailBytesMiB;
         }
+        if (c.hobbitSeen) {
+            fields["moeHobbitColdInstalls"] = c.hobbitColdInstalls;
+            fields["moeHobbitColdBytesReadMiB"] = c.hobbitColdBytesMiB;
+            fields["moeHobbitFullBytesMiB"] = c.hobbitFullBytesMiB;
+            fields["moeHobbitColdPositions"] = c.hobbitColdPositions;
+            fields["moeHobbitColdInstallMs"] = c.hobbitColdInstallMs;
+        }
         return fields;
     };
     auto emit_counters = [&]() {
@@ -1037,7 +1077,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         {"profile", "minicpm-v47-phone-trial-v1"},
         {"runtime", "llama.cpp-omni (tc-mb fork, LES / MoE-SSD)"},
         {"runtimeCommit", RUNTIME_COMMIT},
-        {"runtimePatch", "v47/patches/ggml-cpu-alloc-only-buft.patch (CPU alloc-only buft + llama-model.cpp loader fix; build 13 adds lookahead-accuracy telemetry counters in llama-moe-slot.cpp) + v47/patches/moe-slot-admission.patch (build 24: item-2 admission policies in llama-moe-slot.cpp - LLAMA_MOE_PIN_PREWARM / LLAMA_MOE_LFU_ADMIT, both env-gated and default off) + v47/patches/moe-slot-tail-skip.patch (build 27: item-5 tail-skip in llama-moe-slot.cpp - LLAMA_MOE_TAIL_SKIP, env-gated and default off)"},
+        {"runtimePatch", "v47/patches/ggml-cpu-alloc-only-buft.patch (CPU alloc-only buft + llama-model.cpp loader fix; build 13 adds lookahead-accuracy telemetry counters in llama-moe-slot.cpp) + v47/patches/moe-slot-admission.patch (build 24: item-2 admission policies in llama-moe-slot.cpp - LLAMA_MOE_PIN_PREWARM / LLAMA_MOE_LFU_ADMIT, both env-gated and default off) + v47/patches/moe-slot-tail-skip.patch (build 27: item-5 tail-skip in llama-moe-slot.cpp - LLAMA_MOE_TAIL_SKIP, env-gated and default off) + v47/patches/moe-slot-hobbit.patch (build 29: HOBBIT native cold-tail - manifest v2 cold set in llama-moe-experts, cold tensor creation in llama-model.cpp / qwen35moe.cpp, runtime cold machinery in llama-moe-slot.cpp, dual hot/cold chain in llama-graph - LLAMA_MOE_HOBBIT, env-gated and default off)"},
         {"modelRepo", "tc-mb/MiniCPM-V-Apps-gguf"},
         {"modelRevision", "8716e5209f308fd53f197ccd7d50c6fdcc2dc37d"},
         {"modelFiles", "main -les gguf + mmproj f16 + experts/ (40 shards + manifest.json)"},
@@ -1078,7 +1118,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     const std::string model_dir    = root + "/" + MODEL_SUBDIR;
     const std::string main_path    = model_dir + "/" + MAIN_GGUF;
     const std::string mmproj_path  = model_dir + "/" + MMPROJ_GGUF;
-    const std::string experts_path = model_dir + "/experts";
+    const std::string experts_path = model_dir + (dspark_hobbit ? "/experts-hobbit-allhot" : "/experts");
     report["moeExpertsPath"] = experts_path;
     report["moeSlotBank"] = MOE_SLOT_BANK;
 
@@ -1103,8 +1143,8 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // set or clear it explicitly in every arm.
     unsetenv("LLAMA_MOE_LAYER_WINDOWS");
     unsetenv("LLAMA_MOE_MATMUL_SPLIT");
-    if (dspark_io8)   setenv("LLAMA_MOE_IO_THREADS", "8", 1);
-    else              unsetenv("LLAMA_MOE_IO_THREADS");
+    if (dspark_io8 || dspark_hobbit) setenv("LLAMA_MOE_IO_THREADS", "8", 1);
+    else                             unsetenv("LLAMA_MOE_IO_THREADS");
     // Build 24: the item-2 admission policies live only in their
     // own arms. Both variables are read by the slot runtime once
     // at init, and this process exits after every run, so the
@@ -1120,6 +1160,9 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // exits after every run).
     if (dspark_tailskip) setenv("LLAMA_MOE_TAIL_SKIP", "1", 1);
     else                 unsetenv("LLAMA_MOE_TAIL_SKIP");
+    // Build 29: HOBBIT is set or cleared explicitly in every arm.
+    if (dspark_hobbit) setenv("LLAMA_MOE_HOBBIT", "1", 1);
+    else               unsetenv("LLAMA_MOE_HOBBIT");
     // Build 12 (research 2.1): lookahead prefetch ON, depth left at
     // the fork default of 8. The runtime predicts the next layer's
     // routing from the current hidden state and pre-reads those
@@ -1147,8 +1190,8 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         setenv("LLAMA_MOE_WINDOW_MAX_ROWS", std::to_string(DSPARK_WINDOW_MAX_ROWS).c_str(), 1);
     }
     report["moeLookaheadPrefetch"] = dspark ? "off" : (lookahead_off ? "off" : "on (depth default 8)");
-    report["abArm"] = dspark_tailskip ? "dspark_tailskip" : (dspark_pinlfu ? "dspark_pinlfu" : (dspark_pin ? "dspark_pin" : (dspark_lfu ? "dspark_lfu" : (dspark_io8 ? "dspark_io8" : (dspark ? "dspark_on" : (lookahead_off ? "lookahead_off" : "lookahead_on"))))));
-    if (dspark_io8)   report["moeIoThreads"] = 8;
+    report["abArm"] = dspark_hobbit ? "dspark_hobbit" : (dspark_tailskip ? "dspark_tailskip" : (dspark_pinlfu ? "dspark_pinlfu" : (dspark_pin ? "dspark_pin" : (dspark_lfu ? "dspark_lfu" : (dspark_io8 ? "dspark_io8" : (dspark ? "dspark_on" : (lookahead_off ? "lookahead_off" : "lookahead_on")))))));
+    if (dspark_io8 || dspark_hobbit) report["moeIoThreads"] = 8;
     if (dspark) {
         // Build 24: name both admission flags in every DSpark
         // arm's report, control included, so a device paste
@@ -1159,6 +1202,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         report["moePinPrewarm"] = (dspark_pin || dspark_pinlfu) ? "on" : "off";
         report["moeLfuAdmit"]   = (dspark_lfu || dspark_pinlfu) ? "on" : "off";
         report["moeTailSkip"]   = dspark_tailskip ? "on" : "off";
+        // Build 29: name HOBBIT stage-1 configuration in every DSpark report.
+        report["moeHobbit"] = dspark_hobbit ? "on" : "off";
+        report["moeHobbitColdSetSource"] = "stage 1 all-hot: cold set empty (no sweep data yet); all-hot v2 manifest over the original bins; the real cold set is mined from this build's exported moe_sweep.txt";
+        report["moeHobbitColdExperts"] = 0;
     }
     if (dspark) {
         report["dsparkDraftModel"] = std::string(DSPARK_GGUF) +
@@ -1184,6 +1231,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     if (dspark_lfu || dspark_pinlfu) emit("MoE admission: LLAMA_MOE_LFU_ADMIT=1 (probationary LFU admission)");
     // Build 27: the tail-skip arm's difference, same style.
     if (dspark_tailskip) emit("MoE tail-skip: LLAMA_MOE_TAIL_SKIP=1 (verify-batch last-rank misses are zeroed, not installed)");
+    if (dspark_hobbit) emit("MoE HOBBIT: LLAMA_MOE_HOBBIT=1 (native cold-tail; stage 1 all-hot pack - cold set empty, cold bank allocated) + LLAMA_MOE_IO_THREADS=8");
 
     // Prewarm table selection. First choice: a table mined from the
     // previous run's sweep trace (this app's own routing on this

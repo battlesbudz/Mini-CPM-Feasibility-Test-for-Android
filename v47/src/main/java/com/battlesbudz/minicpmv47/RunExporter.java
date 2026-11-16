@@ -64,6 +64,8 @@ public final class RunExporter {
             }
             putText(zip,"summary.txt",summary(status,report,partial));
             putText(zip,"memory.json",fileText(new File(files,"last-run/memory.json")));
+            // Build 29: LLAMA_MOE_SWEEP writes the routing trace into the model dir and truncates it at each context creation, so this is the just-finished run's trace; HOBBIT stage-2 cold-set mining (native scope §12) and the prewarm miner consume it.
+            putText(zip,"moe_sweep.txt",fileText(new File(files,"models/MiniCPM-V-4.7-35B-A3B/moe_sweep.txt")));
             putText(zip,"native_stderr_tail.txt",fileTail(new File(files,"native_stderr.log"),32*1024));
             File crash=new File(files,"native_crash.txt");
             if(crash.isFile()&&crash.length()>0)putText(zip,"native_crash.txt",fileText(crash));
@@ -134,6 +136,7 @@ public final class RunExporter {
             s.append("moePinPrewarm: ").append(status.optString("moePinPrewarm","")).append('\n');
             s.append("moeLfuAdmit: ").append(status.optString("moeLfuAdmit","")).append('\n');
             s.append("moeTailSkip: ").append(status.optString("moeTailSkip","")).append('\n');
+            s.append("moeHobbit: ").append(status.optString("moeHobbit","")).append('\n');
             s.append("phase: ").append(status.optString("phase","")).append('\n');
             s.append("status: ").append(status.optString("status","")).append('\n');
         }
@@ -153,6 +156,13 @@ public final class RunExporter {
             if(report.has("moeTailSkipBytesNotReadMiB"))s.append("moeTailSkipBytesNotReadMiB: ").append(num(report,"moeTailSkipBytesNotReadMiB")).append('\n');
             if(report.has("moeTailSkipProbeJsonValid"))s.append("moeTailSkipProbeJsonValid: ").append(report.optBoolean("moeTailSkipProbeJsonValid")).append('\n');
             if(report.has("moeTailSkipProbeTokens"))s.append("moeTailSkipProbeTokens: ").append(num(report,"moeTailSkipProbeTokens")).append('\n');
+            if(report.has("moeHobbitColdSetSource"))s.append("moeHobbitColdSetSource: ").append(report.optString("moeHobbitColdSetSource")).append('\n');
+            if(report.has("moeHobbitColdExperts"))s.append("moeHobbitColdExperts: ").append(num(report,"moeHobbitColdExperts")).append('\n');
+            if(report.has("moeHobbitColdInstalls"))s.append("moeHobbitColdInstalls: ").append(num(report,"moeHobbitColdInstalls")).append('\n');
+            if(report.has("moeHobbitColdBytesReadMiB"))s.append("moeHobbitColdBytesReadMiB: ").append(num(report,"moeHobbitColdBytesReadMiB")).append('\n');
+            if(report.has("moeHobbitFullBytesMiB"))s.append("moeHobbitFullBytesMiB: ").append(num(report,"moeHobbitFullBytesMiB")).append('\n');
+            if(report.has("moeHobbitColdPositions"))s.append("moeHobbitColdPositions: ").append(num(report,"moeHobbitColdPositions")).append('\n');
+            if(report.has("moeHobbitColdInstallMs"))s.append("moeHobbitColdInstallMs: ").append(num(report,"moeHobbitColdInstallMs")).append('\n');
             JSONArray cases=report.optJSONArray("cases");
             if(cases!=null)for(int i=0;i<cases.length();i++){
                 JSONObject c=cases.optJSONObject(i);if(c==null)continue;

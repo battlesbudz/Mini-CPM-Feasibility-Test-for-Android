@@ -26,6 +26,33 @@ final class ModelStore {
         context=c;root=new File(c.getFilesDir(),"models");root.mkdirs();
         try(InputStream in=c.getAssets().open("models.json")){manifest=new JSONObject(new String(Io.bytes(in),java.nio.charset.StandardCharsets.UTF_8));}
     }
+    // Build 29: stage-1 shadow pack. Create/verify all links before the manifest commit point,
+    // because models.json and ready() key on that manifest; partial provisioning must leave
+    // no manifest in place. The bins link to verified originals; the verified pack is untouched.
+    static void provisionHobbitAllHot(Context c)throws Exception{
+        File root=new File(c.getFilesDir(),"models");
+        File shadow=new File(root,"MiniCPM-V-4.7-35B-A3B/experts-hobbit-allhot");
+        if(!shadow.isDirectory()&&!shadow.mkdirs())throw new IOException("Cannot create HOBBIT shadow directory");
+        File manifest=new File(shadow,"manifest.json");
+        Files.deleteIfExists(manifest.toPath());
+        File originalExperts=new File(root,"MiniCPM-V-4.7-35B-A3B/experts");
+        for(int i=0;i<40;i++){
+            String name=String.format(Locale.US,"layer_%03d.bin",i);
+            File link=new File(shadow,name);
+            File target=new File(originalExperts,name);
+            String targetAbs=target.getAbsolutePath();
+            if(Files.isSymbolicLink(link.toPath())&&Files.readSymbolicLink(link.toPath()).toString().equals(targetAbs))continue;
+            if(Files.exists(link.toPath(),LinkOption.NOFOLLOW_LINKS))Files.delete(link.toPath());
+            android.system.Os.symlink(targetAbs,link.getAbsolutePath());
+        }
+        if(!manifest.isFile()||manifest.length()!=73805){
+            File temp=File.createTempFile("hobbit-manifest-",".tmp",shadow);
+            try(InputStream in=c.getAssets().open("hobbit_allhot_manifest.json");FileOutputStream out=new FileOutputStream(temp)){
+                byte[] buffer=new byte[8192];int n;while((n=in.read(buffer))!=-1)out.write(buffer,0,n);out.getFD().sync();
+            }catch(Exception e){temp.delete();throw e;}
+            Files.move(temp.toPath(),manifest.toPath(),StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
     boolean ready()throws Exception{
         File marker=new File(root,"verified.json");
         if(!marker.isFile()||!Io.read(marker.toPath()).equals(manifest.toString()))return false;

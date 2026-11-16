@@ -29,6 +29,14 @@ src/llama-moe-slot.cpp, in regions disjoint from both earlier patches'
 hunks there (it applies onto the pristine pin standalone, and in
 either order relative to the admission patch), so PATCHED_FILES is
 unchanged and the same byte-exact check covers all three.
+
+Build HOBBIT Unit 1 adds a fourth patch: schema v2 parsing and cold-set
+storage in the MoE experts loader. See the patch header for the manifest
+shape and validation details.
+
+Build HOBBIT Unit 2 extends that patch with the cold slot runtime and its
+staged cold ids accessor; src/llama-moe-slot.h is covered by PATCHED_FILES.
+Build HOBBIT Unit 3 adds the dual hot/cold graph chain and chained cold ids op.
 """
 import pathlib, shutil, subprocess, tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -38,6 +46,7 @@ PATCHES = [
     ROOT / "v47/patches/ggml-cpu-alloc-only-buft.patch",
     ROOT / "v47/patches/moe-slot-admission.patch",
     ROOT / "v47/patches/moe-slot-tail-skip.patch",
+    ROOT / "v47/patches/moe-slot-hobbit.patch",
 ]
 PATCHED_FILES = [
     "ggml/include/ggml-backend.h",
@@ -45,6 +54,13 @@ PATCHED_FILES = [
     "ggml/src/ggml-cpu/ggml-cpu.cpp",
     "src/llama-model.cpp",
     "src/llama-moe-slot.cpp",
+    "src/llama-moe-slot.h",
+    "src/llama-moe-experts.h",
+    "src/llama-moe-experts.cpp",
+    "src/llama-model.h",
+    "src/models/qwen35moe.cpp",
+    "src/llama-graph.h",
+    "src/llama-graph.cpp",
 ]
 def git(*args): return subprocess.check_output(["git", *args], text=True).strip()
 def run(*args): subprocess.run(["git", *args], check=True)
@@ -54,12 +70,19 @@ def dirty_paths():
     out = subprocess.check_output(["git", "-C", str(dest), "status", "--porcelain"], text=True)
     return {line[3:] for line in out.splitlines() if line}
 def patch_is_applied():
-    # True iff the working tree differs from HEAD by exactly our patches.
-    # Byte-exact: rebuild HEAD + patches in a scratch dir and compare, so an
-    # unrelated edit anywhere in the touched files (even outside the patch
-    # hunks) is still treated as foreign and refused, never silently reset.
-    if dirty_paths() != set(PATCHED_FILES):
+    # Byte-exact: rebuild HEAD + patches and compare every covered path.
+    # Later-unit paths not touched yet are identity entries; no outside path
+    # may be dirty, and edits to any covered path still fail this comparison.
+    if not dirty_paths().issubset(set(PATCHED_FILES)):
         return False
+    # A matching worktree is not enough: checkout below would discard a foreign staged version.
+    for rel in PATCHED_FILES:
+        head_blob = subprocess.check_output(["git", "-C", str(dest), "show", f"HEAD:{rel}"])
+        index_blob = subprocess.run(
+            ["git", "-C", str(dest), "show", f":{rel}"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if index_blob.returncode != 0 or index_blob.stdout != head_blob:
+            return False
     with tempfile.TemporaryDirectory() as td:
         for rel in PATCHED_FILES:
             blob = subprocess.check_output(["git", "-C", str(dest), "show", f"HEAD:{rel}"])

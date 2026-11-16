@@ -1,0 +1,1278 @@
+HOBBIT Units 1–2 patch: manifest schema v2 cold-expert parsing/storage and
+cold slot runtime machinery. Unit 1's optional top-level `cold` object
+contains `quant_type`, `source`, `family_bytes`, and optional per-layer
+`layers` arrays of expert ids. Validation covers schema versions, type
+capabilities, per-layer stride fit, layer/expert ranges, unique ids, JSON
+shapes, and unsigned values above INT64_MAX before signed conversion.
+
+Unit 3a adds cold tensor fields, cold load bases/views, and manifest suffix
+resolution. Unit 2 adds only the const `llama_model::moe_experts_is_cold()`
+forwarder plus the runtime cold binding/state, LRU allocation, direct cold
+preadv installs, `llama_moe_slot_runtime::staged_cold_slot_ids()` accessor,
+counters, and HOBBIT matmul-split rule.
+
+LLAMA_MOE_HOBBIT is read once and defaults off; off leaves the hot runtime
+path unchanged. In HOBBIT mode, each hot-prefill, hot-decode, cold-prefill,
+and cold-decode binding set has exactly one zero slot. Cold tensor byte sizes
+come only from the v2 cold family_bytes accessor; bytes_per_expert remains the
+hot size. Cold prefill capacity is 128; cold decode views use each layer's hot
+width. Empty v2 cold sets still allocate the full cold bank.
+
+The runtime forces matmul_split to zero when HOBBIT is on, so no A2 install
+is deferred. Cold experts remain in their manifest quantization and are read
+directly into their own cold slot tensors; no conversion is performed.
+
+Unit 3 adds `has_cold_layer()` and the chained `build_slot_ids_tensor_cold()`
+operation (hot ids are both map_custom2 carriers; the callback ignores the
+second source and copies the staged cold ids). When the runtime reports a
+cold layer, build_moe_ffn computes separate hot and cold gate/up/activation/
+down chains, then adds them immediately before router weighting. It rejects
+fused gate_up, biases/scales, weight_before_ffn, and missing cold tensors with
+named runtime errors. The hot graph names stay stock; the cold chain uses the
+`_cold` names, and the add is `ffn_moe_dual_add`. MTP verification resolved:
+this trial GGUF has nextn_predict_layers absent/default zero, so no MTP graph
+block exists and the reverse-gap guard is inert for graph_mtp.
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 31d4c41..7daf1bd 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -18,6 +18,7 @@
+ #include <cstring>
+ #include <numeric>
+ #include <sstream>
++#include <stdexcept>
+ #include <unordered_set>
+ 
+ // dedup helpers
+@@ -1453,7 +1454,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * gate_up_exps,
+          ggml_tensor * up_exps_s,
+          ggml_tensor * gate_exps_s,
+-         ggml_tensor * down_exps_s) const {
++         ggml_tensor * down_exps_s,
++         ggml_tensor * gate_up_exps_cold,
++         ggml_tensor * up_exps_cold,
++         ggml_tensor * gate_exps_cold,
++         ggml_tensor * down_exps_cold) const {
+     return build_moe_ffn(
+         cur,
+         gate_inp,  /* gate_inp_b  */ nullptr,
+@@ -1473,7 +1478,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         /* gate_up_exps_b */ nullptr,
+         up_exps_s,
+         gate_exps_s,
+-        down_exps_s
++        down_exps_s,
++        gate_up_exps_cold,
++        up_exps_cold,
++        gate_exps_cold,
++        down_exps_cold
+     );
+ }
+ 
+@@ -1500,10 +1509,34 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * gate_up_exps_b,
+          ggml_tensor * up_exps_s,
+          ggml_tensor * gate_exps_s,
+-         ggml_tensor * down_exps_s) const {
++         ggml_tensor * down_exps_s,
++         ggml_tensor * gate_up_exps_cold,
++         ggml_tensor * up_exps_cold,
++         ggml_tensor * gate_exps_cold,
++         ggml_tensor * down_exps_cold) const {
+     const int64_t n_embd   = cur->ne[0];
+     const int64_t n_tokens = cur->ne[1];
+     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
++    const bool runtime_cold_layer = moe_slots && moe_slots->uses_layer(il) && moe_slots->has_cold_layer(il);
++    const bool cold_any = gate_up_exps_cold || up_exps_cold || gate_exps_cold || down_exps_cold;
++    const bool cold_separate = up_exps_cold && gate_exps_cold && down_exps_cold;
++    const bool dual = cold_separate && moe_slots && moe_slots->uses_layer(il) && moe_slots->has_cold_layer(il);
++    if (runtime_cold_layer && !cold_any) {
++        throw std::runtime_error("HOBBIT cold layer without cold tensors");
++    }
++    if (runtime_cold_layer && cold_any && !cold_separate) {
++        throw std::runtime_error("HOBBIT incomplete cold expert tensor set");
++    }
++    if (dual && (gate_up_exps || gate_up_exps_cold)) {
++        throw std::runtime_error("HOBBIT dual chain does not support fused gate_up experts");
++    }
++    if (dual && (up_exps_b || gate_exps_b || down_exps_b || gate_up_exps_b ||
++                 up_exps_s || gate_exps_s || down_exps_s)) {
++        throw std::runtime_error("HOBBIT dual chain does not support expert bias or scale tensors");
++    }
++    if (dual && weight_before_ffn) {
++        throw std::runtime_error("HOBBIT dual chain does not support weight_before_ffn");
++    }
+ 
+     ggml_tensor * logits = nullptr;
+ 
+@@ -1631,6 +1664,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     ggml_build_forward_expand(gf, weights);
+ 
+     ggml_tensor * selected_experts_mm = selected_experts;
++    ggml_tensor * selected_experts_cold_mm = nullptr;
+     if (moe_slots && moe_slots->uses_layer(il)) {
+         selected_experts_mm = moe_slots->build_slot_ids_tensor(ctx0, selected_experts, il);
+         cb(selected_experts_mm, "ffn_moe_slots", il);
+@@ -1638,6 +1672,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ 
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+ 
++    if (dual) {
++        selected_experts_cold_mm = moe_slots->build_slot_ids_tensor_cold(ctx0, selected_experts_mm, il);
++        cb(selected_experts_cold_mm, "ffn_moe_cold_ids", il);
++    }
++
+     // ── A2：把 MoE 拆成两段，让「已驻留专家」的计算盖住「缺失专家」的读取 ──
+     //
+     // 结构（Metal 按 split 提交，所以这个顺序天然产生重叠）：
+@@ -1702,6 +1741,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         return out;
+     }
+ 
++
++    ggml_tensor * up = nullptr;
++    ggml_tensor * experts = nullptr;
++
+     if (weight_before_ffn) {
+         // repeat cur to [n_embd, n_expert_used, n_tokens]
+         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
+@@ -1709,11 +1752,65 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(cur, "ffn_moe_weighted", il);
+     }
+ 
+-    ggml_tensor * up = nullptr;
+-    ggml_tensor * experts = nullptr;
++    if (dual) {
++        auto build_dual_chain = [&](ggml_tensor * up_w, ggml_tensor * gate_w, ggml_tensor * down_w,
++                                    ggml_tensor * ids, const char * suffix) {
++            ggml_tensor * chain_up = build_lora_mm_id(up_w, cur, ids);
++            cb(chain_up, suffix[0] ? "ffn_moe_up_cold" : "ffn_moe_up", il);
++            ggml_tensor * chain_gate = build_lora_mm_id(gate_w, cur, ids);
++            cb(chain_gate, suffix[0] ? "ffn_moe_gate_cold" : "ffn_moe_gate", il);
++            ggml_tensor * activated = nullptr;
++            switch (type_op) {
++                case LLM_FFN_SILU:
++                    if (gate_w && arch == LLM_ARCH_STEP35 && il >= 0) {
++                        const float limit = hparams.swiglu_clamp_exp[il];
++                        constexpr float eps = 1e-6f;
++                        if (limit > eps) {
++                            ggml_tensor * gate_act = ggml_silu(ctx0, chain_gate);
++                            cb(gate_act, "ffn_moe_silu", il);
++                            gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
++                            cb(gate_act, "ffn_moe_silu_clamped", il);
++                            chain_up = ggml_clamp(ctx0, chain_up, -limit, limit);
++                            cb(chain_up, "ffn_moe_up_clamped", il);
++                            activated = ggml_mul(ctx0, gate_act, chain_up);
++                            cb(activated, "ffn_moe_swiglu_limited", il);
++                            break;
++                        }
++                    }
++                    activated = ggml_swiglu_split(ctx0, chain_gate, chain_up);
++                    cb(activated, suffix[0] ? "ffn_moe_swiglu_cold" : "ffn_moe_swiglu", il);
++                    break;
++                case LLM_FFN_GELU:
++                    activated = ggml_geglu_split(ctx0, chain_gate, chain_up);
++                    cb(activated, "ffn_moe_geglu", il);
++                    break;
++                case LLM_FFN_SWIGLU_OAI_MOE:
++                    activated = ggml_swiglu_oai(ctx0, chain_gate, chain_up, 1.702f, 7.0f);
++                    cb(activated, "ffn_moe_swiglu_oai", il);
++                    break;
++                case LLM_FFN_RELU:
++                    activated = ggml_reglu_split(ctx0, chain_gate, chain_up);
++                    cb(activated, "ffn_moe_reglu", il);
++                    break;
++                case LLM_FFN_RELU_SQR:
++                    GGML_ABORT("fatal error: gated squared relu not implemented");
++                default:
++                    GGML_ABORT("fatal error");
++            }
++            ggml_tensor * chain_down = build_lora_mm_id(down_w, activated, ids);
++            cb(chain_down, suffix[0] ? "ffn_moe_down_cold" : "ffn_moe_down", il);
++            return chain_down;
++        };
++        ggml_tensor * experts_hot = build_dual_chain(up_exps, gate_exps, down_exps, selected_experts_mm, "");
++        ggml_tensor * experts_cold = build_dual_chain(up_exps_cold, gate_exps_cold, down_exps_cold,
++                                                       selected_experts_cold_mm, "_cold");
++        experts = ggml_add(ctx0, experts_hot, experts_cold);
++        cb(experts, "ffn_moe_dual_add", il);
++    }
+ 
+ 
+-    if (gate_up_exps) {
++    if (!dual) {
++        if (gate_up_exps) {
+         // merged gate_up path: one mul_mat_id, then split into gate and up views
+         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts_mm); // [n_ff*2, n_expert_used, n_tokens]
+         cb(gate_up, "ffn_moe_gate_up", il);
+@@ -1863,6 +1960,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         experts = ggml_mul(ctx0, experts, s);
+         cb(experts, "ffn_moe_down_scaled", il);
+     }
++    }
++
+ 
+     if (!weight_before_ffn) {
+         experts = ggml_mul(ctx0, experts, weights);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 8678e0e..47001d0 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -927,7 +927,11 @@ struct llm_graph_context {
+              ggml_tensor * gate_up_exps = nullptr,
+              ggml_tensor * up_exps_s = nullptr,
+              ggml_tensor * gate_exps_s = nullptr,
+-             ggml_tensor * down_exps_s = nullptr) const;
++             ggml_tensor * down_exps_s = nullptr,
++             ggml_tensor * gate_up_exps_cold = nullptr,
++             ggml_tensor * up_exps_cold = nullptr,
++             ggml_tensor * gate_exps_cold = nullptr,
++             ggml_tensor * down_exps_cold = nullptr) const;
+ 
+     ggml_tensor * build_moe_ffn(
+              ggml_tensor * cur,
+@@ -952,7 +956,11 @@ struct llm_graph_context {
+              ggml_tensor * gate_up_exps_b = nullptr,
+              ggml_tensor * up_exps_s = nullptr,
+              ggml_tensor * gate_exps_s = nullptr,
+-             ggml_tensor * down_exps_s = nullptr) const;
++             ggml_tensor * down_exps_s = nullptr,
++             ggml_tensor * gate_up_exps_cold = nullptr,
++             ggml_tensor * up_exps_cold = nullptr,
++             ggml_tensor * gate_exps_cold = nullptr,
++             ggml_tensor * down_exps_cold = nullptr) const;
+ 
+     //
+     // inputs
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 0524ab9..cb25593 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2117,6 +2117,22 @@ int32_t llama_model::moe_experts_layer_count() const {
+     return pimpl->moe_experts ? pimpl->moe_experts->layer_count() : 0;
+ }
+ 
++bool llama_model::moe_experts_has_cold() const {
++    return pimpl->moe_experts && pimpl->moe_experts->has_cold();
++}
++
++bool llama_model::moe_experts_is_cold(int32_t layer, int32_t expert) const {
++    return pimpl->moe_experts && pimpl->moe_experts->is_cold(layer, expert);
++}
++
++ggml_type llama_model::moe_experts_cold_type() const {
++    return pimpl->moe_experts ? pimpl->moe_experts->cold_type() : GGML_TYPE_COUNT;
++}
++
++size_t llama_model::moe_experts_cold_family_bytes() const {
++    return pimpl->moe_experts ? pimpl->moe_experts->cold_family_bytes() : 0;
++}
++
+ int32_t llama_model::moe_decode_window() const {
+     if (!pimpl->moe_experts) {
+         return 0;
+@@ -2222,10 +2238,13 @@ const llama_moe_experts_entry * llama_model::moe_experts_entry(const char * tens
+     if (!pimpl->moe_experts || !tensor_name) {
+         return nullptr;
+     }
+-    // decode 窗口张量的名字是 `<原名>.dec`（见 qwen35moe 的窗口布局），
+-    // 它们是同一份权重、同一个 experts entry，所以查表前剥掉后缀。
++    // 窗口张量沿用同一个 experts entry，所以查表前剥掉布局后缀。
+     std::string name = tensor_name;
+-    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".dec") == 0) {
++    if (name.size() > 9 && name.compare(name.size() - 9, 9, ".cold.dec") == 0) {
++        name.resize(name.size() - 9);
++    } else if (name.size() > 5 && name.compare(name.size() - 5, 5, ".cold") == 0) {
++        name.resize(name.size() - 5);
++    } else if (name.size() > 4 && name.compare(name.size() - 4, 4, ".dec") == 0) {
+         name.resize(name.size() - 4);
+     }
+     return pimpl->moe_experts->find(name.c_str());
+diff --git a/src/llama-model.h b/src/llama-model.h
+index fb0599c..0c588c1 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -299,6 +299,12 @@ struct llama_layer {
+     struct ggml_tensor * ffn_up_exps       = nullptr;
+     struct ggml_tensor * ffn_gate_up_exps  = nullptr;
+ 
++    // Native HOBBIT cold expert slot tensors (created only for a v2 cold manifest).
++    struct ggml_tensor * ffn_gate_up_exps_cold = nullptr;
++    struct ggml_tensor * ffn_gate_exps_cold    = nullptr;
++    struct ggml_tensor * ffn_up_exps_cold      = nullptr;
++    struct ggml_tensor * ffn_down_exps_cold    = nullptr;
++
+     // MoE-SSD decode 专用 slot 张量。指向**同一块 buffer 上本层自己的偏移**
+     // （`view_offs = il * c * bytes_per_expert`），ne[2] = 每层窗口宽度 c，
+     // 所以层间不共用 slot，decode 缓存能跨 token 保留。
+@@ -313,6 +319,10 @@ struct llama_layer {
+     struct ggml_tensor * ffn_down_exps_dec    = nullptr;
+     struct ggml_tensor * ffn_up_exps_dec      = nullptr;
+     struct ggml_tensor * ffn_gate_up_exps_dec = nullptr;
++    struct ggml_tensor * ffn_gate_up_exps_cold_dec = nullptr;
++    struct ggml_tensor * ffn_gate_exps_cold_dec    = nullptr;
++    struct ggml_tensor * ffn_up_exps_cold_dec      = nullptr;
++    struct ggml_tensor * ffn_down_exps_cold_dec    = nullptr;
+     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
+     struct ggml_tensor * ffn_gate_exps_b   = nullptr;
+     struct ggml_tensor * ffn_down_exps_b   = nullptr;
+@@ -677,6 +687,10 @@ struct llama_model {
+     int32_t moe_experts_layer_count() const;
+ 
+     const llama_moe_experts_entry * moe_experts_entry(const char * tensor_name) const;
++    bool moe_experts_has_cold() const;
++    bool moe_experts_is_cold(int32_t layer, int32_t expert) const;
++    ggml_type moe_experts_cold_type() const;
++    size_t moe_experts_cold_family_bytes() const;
+ 
+     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
+     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
+diff --git a/src/llama-moe-experts.cpp b/src/llama-moe-experts.cpp
+index 5bfa41b..2d24b78 100644
+--- a/src/llama-moe-experts.cpp
++++ b/src/llama-moe-experts.cpp
+@@ -1,6 +1,7 @@
+ #include "llama-moe-experts.h"
+ 
+ #include "llama-impl.h"
++#include "ggml-cpu.h"
+ 
+ #include <nlohmann/json.hpp>
+ 
+@@ -11,6 +12,7 @@
+ #include <limits>
+ #include <stdexcept>
+ #include <unordered_set>
++#include <charconv>
+ 
+ namespace {
+ 
+@@ -44,6 +46,15 @@ bool routed_family(const std::string & family) {
+            family == "ffn_gate_up_exps";
+ }
+ 
++int32_t parse_layer_key(const std::string & key) {
++    int32_t layer = -1;
++    const auto result = std::from_chars(key.data(), key.data() + key.size(), layer);
++    if (key.empty() || result.ec != std::errc() || result.ptr != key.data() + key.size()) {
++        throw std::runtime_error(format("invalid cold layer key '%s'", key.c_str()));
++    }
++    return layer;
++}
++
+ }
+ 
+ llama_moe_experts::llama_moe_experts(const char * input_path) {
+@@ -65,7 +76,8 @@ llama_moe_experts::llama_moe_experts(const char * input_path) {
+     nlohmann::json manifest;
+     stream >> manifest;
+ 
+-    if (manifest.value("schema_version", 0) != 1) {
++    const int schema_version = manifest.value("schema_version", 0);
++    if (schema_version != 1 && schema_version != 2) {
+         throw std::runtime_error("unsupported MoE experts schema version");
+     }
+     // 兼容旧 manifest：早期写的是 `sidecar_kind`。数据格式改名不该让已生成的
+@@ -145,6 +157,113 @@ llama_moe_experts::llama_moe_experts(const char * input_path) {
+         throw std::runtime_error("MoE experts manifest has no routed expert tensors");
+     }
+     n_layer = (int32_t) layers.size();
++
++    // Version 1 remains the original hot-only format. In particular, a cold
++    // key in a v1 document has no meaning and is not inspected.
++    if (schema_version == 2 && manifest.contains("cold")) {
++        const auto & cold = manifest.at("cold");
++        if (!cold.is_object()) {
++            throw std::runtime_error("MoE experts cold section must be an object");
++        }
++        if (!cold.contains("quant_type") || !cold.at("quant_type").is_string()) {
++            throw std::runtime_error("MoE experts cold quant_type is required and must be a string");
++        }
++        if (!cold.contains("source") || !cold.at("source").is_string()) {
++            throw std::runtime_error("MoE experts cold source is required and must be a string");
++        }
++        if (!cold.contains("family_bytes") || !cold.at("family_bytes").is_number_unsigned() &&
++                !cold.at("family_bytes").is_number_integer()) {
++            throw std::runtime_error("MoE experts cold family_bytes is required and must be an integer");
++        }
++
++        cold_quant_type = parse_type(cold.at("quant_type").get<std::string>());
++        cold_set_source = cold.at("source").get<std::string>();
++        if (cold.at("family_bytes").is_number_unsigned() &&
++                cold.at("family_bytes").get<uint64_t>() > (uint64_t) std::numeric_limits<int64_t>::max()) {
++            throw std::runtime_error("MoE experts cold family_bytes is out of range");
++        }
++        const auto family_bytes = cold.at("family_bytes").get<int64_t>();
++        if (family_bytes <= 0) {
++            throw std::runtime_error("MoE experts cold family_bytes must be greater than zero");
++        }
++        cold_bytes_per_family = (size_t) family_bytes;
++
++        const auto * type_traits = ggml_get_type_traits(cold_quant_type);
++        const auto * cpu_traits = ggml_get_type_traits_cpu(cold_quant_type);
++        if (!type_traits || !type_traits->to_float) {
++            throw std::runtime_error(format("MoE experts cold quant type '%s' has no to_float conversion",
++                ggml_type_name(cold_quant_type)));
++        }
++        if (!cpu_traits || !cpu_traits->vec_dot) {
++            throw std::runtime_error(format("MoE experts cold quant type '%s' has no vec_dot kernel",
++                ggml_type_name(cold_quant_type)));
++        }
++
++        for (const auto & item : entries) {
++            if (item.second.type == cold_quant_type) {
++                throw std::runtime_error(format("MoE experts cold quant type '%s' matches routed entry '%s'",
++                    ggml_type_name(cold_quant_type), item.first.c_str()));
++            }
++        }
++
++        cold_layer_experts.resize((size_t) n_layer);
++        if (cold.contains("layers")) {
++            if (!cold.at("layers").is_object()) {
++                throw std::runtime_error("MoE experts cold layers must be an object");
++            }
++            for (auto layer_it = cold.at("layers").begin(); layer_it != cold.at("layers").end(); ++layer_it) {
++                const int32_t layer = parse_layer_key(layer_it.key());
++                if (layer < 0 || layer >= n_layer) {
++                    throw std::runtime_error(format("MoE experts cold layer %d is outside [0, %d)", layer, n_layer));
++                }
++                if (!layer_it.value().is_array()) {
++                    throw std::runtime_error(format("MoE experts cold ids for layer %d must be an array", layer));
++                }
++                std::unordered_set<int32_t> seen;
++                auto & ids = cold_layer_experts[(size_t) layer];
++                for (const auto & value : layer_it.value()) {
++                    if (!value.is_number_integer() || value.is_number_float()) {
++                        throw std::runtime_error(format("MoE experts cold ids for layer %d must be integers", layer));
++                    }
++                    if (value.is_number_unsigned() &&
++                            value.get<uint64_t>() > (uint64_t) std::numeric_limits<int64_t>::max()) {
++                        throw std::runtime_error(format("MoE experts cold expert id in layer %d is out of range (unsigned integer)", layer));
++                    }
++                    const int64_t expert = value.get<int64_t>();
++                    if (expert < 0 || expert >= n_expert) {
++                        throw std::runtime_error(format("MoE experts cold expert id %lld for layer %d is outside [0, %d)",
++                            (long long) expert, layer, n_expert));
++                    }
++                    const int32_t id = (int32_t) expert;
++                    if (!seen.insert(id).second) {
++                        throw std::runtime_error(format("duplicate MoE experts cold id %d in layer %d", id, layer));
++                    }
++                    ids.push_back(id);
++                }
++                if (!ids.empty()) {
++                    if (cold_bytes_per_family > std::numeric_limits<size_t>::max() / 3) {
++                        throw std::runtime_error("MoE experts cold family extent overflows");
++                    }
++                    const size_t cold_extent = 3 * cold_bytes_per_family;
++                    bool found_layer = false;
++                    for (const auto & item : entries) {
++                        if (item.second.layer == layer) {
++                            found_layer = true;
++                            if (cold_extent > item.second.expert_stride) {
++                                throw std::runtime_error(format("MoE experts cold family extent %zu exceeds expert stride %zu in layer %d",
++                                    cold_extent, item.second.expert_stride, layer));
++                            }
++                        }
++                    }
++                    if (!found_layer) {
++                        throw std::runtime_error(format("MoE experts cold layer %d has no routed entries", layer));
++                    }
++                    n_cold += (int32_t) ids.size();
++                }
++            }
++        }
++        cold_present = true;
++    }
+ }
+ 
+ const llama_moe_experts_entry * llama_moe_experts::find(const char * tensor_name) const {
+@@ -167,3 +286,36 @@ int32_t llama_moe_experts::layer_count() const {
+ size_t llama_moe_experts::bytes_per_slot_all_layers() const {
+     return bytes_per_slot;
+ }
++
++bool llama_moe_experts::has_cold() const {
++    return cold_present;
++}
++
++ggml_type llama_moe_experts::cold_type() const {
++    return cold_quant_type;
++}
++
++size_t llama_moe_experts::cold_family_bytes() const {
++    return cold_bytes_per_family;
++}
++
++const std::string & llama_moe_experts::cold_source() const {
++    return cold_set_source;
++}
++
++bool llama_moe_experts::is_cold(int32_t layer, int32_t expert) const {
++    const auto & ids = cold_experts(layer);
++    return std::find(ids.begin(), ids.end(), expert) != ids.end();
++}
++
++const std::vector<int32_t> & llama_moe_experts::cold_experts(int32_t layer) const {
++    static const std::vector<int32_t> empty;
++    if (layer < 0 || (size_t) layer >= cold_layer_experts.size()) {
++        return empty;
++    }
++    return cold_layer_experts[(size_t) layer];
++}
++
++int32_t llama_moe_experts::cold_count() const {
++    return n_cold;
++}
+diff --git a/src/llama-moe-experts.h b/src/llama-moe-experts.h
+index b06f765..25c9d3f 100644
+--- a/src/llama-moe-experts.h
++++ b/src/llama-moe-experts.h
+@@ -6,6 +6,7 @@
+ #include <cstdint>
+ #include <string>
+ #include <unordered_map>
++#include <vector>
+ 
+ struct llama_moe_experts_entry {
+     int32_t layer = -1;
+@@ -31,10 +32,24 @@ public:
+     int32_t layer_count() const;
+     size_t bytes_per_slot_all_layers() const;
+ 
++    bool has_cold() const;
++    ggml_type cold_type() const;
++    size_t cold_family_bytes() const;
++    const std::string & cold_source() const;
++    bool is_cold(int32_t layer, int32_t expert) const;
++    const std::vector<int32_t> & cold_experts(int32_t layer) const;
++    int32_t cold_count() const;
++
+ private:
+     int32_t n_expert = 0;
+     int32_t n_expert_used = 0;
+     int32_t n_layer = 0;
+     size_t bytes_per_slot = 0;
+     std::unordered_map<std::string, llama_moe_experts_entry> entries;
++    bool cold_present = false;
++    ggml_type cold_quant_type = GGML_TYPE_COUNT;
++    size_t cold_bytes_per_family = 0;
++    std::string cold_set_source;
++    std::vector<std::vector<int32_t>> cold_layer_experts;
++    int32_t n_cold = 0;
+ };
+diff --git a/src/llama-moe-slot.cpp b/src/llama-moe-slot.cpp
+index 352e2b4..d476d53 100644
+--- a/src/llama-moe-slot.cpp
++++ b/src/llama-moe-slot.cpp
+@@ -526,6 +526,19 @@ struct llama_moe_slot_runtime::impl {
+         std::string dec_pack_path;
+         std::vector<binding> dec_bindings;
+         std::vector<size_t> dec_pack_order;
++        bool cold_pack_ok = false;
++        size_t cold_pack_base = 0, cold_pack_stride = 0;
++        std::string cold_pack_path;
++        std::vector<binding> cold_bindings;
++        std::vector<size_t> cold_pack_order;
++        bool cold_dec_pack_ok = false;
++        size_t cold_dec_pack_base = 0, cold_dec_pack_stride = 0;
++        std::string cold_dec_pack_path;
++        std::vector<binding> cold_dec_bindings;
++        std::vector<size_t> cold_dec_pack_order;
++        std::vector<int32_t> slot_to_expert_cold, expert_to_slot_cold;
++        std::vector<uint64_t> slot_age_cold;
++        uint64_t age_cold = 0;
+ 
+         /// 预读成功发布进本窗口的次数（诊断用；与 n_hits 的区别是后者统计的是
+         /// 主路径命中，这里统计 worker 的产出）。
+@@ -539,6 +552,8 @@ struct llama_moe_slot_runtime::impl {
+         std::vector<uint8_t> slot_prob;
+         uint64_t age = 0;
+         std::mutex mutex;
++        int32_t cold_zero_slot = -1;
++        bool cold_zero_armed = false;
+     };
+     struct map_userdata {
+         llama_moe_slot_runtime * runtime = nullptr;
+@@ -607,6 +622,12 @@ struct llama_moe_slot_runtime::impl {
+     // 三者的和是 process_ns 的子集，差值就是其余部分（分配、淘汰、统计等）。
+     std::atomic<int64_t> readids_ns{0};
+     std::atomic<int64_t> install_ns{0};
++    bool hobbit = false;
++    static constexpr int32_t kColdPrefillCap = 128;
++    std::vector<std::vector<int32_t>> cold_ids_staging;
++    std::atomic<uint64_t> cold_installs{0}, cold_prefill_installs{0}, cold_decode_installs{0};
++    std::atomic<uint64_t> cold_bytes{0}, cold_full_bytes{0}, cold_positions{0};
++    std::atomic<int64_t> cold_install_ns{0};
+     std::atomic<int64_t> writeids_ns{0};
+     // 诊断：各层「用到的专家并集」大小之和（= 图里真正要做的 (行,专家) matvec 次数）。
+     // 用来区分 ε 是「按并集大小（kernel 次数）」还是「按字节」增长。
+@@ -648,7 +669,11 @@ struct llama_moe_slot_runtime::impl {
+         predicted(model.layers.size()),
+         deferred(model.layers.size()),
+         miss_per_layer(model.layers.size(), 0),
+-        userdata(model.layers.size()) {
++        userdata(model.layers.size()),
++        cold_ids_staging(model.layers.size()) {
++        const char * hobbit_env = std::getenv("LLAMA_MOE_HOBBIT");
++        hobbit = hobbit_env && *hobbit_env && *hobbit_env != '0';
++        if (hobbit) moe_log("hobbit: on; cold prefill cap=%d", kColdPrefillCap);
+         for (size_t il = 0; il < model.layers.size(); ++il) {
+             auto & state = layers[il];
+             const auto & layer = model.layers[il];
+@@ -657,10 +682,19 @@ struct llama_moe_slot_runtime::impl {
+             bind(state, layer.ffn_gate_exps,    n_slots);
+             bind(state, layer.ffn_up_exps,      n_slots);
+             bind(state, layer.ffn_down_exps,    n_slots);
++            if (hobbit && model.moe_experts_has_cold()) {
++                cold_bind(state, layer.ffn_gate_exps_cold, kColdPrefillCap);
++                cold_bind(state, layer.ffn_up_exps_cold, kColdPrefillCap);
++                cold_bind(state, layer.ffn_down_exps_cold, kColdPrefillCap);
++            }
+ 
+             if (state.bindings.empty()) {
+                 continue;
+             }
++            if (hobbit && model.moe_experts_has_cold() && !state.cold_bindings.empty() &&
++                state.cold_bindings.size() != 3) {
++                throw std::runtime_error(format("incomplete MoE cold slot bindings for layer %zu", il));
++            }
+             if (!layer.ffn_down_exps ||
+                 (!layer.ffn_gate_up_exps && (!layer.ffn_gate_exps || !layer.ffn_up_exps))) {
+                 throw std::runtime_error(format("incomplete MoE slot bindings for layer %zu", il));
+@@ -671,6 +705,13 @@ struct llama_moe_slot_runtime::impl {
+             state.slot_to_expert.assign(n_slots, kSlotFree);
+             state.expert_to_slot.assign(n_expert, kSlotFree);
+             state.slot_age.assign(n_slots, 0);
++            if (!state.cold_bindings.empty()) {
++                finalize_pack(state.cold_bindings, state.cold_pack_order, state.cold_pack_ok,
++                              state.cold_pack_base, state.cold_pack_stride, state.cold_pack_path);
++                state.slot_to_expert_cold.assign(kColdPrefillCap, kSlotFree);
++                state.expert_to_slot_cold.assign(n_expert, kSlotFree);
++                state.slot_age_cold.assign(kColdPrefillCap, 0);
++            }
+             // window_start 不在这里算 —— decode_window 要到 resolve_decode_window()
+             // 才确定，此处还是 0。在那边统一赋值，否则所有层会共用窗口起点 [0, W)，
+             // 层间互相覆盖（曾经的实际 bug）。
+@@ -713,6 +754,15 @@ struct llama_moe_slot_runtime::impl {
+                         ggml_get_name(b.tensor)));
+                 }
+             }
++            if (hobbit && !layer.cold_bindings.empty() && !layer.cold_pack_ok) {
++                throw std::runtime_error("MoE cold experts layer is not packed");
++            }
++            for (const auto & b : layer.cold_bindings) {
++                if (!b.tensor->buffer || !ggml_backend_buffer_is_host_addressable(b.tensor->buffer)) {
++                    throw std::runtime_error(format("MoE cold slot tensor '%s' is not CPU-addressable",
++                        ggml_get_name(b.tensor)));
++                }
++            }
+         }
+ 
+         moe_log("init pack=%s pack_layers=%d/%d bank=%d shared=%s experts=%d io_threads=%d stride0=%zu preadv=on park_window=%s",
+@@ -723,6 +773,10 @@ struct llama_moe_slot_runtime::impl {
+ 
+         lookahead.init((int32_t) n_slots, n_expert, last_moe_layer,
+             [this](int layer, int expert, int slot) {
++                if (hobbit && this->model.moe_experts_is_cold(layer, expert)) {
++                    if (slot < 0) install_cold_prefetch_into_window(layer, expert);
++                    return; // cold lookahead is installed only in its layer decode window
++                }
+                 if (slot < 0) {
+                     install_prefetch_into_window(layer, expert);
+                 } else {
+@@ -732,7 +786,8 @@ struct llama_moe_slot_runtime::impl {
+         resolve_decode_window();
+         {
+             const char * e = std::getenv("LLAMA_MOE_MATMUL_SPLIT");
+-            matmul_split = e ? std::atoi(e) : 0;
++            matmul_split = hobbit ? 0 : (e ? std::atoi(e) : 0);
++            if (hobbit) moe_log("matmul-split: forced to 0 by HOBBIT");
+             if (matmul_split > 0) {
+                 moe_log("matmul-split: 末尾 %d 个位置的缺失专家延后读取（读与算重叠）",
+                         (int) matmul_split);
+@@ -775,12 +830,51 @@ struct llama_moe_slot_runtime::impl {
+                                       (int) decode_window, e.what());
+                     }
+                 }
++                if (hobbit && fail.empty() && model.moe_experts_has_cold()) {
++                    const std::pair<ggml_tensor *, const char *> cold_fam[3] = {
++                        { layer.ffn_gate_exps_cold_dec, "cold_gate" },
++                        { layer.ffn_up_exps_cold_dec, "cold_up" },
++                        { layer.ffn_down_exps_cold_dec, "cold_down" },
++                    };
++                    for (int k = 0; k < 3 && fail.empty(); ++k) {
++                        if (!cold_fam[k].first) continue;
++                        try {
++                            cold_bind(state, cold_fam[k].first,
++                                layer_width[il] > 0 ? layer_width[il] : decode_window + prefetch_slots,
++                                &state.cold_dec_bindings);
++                        } catch (const std::exception & e) {
++                            fail = format("layer %zu family %s: %s", il, cold_fam[k].second, e.what());
++                        }
++                    }
++                    if (fail.empty() && !state.cold_dec_bindings.empty()) {
++                        finalize_pack(state.cold_dec_bindings, state.cold_dec_pack_order,
++                            state.cold_dec_pack_ok, state.cold_dec_pack_base,
++                            state.cold_dec_pack_stride, state.cold_dec_pack_path);
++                        const int32_t cw = layer_width[il] > 0 ? layer_width[il] : decode_window + prefetch_slots;
++                        state.slot_to_expert_cold.assign((size_t) cw, kSlotFree);
++                        state.slot_age_cold.assign((size_t) cw, 0);
++                    }
++                }
+                 if (fail.empty() && state.dec_bindings.empty()) {
+                     fail = format("layer %zu has no decode tensors", il);
+                 }
++                if (fail.empty() && hobbit && model.moe_experts_has_cold() &&
++                    !state.cold_bindings.empty() && state.cold_dec_bindings.size() != 3) {
++                    fail = format("layer %zu has incomplete cold decode tensors", il);
++                }
+                 if (fail.empty()) {
+                     finalize_pack(state.dec_bindings, state.dec_pack_order, state.dec_pack_ok,
+                                   state.dec_pack_base, state.dec_pack_stride, state.dec_pack_path);
++                    if (hobbit && !state.cold_dec_bindings.empty()) {
++                        for (const auto & b : state.cold_dec_bindings) {
++                            if (!b.tensor->buffer || !ggml_backend_buffer_is_host_addressable(b.tensor->buffer)) {
++                                fail = format("cold decode tensor '%s' is not CPU-addressable", ggml_get_name(b.tensor));
++                                break;
++                            }
++                        }
++                    }
++                }
++                if (fail.empty()) {
+                     n_dec++;
+                 }
+             }
+@@ -819,6 +913,8 @@ struct llama_moe_slot_runtime::impl {
+     /// 清空只发生在 prefill→decode 边界（那时没有 worker 在飞），但保留判断更安全
+     /// —— 否则会把 worker 的位置标成空闲，主路径分配过去就撞车了。
+     static void clear_layer_cache(layer_state & st) {
++        st.cold_zero_slot = -1;
++        st.cold_zero_armed = false;
+         // tail-skip 的零 slot 随缓存一起解除武装：新窗口阶段第一次真
+         // 跳过时再重新武装（重新清零）。策略关闭时这两个字段恒为
+         // -1/false，这两行无副作用。
+@@ -834,6 +930,8 @@ struct llama_moe_slot_runtime::impl {
+         // LFU 类别随缓存一起清：新窗口里落位时再标。策略关闭时 slot_prob
+         // 是空 vector，这行是 no-op。
+         std::fill(st.slot_prob.begin(), st.slot_prob.end(), 0);
++        for (auto & e : st.slot_to_expert_cold) if (e != kSlotPending) e = kSlotFree;
++        std::fill(st.expert_to_slot_cold.begin(), st.expert_to_slot_cold.end(), kSlotFree);
+     }
+ 
+     /// 预读：把一个预测专家读进**目标层自己的窗口**，与缓存共用同一片 slot 池。
+@@ -955,6 +1053,37 @@ struct llama_moe_slot_runtime::impl {
+         publish_slot_in_window(st, expert, slot);
+     }
+ 
++    void install_cold_prefetch_into_window(int layer, int32_t expert) {
++        if (layer < 0 || layer >= (int) layers.size() || expert < 0 || expert >= n_expert) return;
++        auto & st = layers[(size_t) layer];
++        if (st.cold_dec_bindings.empty() || decode_window <= 0) return;
++        int32_t slot = -1;
++        {
++            std::lock_guard<std::mutex> lock(st.mutex);
++            if (st.expert_to_slot_cold[(size_t)expert] >= 0) return;
++            const int32_t hi = (int32_t) st.slot_to_expert_cold.size();
++            for (int32_t c = 0; c < hi; ++c) if (st.slot_to_expert_cold[(size_t)c] == kSlotFree) { slot = c; break; }
++            if (slot < 0) {
++                uint64_t oldest = UINT64_MAX;
++                for (int32_t c = 0; c < hi; ++c) {
++                    int32_t resident = st.slot_to_expert_cold[(size_t)c];
++                    if (resident >= 0 && c != st.cold_zero_slot && st.slot_age_cold[(size_t)c] < oldest) {
++                        oldest = st.slot_age_cold[(size_t)c]; slot = c;
++                    }
++                }
++            }
++            if (slot < 0) return;
++            const int32_t old = st.slot_to_expert_cold[(size_t)slot];
++            if (old >= 0) st.expert_to_slot_cold[(size_t)old] = kSlotFree;
++            st.slot_to_expert_cold[(size_t)slot] = kSlotPending;
++        }
++        read_cold_expert_directv(st, expert, slot, true);
++        std::lock_guard<std::mutex> lock(st.mutex);
++        st.slot_to_expert_cold[(size_t)slot] = expert;
++        st.expert_to_slot_cold[(size_t)expert] = slot;
++        st.slot_age_cold[(size_t)slot] = ++st.age_cold;
++    }
++
+     /// ── 缓存预热（LLAMA_MOE_PREWARM）───────────────────────────────────
+     ///
+     /// 每轮生成开始时各层窗口都是空的（进窗口模式时整表清空 / park 后又清）。
+@@ -1268,6 +1397,14 @@ struct llama_moe_slot_runtime::impl {
+                 cur.n_tokens <= 1 ? n_decode_step : n_prefill_ubatch);
+         }
+         lookahead.report();
++        if (hobbit) {
++            moe_log("hobbit: cold_installs=%llu cold_bytes=%.1fMiB full_bytes=%.1fMiB cold_positions=%llu cold_install_ms=%.1f",
++                (unsigned long long) cold_installs.load(std::memory_order_relaxed),
++                (double) cold_bytes.load(std::memory_order_relaxed) / (1024.0 * 1024.0),
++                (double) cold_full_bytes.load(std::memory_order_relaxed) / (1024.0 * 1024.0),
++                (unsigned long long) cold_positions.load(std::memory_order_relaxed),
++                (double) cold_install_ns.load(std::memory_order_relaxed) / 1000000.0);
++        }
+         if (tail_skip) {
+             moe_log("tail-skip: batches=%llu skipped=%llu bytes=%.1fMiB",
+                 (unsigned long long) tail_batches.load(std::memory_order_relaxed),
+@@ -1325,6 +1462,21 @@ struct llama_moe_slot_runtime::impl {
+         (out ? *out : state.bindings).push_back({ tensor, entry });
+     }
+ 
++    void cold_bind(layer_state & state, ggml_tensor * tensor, int32_t expect_slots,
++                   std::vector<binding> * out = nullptr) {
++        if (!tensor) return;
++        const auto * entry = model.moe_experts_entry(ggml_get_name(tensor));
++        const size_t family_bytes = model.moe_experts_cold_family_bytes();
++        if (!entry || family_bytes == 0) {
++            throw std::runtime_error(format("missing cold experts entry for tensor '%s'", ggml_get_name(tensor)));
++        }
++        if (tensor->ne[2] != expect_slots ||
++            ggml_nbytes(tensor) != family_bytes * (size_t) expect_slots) {
++            throw std::runtime_error(format("invalid cold virtual slot tensor '%s'", ggml_get_name(tensor)));
++        }
++        (out ? *out : state.cold_bindings).push_back({ tensor, entry });
++    }
++
+     using pack_out = layer_state;
+ 
+     static void finalize_pack(std::vector<binding> & bindings, std::vector<size_t> & order,
+@@ -1582,6 +1734,39 @@ struct llama_moe_slot_runtime::impl {
+         return dt;
+     }
+ 
++    int64_t read_cold_expert_directv(const layer_state & st, int32_t expert, int32_t slot,
++                                     bool window_mode) {
++        const auto & bs = window_mode ? st.cold_dec_bindings : st.cold_bindings;
++        const auto & order = window_mode ? st.cold_dec_pack_order : st.cold_pack_order;
++        const auto & path = window_mode ? st.cold_dec_pack_path : st.cold_pack_path;
++        const size_t base = window_mode ? st.cold_dec_pack_base : st.cold_pack_base;
++        const size_t stride = window_mode ? st.cold_dec_pack_stride : st.cold_pack_stride;
++        const size_t bytes = model.moe_experts_cold_family_bytes();
++        if (order.size() != 3 || bytes == 0) throw std::runtime_error("invalid packed cold family set");
++        struct iovec iov[3];
++        for (size_t i = 0; i < 3; ++i) {
++            auto & b = bs[order[i]];
++            iov[i].iov_base = (uint8_t *) b.tensor->data + (size_t) slot * bytes;
++            iov[i].iov_len = bytes;
++        }
++        const int64_t t0 = now_ns();
++        readv_span(fd_for(path), base + (size_t) expert * stride, iov, 3);
++        const int64_t dt = now_ns() - t0;
++        const uint64_t cb = 3 * bytes;
++        uint64_t fb = 0;
++        for (const auto & b : (window_mode ? st.dec_bindings : st.bindings))
++            if (b.entry) fb += b.entry->bytes_per_expert;
++        cold_installs.fetch_add(1, std::memory_order_relaxed);
++        (window_mode ? cold_decode_installs : cold_prefill_installs).fetch_add(1, std::memory_order_relaxed);
++        cold_bytes.fetch_add(cb, std::memory_order_relaxed);
++        cold_full_bytes.fetch_add(fb, std::memory_order_relaxed);
++        cold_install_ns.fetch_add(dt, std::memory_order_relaxed);
++        stats.n_bytes.fetch_add(cb, std::memory_order_relaxed);
++        stats.n_miss.fetch_add(1, std::memory_order_relaxed);
++        stats.pread_ns.fetch_add(dt, std::memory_order_relaxed);
++        return dt;
++    }
++
+     static const uint8_t * host_data(const ggml_tensor * tensor) {
+         if (!tensor || !tensor->data || (tensor->buffer && !ggml_backend_buffer_is_host(tensor->buffer))) {
+             return nullptr;
+@@ -2193,6 +2378,20 @@ struct llama_moe_slot_runtime::impl {
+         }
+     }
+ 
++    void zero_cold_slot(const layer_state & st, int32_t slot, bool window_mode) {
++        const auto & bs = window_mode ? st.cold_dec_bindings : st.cold_bindings;
++        const size_t bytes = model.moe_experts_cold_family_bytes();
++        for (const auto & b : bs) if (b.tensor)
++            memset((uint8_t *) b.tensor->data + (size_t) slot * bytes, 0, bytes);
++    }
++
++    void zero_hot_slot(const layer_state & st, int32_t slot, bool window_mode) {
++        const auto & bs = window_mode ? st.dec_bindings : st.bindings;
++        for (const auto & b : bs) if (b.tensor && b.entry)
++            memset((uint8_t *) b.tensor->data + (size_t) slot * b.entry->bytes_per_expert,
++                   0, b.entry->bytes_per_expert);
++    }
++
+     /// 本层一个专家的 decode 总字节（各 family 的 bytes_per_expert 之
+     /// 和），即一次安装真正要读的字节数，遥测用。
+     static size_t dec_expert_bytes(const layer_state & st) {
+@@ -2273,6 +2472,8 @@ struct llama_moe_slot_runtime::impl {
+         for (const auto & st : layers) {
+             add(st.bindings);
+             add(st.dec_bindings);
++            add(st.cold_bindings);
++            add(st.cold_dec_bindings);
+         }
+         return { uniq.begin(), uniq.end() };
+     }
+@@ -2373,10 +2574,46 @@ bool llama_moe_slot_runtime::uses_layer(int layer) const {
+     return layer >= 0 && layer < (int) pimpl->layers.size() && pimpl->layers[layer].enabled;
+ }
+ 
++bool llama_moe_slot_runtime::has_cold_layer(int layer) const {
++    return pimpl->hobbit && layer >= 0 && layer < (int) pimpl->layers.size() &&
++        pimpl->layers[(size_t) layer].enabled &&
++        !pimpl->layers[(size_t) layer].cold_bindings.empty();
++}
++
+ int llama_moe_slot_runtime::matmul_split() const {
+     return pimpl->matmul_split;
+ }
+ 
++const std::vector<int32_t> & llama_moe_slot_runtime::staged_cold_slot_ids(int layer) const {
++    static const std::vector<int32_t> empty;
++    return layer >= 0 && layer < (int) pimpl->cold_ids_staging.size()
++        ? pimpl->cold_ids_staging[(size_t) layer] : empty;
++}
++
++void llama_moe_slot_runtime::map_custom_cold(
++        ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b,
++        int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    GGML_UNUSED(b);
++    if (ith != 0) return;
++    auto * data = static_cast<llama_moe_slot_runtime::impl::map_userdata *>(userdata);
++    const auto & ids = data->runtime->staged_cold_slot_ids(data->layer);
++    const size_t src_bytes = ids.size() * sizeof(int32_t);
++    if (src_bytes != ggml_nbytes(dst)) {
++        throw std::runtime_error(format(
++            "HOBBIT cold slot ids size mismatch at layer %d: staged=%zu dst=%zu",
++            data->layer, src_bytes, ggml_nbytes(dst)));
++    }
++    GGML_UNUSED(a);
++    memcpy(dst->data, ids.data(), src_bytes);
++}
++
++ggml_tensor * llama_moe_slot_runtime::build_slot_ids_tensor_cold(
++        ggml_context * ctx, ggml_tensor * hot_ids, int layer) {
++    if (!has_cold_layer(layer)) return hot_ids;
++    return ggml_map_custom2(ctx, hot_ids, hot_ids, map_custom_cold, 1, &pimpl->userdata[(size_t) layer]);
++}
++
+ /// A2 的 phase B 节点：把 slot_ids 拷一份作为输出（这样本节点自然依赖 phase A），
+ /// 同时依赖前段专家的 matmul 输出 `b` —— 于是调度器会把它排在前段算完之后、
+ /// 后段 matmul 之前执行。
+@@ -2580,6 +2817,34 @@ void llama_moe_slot_runtime::process(
+     const size_t count = experts.size();
+     std::vector<int32_t> slots(count);
+     std::vector<uint8_t> requested(pimpl->n_expert, 0);
++    std::vector<uint8_t> requested_cold(pimpl->n_expert, 0);
++    std::vector<int32_t> cold_slots(count, -1);
++    const bool cold_active = pimpl->hobbit && !state.cold_bindings.empty();
++    if (cold_active) {
++        const int32_t hot_zero = window_mode
++            ? state.window_start + std::max<int32_t>(1, state.window_width) - 1
++            : pimpl->n_slots - 1;
++        if (!state.tail_zero_armed) {
++            const int32_t resident = state.slot_to_expert[(size_t) hot_zero];
++            if (resident >= 0) state.expert_to_slot[(size_t) resident] = kSlotFree;
++            state.slot_to_expert[(size_t) hot_zero] = kSlotFree;
++            pimpl->zero_hot_slot(state, hot_zero, window_mode);
++            state.tail_zero_slot = hot_zero;
++            state.tail_zero_armed = true;
++        }
++        if (!state.cold_zero_armed) {
++            const int32_t cz = (int32_t) (window_mode ? state.cold_dec_bindings[0].tensor->ne[2]
++                                                       : state.cold_bindings[0].tensor->ne[2]) - 1;
++            if (cz >= 0) {
++                const int32_t resident = state.slot_to_expert_cold[(size_t)cz];
++                if (resident >= 0) state.expert_to_slot_cold[(size_t)resident] = kSlotFree;
++                state.slot_to_expert_cold[(size_t)cz] = kSlotFree;
++                pimpl->zero_cold_slot(state, cz, window_mode);
++                state.cold_zero_slot = cz;
++                state.cold_zero_armed = true;
++            }
++        }
++    }
+ 
+     // 诊断：这个 token 里哪些**位置**会 miss（该位置还不在缓存里）。
+     // 注意此时槽位分配还没做，所以只用 expert_to_slot 判断「已驻留」。
+@@ -2597,16 +2862,64 @@ void llama_moe_slot_runtime::process(
+         if (experts[i] < 0 || experts[i] >= pimpl->n_expert) {
+             throw std::runtime_error("MoE expert id is out of range");
+         }
+-        if (!requested[experts[i]]) {
+-            requested[experts[i]] = 1;
+-            // LFU 需求计数（trial item 2）：需求集语义 —— 窗口模式下每层
+-            // 每步每个专家最多记一次，不按位置数（投机验证的 4 行是同一个
+-            // 需求集，不该把同一专家记 4 次）。纯计数，不影响本步任何决策
+-            // 之外的行为；计数本身只被后面的淘汰扫描读。
+-            if (window_mode && pimpl->lfu_admit) {
+-                pimpl->note_demand(layer, experts[i]);
++        const bool is_cold = cold_active && pimpl->model.moe_experts_is_cold(layer, experts[i]);
++        // LFU demand remains class-agnostic: count each requested expert once
++        // per layer and step, matching the stock demand-set semantics.
++        uint8_t & class_requested = is_cold
++            ? requested_cold[(size_t) experts[i]] : requested[(size_t) experts[i]];
++        if (!class_requested) {
++            class_requested = 1;
++            if (window_mode && pimpl->lfu_admit) pimpl->note_demand(layer, experts[i]);
++        }
++    }
++
++    // Cold experts use an independent plain-LRU bank. Prefill is the shared
++    // 128-slot segment; decode uses the cold view's layer window.
++    std::vector<llama_moe_slot_runtime::impl::pending_install> cold_pending;
++    if (cold_active) {
++        const int32_t cold_capacity = (int32_t) (window_mode
++            ? state.cold_dec_bindings[0].tensor->ne[2] : state.cold_bindings[0].tensor->ne[2]);
++        const int32_t cold_lo = 0;
++        const int32_t cold_hi = state.cold_zero_armed ? state.cold_zero_slot : cold_capacity;
++        int unique_cold = 0;
++        for (uint8_t value : requested_cold) unique_cold += value != 0;
++        if (unique_cold > cold_hi - cold_lo) {
++            throw std::runtime_error(format("layer %d requires more than %d unique cold experts in one graph; reduce ubatch or increase --moe-slot-bank",
++                layer, cold_hi - cold_lo));
++        }
++        for (size_t pos = 0; pos < count; ++pos) {
++            const int32_t expert = experts[pos];
++            if (!requested_cold[(size_t) expert]) {
++                cold_slots[pos] = state.cold_zero_slot;
++                continue;
+             }
++            int32_t slot = state.expert_to_slot_cold[(size_t) expert];
++            if (slot < 0) {
++                for (int32_t c = cold_lo; c < cold_hi; ++c) if (state.slot_to_expert_cold[(size_t)c] == kSlotFree) { slot = c; break; }
++                if (slot < 0) {
++                    uint64_t oldest = UINT64_MAX;
++                    for (int32_t c = cold_lo; c < cold_hi; ++c) {
++                        const int32_t resident = state.slot_to_expert_cold[(size_t)c];
++                        if (resident >= 0 && !requested_cold[(size_t)resident] && state.slot_age_cold[(size_t)c] < oldest) {
++                            oldest = state.slot_age_cold[(size_t)c]; slot = c;
++                        }
++                    }
++                }
++                if (slot < 0) throw std::runtime_error(format("layer %d requires more than %d unique cold experts in one graph; reduce ubatch or increase --moe-slot-bank", layer, cold_hi-cold_lo));
++                const int32_t old = state.slot_to_expert_cold[(size_t)slot];
++                if (old >= 0) state.expert_to_slot_cold[(size_t)old] = kSlotFree;
++                state.slot_to_expert_cold[(size_t)slot] = expert;
++                state.expert_to_slot_cold[(size_t)expert] = slot;
++                state.slot_age_cold[(size_t)slot] = ++state.age_cold;
++                cold_pending.push_back({expert, slot});
++            }
++            cold_slots[pos] = slot;
++            if (requested_cold[(size_t) expert]) {
++                state.slot_age_cold[(size_t) slot] = ++state.age_cold;
++            }
++            pimpl->cold_positions.fetch_add(1, std::memory_order_relaxed);
+         }
++        pimpl->cold_ids_staging[(size_t)layer] = cold_slots;
+     }
+ 
+     if (pimpl->lookahead.enabled && !decode) {
+@@ -2722,6 +3035,7 @@ void llama_moe_slot_runtime::process(
+     } else if (lookahead_step) {
+         alloc_hi = pimpl->lookahead.slot_floor();
+     }
++    if (cold_active && !window_mode) alloc_hi = std::min<int32_t>(alloc_hi, pimpl->n_slots - 1);
+ 
+     // 「缓存 + 预测」的结合点（零 I/O 成本）：
+     // 上一层给出的预测里，有些专家本层这次没用到、但**下一步**会用。淘汰时必须
+@@ -2816,6 +3130,10 @@ void llama_moe_slot_runtime::process(
+ 
+     for (size_t pos = 0; pos < count; ++pos) {
+         const int32_t expert = experts[pos];
++        if (cold_active && pimpl->model.moe_experts_is_cold(layer, expert)) {
++            slots[pos] = state.tail_zero_slot;
++            continue;
++        }
+         if (state.expert_to_slot[expert] >= 0) {
+             slots[pos] = state.expert_to_slot[expert];   // 已驻留，无需读取
+             if (lfu_active && state.slot_prob[(size_t) slots[pos]]) {
+@@ -2953,7 +3271,9 @@ void llama_moe_slot_runtime::process(
+         }
+         if (slot < 0) {
+             throw std::runtime_error(format(
+-                "layer %d requires more than %d unique experts in one graph; reduce ubatch or increase --moe-slot-bank",
++                cold_active
++                    ? "layer %d requires more than %d unique hot experts in one graph; reduce ubatch or increase --moe-slot-bank"
++                    : "layer %d requires more than %d unique experts in one graph; reduce ubatch or increase --moe-slot-bank",
+                 layer, alloc_hi - alloc_lo));
+         }
+         if (lfu_active) {
+@@ -3005,6 +3325,12 @@ void llama_moe_slot_runtime::process(
+     const llama_moe_slot_runtime::impl::install_timing timing =
+         pimpl->install_pending(state, pending, window_mode);
+     pimpl->install_ns.fetch_add(timing.wall_ns, std::memory_order_relaxed);
++    if (cold_active) {
++        for (const auto & item : cold_pending) {
++            pimpl->read_cold_expert_directv(state, item.expert, item.slot, window_mode);
++        }
++        if (cold_slots.size() == count) pimpl->write_i32_ids(slot_ids, slots);
++    }
+ 
+     if (!pending.empty()) {
+         // 仅统计，不影响读取路径。按层取增量，避免 cur 累计后重复计数。
+diff --git a/src/llama-moe-slot.h b/src/llama-moe-slot.h
+index 0aa556f..91c8353 100644
+--- a/src/llama-moe-slot.h
++++ b/src/llama-moe-slot.h
+@@ -3,6 +3,7 @@
+ #include "ggml.h"
+ 
+ #include <memory>
++#include <vector>
+ 
+ struct llama_model;
+ 
+@@ -12,6 +13,7 @@ public:
+     ~llama_moe_slot_runtime();
+ 
+     bool uses_layer(int layer) const;
++    bool has_cold_layer(int layer) const;
+     bool lookahead_prefetch_enabled() const;
+     int  lookahead_prefetch_depth() const;
+     /// 每层 decode 窗口宽度（slot 数）。0 = 未启用按层窗口。
+@@ -35,6 +37,10 @@ public:
+         int layer);
+     void process(int layer, const ggml_tensor * expert_ids, ggml_tensor * slot_ids,
+                  const ggml_tensor * lookahead_pred = nullptr);
++    const std::vector<int32_t> & staged_cold_slot_ids(int layer) const;
++    ggml_tensor * build_slot_ids_tensor_cold(ggml_context * ctx, ggml_tensor * hot_ids, int layer);
++    static void map_custom_cold(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b,
++                                int ith, int nth, void * userdata);
+ 
+     /// 累加「图执行期间的专家管理耗时」（`map_custom` 回调内）。
+     ///
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index d8c62fb..c319331 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -89,11 +89,16 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
+     };
+     // family -> (bytes_per_expert -> 层号升序)
+     std::map<size_t, std::vector<int>> groups[4];
++    const bool cold_bank_enabled = moe_slot_bank_enabled() && moe_experts_has_cold();
++    std::map<size_t, std::vector<int>> cold_groups[4];
+     for (int il = 0; il < (int) n_layer; ++il) {
+         for (int fi = 0; fi < 4; ++fi) {
+             const auto * e = moe_experts_entry(tn(fam_ids[fi], "weight", il).str().c_str());
+             if (e) {
+                 groups[fi][e->bytes_per_expert].push_back(il);
++                if (cold_bank_enabled) {
++                    cold_groups[fi][moe_experts_cold_family_bytes()].push_back(il);
++                }
+             }
+         }
+     }
+@@ -312,6 +317,12 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
+             { &llama_layer::ffn_up_exps,      &llama_layer::ffn_up_exps_dec      },
+             { &llama_layer::ffn_down_exps,    &llama_layer::ffn_down_exps_dec    },
+         };
++        const fam_t cold_fams[4] = {
++            { &llama_layer::ffn_gate_up_exps_cold, &llama_layer::ffn_gate_up_exps_cold_dec },
++            { &llama_layer::ffn_gate_exps_cold,    &llama_layer::ffn_gate_exps_cold_dec    },
++            { &llama_layer::ffn_up_exps_cold,      &llama_layer::ffn_up_exps_cold_dec      },
++            { &llama_layer::ffn_down_exps_cold,    &llama_layer::ffn_down_exps_cold_dec    },
++        };
+ 
+         size_t resident = 0;
+         int n_win = 0;
+@@ -377,6 +388,80 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
+             }
+         }
+ 
++        if (cold_bank_enabled) {
++            constexpr int64_t cold_prefill_cap = 128;
++            const ggml_type cold_type = moe_experts_cold_type();
++            const size_t cold_bytes = moe_experts_cold_family_bytes();
++            size_t cold_resident = 0;
++            int cold_n_win = 0;
++            int cold_n_grp = 0;
++
++            for (int fi = 0; fi < 4; ++fi) {
++                for (const auto & kv : cold_groups[fi]) {
++                    const std::vector<int> & members = kv.second;
++                    if (members.empty()) {
++                        continue;
++                    }
++                    const int first = members.front();
++                    ggml_tensor * hot = layers[first].*fams[fi].pf;
++                    if (!hot) {
++                        continue;
++                    }
++
++                    int64_t cold_group_slots = cold_prefill_cap;
++                    if (dec_enabled) {
++                        for (int il : members) {
++                            cold_group_slots += width_of(il);
++                        }
++                    }
++                    const std::string hot_name = ggml_get_name(hot);
++                    const LLM_TN_IMPL hot_tn = tn(fam_ids[fi], "weight", first);
++                    const LLM_TN_IMPL cold_tn(
++                        hot_tn.arch, hot_tn.tensor, "weight.cold.base", hot_tn.bid, hot_tn.xid);
++                    ggml_tensor * base = create_expert_tensor_from_manifest(
++                        ml, cold_tn,
++                        { hot->ne[0], hot->ne[1], n_expert }, cold_type);
++                    if (std::string(ggml_get_name(base)) != hot_name + ".cold.base") {
++                        throw std::runtime_error("cold expert base name does not match its hot family");
++                    }
++                    ml.virtualize_expert_tensor(
++                        base, n_expert, cold_group_slots, cold_type, cold_bytes);
++                    cold_resident += ggml_nbytes(base);
++                    cold_n_grp++;
++
++                    for (size_t j = 0; j < members.size(); ++j) {
++                        auto & L = layers[members[j]];
++                        ggml_tensor * hot_view = L.*fams[fi].pf;
++                        if (!hot_view) {
++                            continue;
++                        }
++                        const std::string cold_name = std::string(ggml_get_name(hot_view)) + ".cold";
++                        L.*cold_fams[fi].pf = ml.window_expert_slot_tensor(
++                            cold_name.c_str(), base, 0, cold_prefill_cap, cold_bytes);
++                        cold_n_win++;
++                        if (dec_enabled) {
++                            const std::string cold_dec_name = cold_name + ".dec";
++                            int64_t off = cold_prefill_cap;
++                            for (size_t k2 = 0; k2 < j; ++k2) {
++                                off += width_of(members[k2]);
++                            }
++                            L.*cold_fams[fi].pf_dec = ml.window_expert_slot_tensor(
++                                cold_dec_name.c_str(), base, off, width_of(members[j]), cold_bytes);
++                        }
++                    }
++                }
++            }
++
++            LLAMA_LOG_INFO(
++                "%s: MoE cold bank %d groups, %.2f MiB resident; %d prefill windows (cap=%lld)%s\n",
++                __func__, cold_n_grp, cold_resident / 1024.0 / 1024.0,
++                cold_n_win, (long long) cold_prefill_cap,
++                dec_enabled ? format(", %d decode windows (hot widths c=%d, 按层宽度 %s)",
++                                    cold_n_win, (int) dec_c,
++                                    getenv("LLAMA_MOE_LAYER_WINDOWS") ? "on" : "off").c_str()
++                            : " (no decode windows)");
++        }
++
+         LLAMA_LOG_INFO(
+             "%s: MoE bank %d groups (family x quant), %.2f MiB resident; %d prefill windows%s\n",
+             __func__, n_grp, resident / 1024.0 / 1024.0, n_win,
+@@ -755,6 +840,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+     ggml_tensor * p_gate = moe_decode_phase && L.ffn_gate_exps_dec    ? L.ffn_gate_exps_dec    : L.ffn_gate_exps;
+     ggml_tensor * p_down = moe_decode_phase && L.ffn_down_exps_dec    ? L.ffn_down_exps_dec    : L.ffn_down_exps;
+     ggml_tensor * p_gu   = moe_decode_phase && L.ffn_gate_up_exps_dec ? L.ffn_gate_up_exps_dec : L.ffn_gate_up_exps;
++    ggml_tensor * p_up_cold   = moe_decode_phase && L.ffn_up_exps_cold_dec      ? L.ffn_up_exps_cold_dec      : L.ffn_up_exps_cold;
++    ggml_tensor * p_gate_cold = moe_decode_phase && L.ffn_gate_exps_cold_dec    ? L.ffn_gate_exps_cold_dec    : L.ffn_gate_exps_cold;
++    ggml_tensor * p_down_cold = moe_decode_phase && L.ffn_down_exps_cold_dec    ? L.ffn_down_exps_cold_dec    : L.ffn_down_exps_cold;
++    ggml_tensor * p_gu_cold   = moe_decode_phase && L.ffn_gate_up_exps_cold_dec ? L.ffn_gate_up_exps_cold_dec : L.ffn_gate_up_exps_cold;
+ 
+     ggml_tensor * moe_out =
+         build_moe_ffn(cur,
+@@ -770,7 +859,11 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+             nullptr, p_gu,
+             model.layers[il].ffn_up_exps_s,
+             model.layers[il].ffn_gate_exps_s,
+-            model.layers[il].ffn_down_exps_s);
++            model.layers[il].ffn_down_exps_s,
++            p_gu_cold,
++            p_up_cold,
++            p_gate_cold,
++            p_down_cold);
+     cb(moe_out, "ffn_moe_out", il);
+ 
+     // Add shared experts if present - following Qwen3Next reference implementation

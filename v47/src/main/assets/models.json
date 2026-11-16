@@ -224,6 +224,11 @@
       "repository": "openbmb/MiniCPM-V-4.7-35B-A3B-DSpark-gguf",
       "revision": "2c8f6931e5fba8a01bcc74b2964f330c62056b5e",
       "remotePath": "dspark-MiniCPM-V-4_7-35B-A3B-Q8_0.gguf"
+    },
+    {
+      "path": "MiniCPM-V-4.7-35B-A3B/experts-hobbit-allhot/manifest.json",
+      "size": 73805,
+      "sha256": "1303e128ea43c999eded0349bcc5b293fdeeb3a4b9c09f8f590bf2052027ffa6"
     }
   ]
 }
