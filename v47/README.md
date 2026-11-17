@@ -764,11 +764,11 @@ This build starts the HOBBIT native project's two-stage device protocol. Stage 1
 
 **Device protocol for build 29:** install over build 28. Open the app once; it provisions the stage-1 manifest and shadow links itself. Tap **Download model pack** once: `models.json` gained one entry, so the store re-verifies the pack, and every file including the new 74 KB manifest verifies locally with no download. If the manifest is fetched from the network instead, report that as a defect. On a cool phone, run the **DSpark I/O threads 8** quick check (control), then the **DSpark HOBBIT cold-tail** quick check. Each run exports its bundle; attach both zips. Expected readings: the control reproduces 6,099 installs / 2,729 hits / 9,512 MiB / 7,379 calls with `moePrewarmTable` `w16 (vendor top-16/layer)` and the standard Case 3 token sequence. The HOBBIT run has token IDs identical to the control, `moeHobbit` on, `moeHobbitColdInstalls` 0, a loader log cold-bank line near 1,386 MiB, and `peakWorkerPssKb` higher by roughly the cold bank (~1.35 GiB).
 
-## Build 30 — HOBBIT verify capacity and run-matched exports
+## Build 31 — HOBBIT verify capacity and run-matched exports
 
-Build 30 keeps the HOBBIT zero slot outside the 32 usable decode slots, so a verify batch with 32 distinct hot experts in one layer no longer aborts. Run exports and the on-screen result views now select reports by the current run's start time; a stale report is ignored and called out, and the zip filename uses the arm recorded in the run status.
+Build 31 keeps the HOBBIT zero slot outside the 32 usable decode slots, so a verify batch with 32 distinct hot experts in one layer no longer aborts. Run exports and the on-screen result views now select reports by the current run's start time; a stale report is ignored and called out, and the zip filename uses the arm recorded in the run status.
 
-**Stage-1 re-run protocol:** install build 30 over build 29, open the app once, then tap **Download model pack** to verify the existing local pack. Run the **DSpark I/O threads 8** control check first and the **DSpark HOBBIT cold-tail** check second. Wait for each run to finish, then send both exported zips.
+**Stage-1 re-run protocol:** install build 31 over build 29, open the app once, then tap **Download model pack** to verify the existing local pack. Run the **DSpark I/O threads 8** control check first and the **DSpark HOBBIT cold-tail** check second. Wait for each run to finish, then send both exported zips.
 
 Expected readings: the control reproduces 6,099 installs / 2,729 hits / 9,512 MiB / 7,379 calls with `moePrewarmTable` `w16 (vendor top-16/layer)` and the standard Case 3 token sequence listed in Build 29. HOBBIT token IDs must match the control, `moeHobbitColdInstalls` must be 0, and `peakWorkerPssKb` should be roughly 1.44 GiB above the control: about 1.35 GiB for the cold bank plus about 95 MiB for one extra decode slot per layer.
 

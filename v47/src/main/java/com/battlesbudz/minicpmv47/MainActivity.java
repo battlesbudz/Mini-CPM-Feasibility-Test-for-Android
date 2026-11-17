@@ -107,7 +107,7 @@ public final class MainActivity extends Activity {
         String s=fileText("status.json");if(!s.isEmpty())out.append("STATUS\n").append(s).append("\n\n");
         ReportSelection selected=reportSelection();
         if(selected.stale)out.append("STALE REPORT: no available report belongs to this run; foreign report results were omitted.\n\n");
-        if(selected.report!=null)out.append(selected.partial?"PARTIAL REPORT (latest run did not finish; per-case results saved so far)\n":"REPORT\n").append(selected.report.toString(2)).append("\n\n");
+        if(selected.report!=null){String rendered;try{rendered=selected.report.toString(2);}catch(Exception ignored){rendered=selected.report.toString();}out.append(selected.partial?"PARTIAL REPORT (latest run did not finish; per-case results saved so far)\n":"REPORT\n").append(rendered).append("\n\n");}
         String m=fileText("last-run/memory.json");if(!m.isEmpty())out.append("MEMORY\n").append(m).append("\n\n");
         // Build 19: the native crash recorder's evidence. The
         // record names the moment itself (a ggml assert's
