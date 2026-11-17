@@ -105,8 +105,9 @@ public final class MainActivity extends Activity {
         out.append("Build: ").append(BuildConfig.VERSION_NAME).append(" · Source: ").append(BuildConfig.SOURCE_COMMIT).append("\n");
         out.append("Device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append(" · SDK ").append(Build.VERSION.SDK_INT).append("\n\n");
         String s=fileText("status.json");if(!s.isEmpty())out.append("STATUS\n").append(s).append("\n\n");
-        String r=fileText("report.json");if(!r.isEmpty())out.append("REPORT\n").append(r).append("\n\n");
-        String p=fileText("report-partial.json");if(!p.isEmpty())out.append("PARTIAL REPORT (latest run did not finish; per-case results saved so far)\n").append(p).append("\n\n");
+        ReportSelection selected=reportSelection();
+        if(selected.stale)out.append("STALE REPORT: no available report belongs to this run; foreign report results were omitted.\n\n");
+        if(selected.report!=null)out.append(selected.partial?"PARTIAL REPORT (latest run did not finish; per-case results saved so far)\n":"REPORT\n").append(selected.report.toString(2)).append("\n\n");
         String m=fileText("last-run/memory.json");if(!m.isEmpty())out.append("MEMORY\n").append(m).append("\n\n");
         // Build 19: the native crash recorder's evidence. The
         // record names the moment itself (a ggml assert's
@@ -120,6 +121,8 @@ public final class MainActivity extends Activity {
         if(!tail.isEmpty())out.append("NATIVE STDERR TAIL (last 32 KiB of the latest run)\n").append(tail);
         return out.toString();
     }
+    private JSONObject jsonFile(String name){try{String value=fileText(name);return value.isEmpty()?null:new JSONObject(value);}catch(Exception ignored){return null;}}
+    private ReportSelection reportSelection(){return ReportSelection.select(jsonFile("status.json"),jsonFile("report.json"),jsonFile("report-partial.json"));}
     private void refresh(){
         if(destroyed||status==null)return;boolean running=workerAlive();
         for(Button b:controls)b.setEnabled(!busy&&!running);
@@ -129,9 +132,10 @@ public final class MainActivity extends Activity {
         if(new File(getFilesDir(),"native_crash.txt").length()>0)text.append("\n\nA native crash was recorded — Copy diagnostics includes the crash record and the native stderr tail.");
         String s=fileText("status.json");
         if(!s.isEmpty()){try{JSONObject o=new JSONObject(s);text.append("\n\nPhase: ").append(o.optString("phase")).append("\nStatus: ").append(o.optString("status"));}catch(Exception ignored){}}
-        String r=fileText("report.json");
-        if(r.isEmpty())r=fileText("report-partial.json");
-        if(!r.isEmpty()){try{JSONObject o=new JSONObject(r);if(o.has("verdict"))text.append("\n\nVerdict: ").append(o.optString("verdict"));else if(o.optBoolean("partial"))text.append("\n\nPartial results from an unfinished run:");JSONArray cases=o.optJSONArray("cases");if(cases!=null)for(int i=0;i<cases.length();i++){JSONObject c=cases.getJSONObject(i);text.append("\n\nQ").append(c.optInt("index")).append(": ").append(c.optString("prompt")).append("\n").append(c.optInt("generatedTokens")).append(" tokens · ").append(String.format(java.util.Locale.US,"%.2f",c.optDouble("decodeTokensPerSec"))).append(" tok/s\n").append(c.optString("answer"));}}catch(Exception ignored){}}
+        ReportSelection selected=reportSelection();
+        if(selected.stale)text.append("\n\nSTALE REPORT: no available report belongs to this run; foreign results were ignored.");
+        JSONObject o=selected.report;
+        if(o!=null){if(o.has("verdict"))text.append("\n\nVerdict: ").append(o.optString("verdict"));else if(selected.partial)text.append("\n\nPartial results from an unfinished run:");JSONArray cases=o.optJSONArray("cases");if(cases!=null)for(int i=0;i<cases.length();i++){JSONObject c=cases.optJSONObject(i);if(c==null)continue;text.append("\n\nQ").append(c.optInt("index")).append(": ").append(c.optString("prompt")).append("\n").append(c.optInt("generatedTokens")).append(" tokens · ").append(String.format(java.util.Locale.US,"%.2f",c.optDouble("decodeTokensPerSec"))).append(" tok/s\n").append(c.optString("answer"));}}
         status.setText(text.toString());
     }
     @Override protected void onDestroy(){destroyed=true;if(task!=null)task.cancel(true);super.onDestroy();}

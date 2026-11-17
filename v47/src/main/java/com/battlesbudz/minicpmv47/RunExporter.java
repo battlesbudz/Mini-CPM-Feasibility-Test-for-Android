@@ -35,12 +35,12 @@ public final class RunExporter {
         try{
             File files=context.getFilesDir();
             JSONObject status=readJson(new File(files,"status.json"));
-            JSONObject report=readJson(new File(files,"report.json"));
-            boolean partial=false;
-            if(report==null){report=readJson(new File(files,"report-partial.json"));partial=report!=null;}
-            String arm="unknown";
-            if(status!=null)arm=status.optString("abArm",status.optString("mode","unknown"));
-            if(report!=null)arm=report.optString("abArm",arm);
+            JSONObject full=readJson(new File(files,"report.json"));
+            JSONObject partialReport=readJson(new File(files,"report-partial.json"));
+            ReportSelection selection=ReportSelection.select(status,full,partialReport);
+            JSONObject report=selection.report;
+            boolean partial=selection.partial;
+            String arm=selection.arm;
             String buildNum="?";
             String version=BuildConfig.VERSION_NAME;
             int dot=version.lastIndexOf("build.");
@@ -62,7 +62,7 @@ public final class RunExporter {
                 putText(zip,"report-slim.json","");
                 putText(zip,"loader_log.txt","");
             }
-            putText(zip,"summary.txt",summary(status,report,partial));
+            putText(zip,"summary.txt",summary(status,selection));
             putText(zip,"memory.json",fileText(new File(files,"last-run/memory.json")));
             // Build 29: LLAMA_MOE_SWEEP writes the routing trace into the model dir and truncates it at each context creation, so this is the just-finished run's trace; HOBBIT stage-2 cold-set mining (native scope §12) and the prewarm miner consume it.
             putText(zip,"moe_sweep.txt",fileText(new File(files,"models/MiniCPM-V-4.7-35B-A3B/moe_sweep.txt")));
@@ -123,9 +123,12 @@ public final class RunExporter {
     // The verdict summary: everything a run is judged on, in a
     // few hundred bytes of plain text. Token IDs are included in
     // full because cross-arm token-ID equality is the hard gate.
-    private static String summary(JSONObject status,JSONObject report,boolean partial){
+    private static String summary(JSONObject status,ReportSelection selection){
         StringBuilder s=new StringBuilder();
-        JSONObject src=report!=null?report:status;
+        JSONObject report=selection.report;
+        boolean partial=selection.partial;
+        JSONObject src=status!=null?status:report;
+        if(selection.stale)s.append("STALE REPORT: no available report belongs to this run; foreign report results were omitted.\n");
         s.append("MiniCPM-V 4.7 phone trial - run summary\n");
         s.append("build: ").append(src==null?BuildConfig.VERSION_NAME:src.optString("build",BuildConfig.VERSION_NAME)).append('\n');
         s.append("sourceCommit: ").append(src==null?BuildConfig.SOURCE_COMMIT:src.optString("sourceCommit",BuildConfig.SOURCE_COMMIT)).append('\n');
