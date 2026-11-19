@@ -229,6 +229,22 @@
       "path": "MiniCPM-V-4.7-35B-A3B/experts-hobbit-allhot/manifest.json",
       "size": 73805,
       "sha256": "1303e128ea43c999eded0349bcc5b293fdeeb3a4b9c09f8f590bf2052027ffa6"
+    },
+    {
+      "path": "MiniCPM-V-4.7-35B-A3B/hobbit-delta/cold_delta_index.json",
+      "size": 991516,
+      "sha256": "c75a3f6ca4a3418ee810ad2c880497b7f4f342465579a16621f60bbf8ee921e0",
+      "repository": "battlesbudz/minicpm-v47-hobbit-delta",
+      "revision": "main",
+      "remotePath": "cold_delta_index.json"
+    },
+    {
+      "path": "MiniCPM-V-4.7-35B-A3B/hobbit-delta/cold_delta.bin",
+      "size": 8357658624,
+      "sha256": "387d802a66557492ebf766fb79cf618770c291df60d4b7c17f9642ff97bd44b8",
+      "repository": "battlesbudz/minicpm-v47-hobbit-delta",
+      "revision": "main",
+      "remotePath": "cold_delta.bin"
     }
   ]
 }

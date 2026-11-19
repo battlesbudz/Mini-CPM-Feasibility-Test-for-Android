@@ -250,10 +250,10 @@
 // moeTailSkipBatches / moeTailSkipSkipped /
 // moeTailSkipBytesNotReadMiB, from the teardown "tail-skip:"
 // line), case-3 fluency, and a structured-output probe the other
-// arms do not run: a seventh case (display index 7, a JSON-only
-// answer about the bicycle case, 96-token cap) whose answer the
-// service validates with org.json into
-// moeTailSkipProbeJsonValid. Token IDs are EXPECTED to differ
+// arms do not run (build 32 also adds it to HOBBIT): a seventh
+// case (display index 7, a JSON-only answer about the bicycle case,
+// 96-token cap) whose answer the service validates into
+// moeTailSkipProbeJsonValid for tail-skip. Token IDs are EXPECTED to differ
 // from the stock sequence in this arm. With the env off the
 // patched runtime is behavior-identical, so the control arm's
 // counters remain the regression check. One new variable per
@@ -286,6 +286,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <ctime>
 #include <exception>
 #include <mutex>
@@ -371,10 +372,10 @@ static const int    MOE_DECODE_WINDOW = 16;
 // the full trial's case list and defaults are unchanged.
 static const int    QUICK_CASE_DISPLAY = 3;
 static const int    QUICK_MAX_TOKENS   = 32;
-// Build 27: the tailskip arm's structured-output probe case
-// (1-based display index) and its own decode cap. 32 tokens (the
-// shared quick cap) would truncate the JSON object mid-answer
-// and prove nothing; 96 leaves room for the small fixed object.
+// Build 32: the tailskip and HOBBIT arms share this structured-output
+// probe case (1-based display index) and its own decode cap. 32 tokens
+// (the shared quick cap) would truncate the JSON object mid-answer;
+// 96 leaves room for the small fixed object.
 static const int    PROBE_CASE_DISPLAY = 7;
 static const int    PROBE_MAX_TOKENS   = 96;
 // Build 15 (DSpark arm): the draft GGUF sits beside the main gguf in
@@ -977,9 +978,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // "quick_dspark_pin" sets LLAMA_MOE_PIN_PREWARM,
     // "quick_dspark_lfu" sets LLAMA_MOE_LFU_ADMIT, and
     // "quick_dspark_pinlfu" sets both.
-    // Build 27: "quick_dspark_tailskip" joins as the item-5 arm:
-    // the DSpark arm plus LLAMA_MOE_TAIL_SKIP, wired below. It is
-    // also the only arm that runs the probe case (index 7).
+    // Build 27 adds tail-skip; build 32 extends its probe case to HOBBIT.
     const bool dspark_io8          = mode == "quick_dspark_io8";
     const bool dspark_pin          = mode == "quick_dspark_pin";
     const bool dspark_lfu          = mode == "quick_dspark_lfu";
@@ -1118,8 +1117,26 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     const std::string model_dir    = root + "/" + MODEL_SUBDIR;
     const std::string main_path    = model_dir + "/" + MAIN_GGUF;
     const std::string mmproj_path  = model_dir + "/" + MMPROJ_GGUF;
-    const std::string experts_path = model_dir + (dspark_hobbit ? "/experts-hobbit-allhot" : "/experts");
+    const std::string experts_path = model_dir + (dspark_hobbit ? "/experts-hobbit" : "/experts");
     report["moeExpertsPath"] = experts_path;
+    std::string hobbit_cold_source = "production manifest unreadable";
+    long long hobbit_cold_experts = -1;
+    if (dspark_hobbit) {
+        try {
+            std::ifstream manifest_in(experts_path + "/manifest.json");
+            json manifest;
+            manifest_in >> manifest;
+            const json & cold = manifest.at("cold");
+            hobbit_cold_source = cold.at("source").get<std::string>();
+            hobbit_cold_experts = 0;
+            for (const auto & layer : cold.at("layers").items()) {
+                hobbit_cold_experts += static_cast<long long>(layer.value().size());
+            }
+        } catch (...) {
+            hobbit_cold_source = "production manifest unreadable";
+            hobbit_cold_experts = -1;
+        }
+    }
     report["moeSlotBank"] = MOE_SLOT_BANK;
 
     // Builds 11/12: enable the decode-window expert cache, prewarm,
@@ -1204,8 +1221,13 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         report["moeTailSkip"]   = dspark_tailskip ? "on" : "off";
         // Build 29: name HOBBIT stage-1 configuration in every DSpark report.
         report["moeHobbit"] = dspark_hobbit ? "on" : "off";
-        report["moeHobbitColdSetSource"] = "stage 1 all-hot: cold set empty (no sweep data yet); all-hot v2 manifest over the original bins; the real cold set is mined from this build's exported moe_sweep.txt";
-        report["moeHobbitColdExperts"] = 0;
+        if (dspark_hobbit) {
+            report["moeHobbitColdSetSource"] = hobbit_cold_source;
+            report["moeHobbitColdExperts"] = hobbit_cold_experts;
+        } else {
+            report["moeHobbitColdSetSource"] = "stage 1 all-hot: cold set empty (no sweep data yet); all-hot v2 manifest over the original bins; the real cold set is mined from this build's exported moe_sweep.txt";
+            report["moeHobbitColdExperts"] = 0;
+        }
     }
     if (dspark) {
         report["dsparkDraftModel"] = std::string(DSPARK_GGUF) +
@@ -1231,7 +1253,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     if (dspark_lfu || dspark_pinlfu) emit("MoE admission: LLAMA_MOE_LFU_ADMIT=1 (probationary LFU admission)");
     // Build 27: the tail-skip arm's difference, same style.
     if (dspark_tailskip) emit("MoE tail-skip: LLAMA_MOE_TAIL_SKIP=1 (verify-batch last-rank misses are zeroed, not installed)");
-    if (dspark_hobbit) emit("MoE HOBBIT: LLAMA_MOE_HOBBIT=1 (native cold-tail; stage 1 all-hot pack - cold set empty, cold bank allocated) + LLAMA_MOE_IO_THREADS=8");
+    if (dspark_hobbit) emit("MoE HOBBIT: LLAMA_MOE_HOBBIT=1 (native cold-tail; stage 2 production pack - " + std::to_string(hobbit_cold_experts) + " cold experts at Q2_K) + LLAMA_MOE_IO_THREADS=8");
 
     // Prewarm table selection. First choice: a table mined from the
     // previous run's sweep trace (this app's own routing on this
@@ -1447,10 +1469,9 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // A text-only prompt needs no image: plain general knowledge questions,
     // the third written to produce a long answer so decode speed is
     // measured over a decent token count.
-    // Build 27: a seventh case, the tailskip arm's structured-output
-    // probe (see the build 27 header note). It runs ONLY in that arm
-    // (the quick-mode filter below admits it only there); every other
-    // arm's case list is exactly as before.
+    // Build 32 extends the build 27 structured-output probe to HOBBIT;
+    // both probe arms admit it through the quick-mode filter, while all
+    // other arms retain their existing case lists.
     struct TrialCase { const char * question; bool has_image; };
     const TrialCase trial_cases[] = {
         { "What is the capital of France?", false },
@@ -1809,17 +1830,14 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
 
     for (int qi = 0; qi < n_cases && fatal.empty(); qi++) {
         // Build 12 quick mode: only the decode measurement case runs.
-        // Build 27: the probe case (7) belongs to the tailskip arm
-        // alone — skipped in every other mode, the full trial
-        // included; the tailskip arm runs it after case 3.
-        if (qi + 1 == PROBE_CASE_DISPLAY && !dspark_tailskip) continue;
+        // Build 32 extends the build 27 probe gates to HOBBIT; all
+        // other modes still skip it, and tail-skip behavior is unchanged.
+        if (qi + 1 == PROBE_CASE_DISPLAY && !(dspark_tailskip || dspark_hobbit)) continue;
         if (quick && qi + 1 != QUICK_CASE_DISPLAY &&
-            !(dspark_tailskip && qi + 1 == PROBE_CASE_DISPLAY)) continue;
+            !((dspark_tailskip || dspark_hobbit) && qi + 1 == PROBE_CASE_DISPLAY)) continue;
         const int display = qi + 1;
-        // Build 27: per-case decode cap (reassigned every iteration,
-        // so no state leaks between cases): the probe case gets its
-        // own cap, everything else keeps the mode's.
-        max_tokens = (dspark_tailskip && display == PROBE_CASE_DISPLAY)
+        // Build 32: per-case decode cap; both probe arms get the probe cap.
+        max_tokens = ((dspark_tailskip || dspark_hobbit) && display == PROBE_CASE_DISPLAY)
             ? PROBE_MAX_TOKENS : (quick ? QUICK_MAX_TOKENS : MAX_NEW_TOKENS);
         const std::string tag = "Case " + std::to_string(display);
         const std::string question = trial_cases[qi].question;
@@ -2051,6 +2069,15 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
             if (c.value("index", 0) == PROBE_CASE_DISPLAY) {
                 report["moeTailSkipProbeAnswer"] = c.value("answer", std::string(""));
                 report["moeTailSkipProbeTokens"] = c.value("generatedTokens", 0);
+            }
+        }
+    }
+    // Build 32: surface the shared probe for the HOBBIT arm as well.
+    if (dspark_hobbit) {
+        for (const auto & c : cases) {
+            if (c.value("index", 0) == PROBE_CASE_DISPLAY) {
+                report["moeHobbitProbeAnswer"] = c.value("answer", std::string(""));
+                report["moeHobbitProbeTokens"] = c.value("generatedTokens", 0);
             }
         }
     }

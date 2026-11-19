@@ -772,6 +772,14 @@ Build 31 keeps the HOBBIT zero slot outside the 32 usable decode slots, so a ver
 
 Expected readings: the control reproduces 6,099 installs / 2,729 hits / 9,512 MiB / 7,379 calls with `moePrewarmTable` `w16 (vendor top-16/layer)` and the standard Case 3 token sequence listed in Build 29. HOBBIT token IDs must match the control, `moeHobbitColdInstalls` must be 0, and `peakWorkerPssKb` should be roughly 1.44 GiB above the control: about 1.35 GiB for the cold bank plus about 95 MiB for one extra decode slot per layer.
 
+## Build 32 — HOBBIT production cold set and on-device construction
+
+Stage 2 replaces the all-hot HOBBIT test pack with the production cold set: 8,097 of 10,240 experts are cold and held as Q2_K weights. The set was mined from build 31 stage-1 Case 3 sweeps: 560 batch samples, 90% per-layer routing coverage, with the vendor prewarm table unioned into the hot set. The cold Q2_K weights were made from the published Q4_K_M model, using its Q4_K gate/up tensors and Q6_K down tensors.
+
+The app downloads route 2: `cold_delta.bin` (8,357,658,624 bytes) and its index through `models.json` from `battlesbudz/minicpm-v47-hobbit-delta`. On the phone it copies the verified original expert bins into `experts-hobbit/`, overwrites each cold window from the delta, verifies every window with SHA-256, and places the bundled production manifest last as the construction commit point. The original bins remain unchanged. The repository must exist on Hugging Face and have `cold_delta.bin` and `cold_delta_index.json` at its root before the Download step can fetch them.
+
+**Judged-pair protocol:** cool the phone, then run **Quick decode check · DSpark HOBBIT cold-tail (A/B)** twice. Each run evaluates Case 3 and then the JSON probe. The pair's Case 3 `decodeTokensPerSec` mean must exceed 3.13 tok/s; `moeHobbitProbeJsonValid` must be true on both runs; Case 3 must pass a fluency read; and both runs must report `moeHobbitColdExperts` = 8097 with `moeHobbitColdSetSource` equal to the production manifest's source string.
+
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub
