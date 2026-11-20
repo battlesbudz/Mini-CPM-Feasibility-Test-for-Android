@@ -780,6 +780,14 @@ The app downloads route 2: `cold_delta.bin` (8,357,658,624 bytes) and its index 
 
 **Judged-pair protocol:** cool the phone, then run **Quick decode check · DSpark HOBBIT cold-tail (A/B)** twice. Each run evaluates Case 3 and then the JSON probe. The pair's Case 3 `decodeTokensPerSec` mean must exceed 3.13 tok/s; `moeHobbitProbeJsonValid` must be true on both runs; Case 3 must pass a fluency read; and both runs must report `moeHobbitColdExperts` = 8097 with `moeHobbitColdSetSource` equal to the production manifest's source string.
 
+
+## Build 33 — three standalone DSpark quick A/B arms
+
+Build 33 adds three quick checks based on the stock DSpark arm (depth 3, slot bank 1024, uniform 32-slot decode window, `LLAMA_MOE_WINDOW_MAX_ROWS=4`, fork-default I/O threads 4, lookahead prefetch off, and the same prewarm and sweep). `quick_dspark_lookahead` changes only `LLAMA_MOE_LOOKAHEAD_PREFETCH=1` (fork default depth 8); `quick_dspark_layerwin` changes only `LLAMA_MOE_LAYER_WINDOWS`; and `quick_dspark_split` changes only `LLAMA_MOE_MATMUL_SPLIT=2`.
+
+The per-layer widths are `0:55,1:59,2:60,3:57,4:46,5:49,6:47,7:40,8:32,9:33,10:45,11:42,12:32,13:36,14:33,15:32,16:35,17:36,18:35,19:32,20:32,21:32,22:42,23:42,24:33,25:35,26:37,27:32,28:39,29:39,30:43,31:32,32:42,33:44,34:42,35:34,36:38,37:41,38:40,39:45`. They come from build 31 sweep mining on this phone: each layer's 90% routing-coverage saturation size was scaled proportionally to a 1600-slot total, with a floor of 32. Reports name the lever states with `moeLayerWindows` and `moeMatmulSplit`, and include `moePrefetchPredicted`, `moePrefillPreadWallMs`, `moePrefillPmgmtMs`, lookahead reservation evidence (`moeLookaheadDepth`, `moeLookaheadReservedBegin`, `moeLookaheadReservedEnd`, and `moeLookaheadBankTooSmall`), and the runtime's full layer-width log line (`moeLayerWidthsLogLine`), in addition to the arm state fields. These are parsing-only extensions of lines the runtime already prints.
+
+**Device protocol:** on a cool phone, for each arm run **Quick decode check · DSpark (A/B)** followed immediately by that arm's check, then send both zips. This is six runs, three pairs. Judge each pair on decode tok/s and installs/hits against the ±20% single-run noise band; if a result is closer than that, repeat the pair in reversed order.
 ## Build
 
 CI (`.github/workflows/v47.yml`) builds `:v47:assembleRelease` on GitHub

@@ -140,6 +140,8 @@ public final class RunExporter {
             s.append("moeLfuAdmit: ").append(status.optString("moeLfuAdmit","")).append('\n');
             s.append("moeTailSkip: ").append(status.optString("moeTailSkip","")).append('\n');
             s.append("moeHobbit: ").append(status.optString("moeHobbit","")).append('\n');
+            s.append("moeLayerWindows: ").append(status.optString("moeLayerWindows","")).append('\n');
+            s.append("moeMatmulSplit: ").append(status.optString("moeMatmulSplit","")).append('\n');
             s.append("phase: ").append(status.optString("phase","")).append('\n');
             s.append("status: ").append(status.optString("status","")).append('\n');
         }
@@ -154,6 +156,14 @@ public final class RunExporter {
             s.append("moeCacheHitRatePct: ").append(num(report,"moeCacheHitRatePct")).append('\n');
             s.append("moeIoReadMiB: ").append(num(report,"moeIoReadMiB")).append('\n');
             s.append("moeIoCalls: ").append(num(report,"moeIoCalls")).append('\n');
+            if(report.has("moePrefetchPredicted"))s.append("moePrefetchPredicted: ").append(num(report,"moePrefetchPredicted")).append('\n');
+            if(report.has("moePrefillPreadWallMs"))s.append("moePrefillPreadWallMs: ").append(num(report,"moePrefillPreadWallMs")).append('\n');
+            if(report.has("moePrefillPmgmtMs"))s.append("moePrefillPmgmtMs: ").append(num(report,"moePrefillPmgmtMs")).append('\n');
+            if(report.has("moeLookaheadDepth"))s.append("moeLookaheadDepth: ").append(num(report,"moeLookaheadDepth")).append('\n');
+            if(report.has("moeLookaheadReservedBegin"))s.append("moeLookaheadReservedBegin: ").append(num(report,"moeLookaheadReservedBegin")).append('\n');
+            if(report.has("moeLookaheadReservedEnd"))s.append("moeLookaheadReservedEnd: ").append(num(report,"moeLookaheadReservedEnd")).append('\n');
+            if(report.has("moeLookaheadBankTooSmall"))s.append("moeLookaheadBankTooSmall: ").append(report.optBoolean("moeLookaheadBankTooSmall")).append('\n');
+            if(report.has("moeLayerWidthsLogLine"))s.append("moeLayerWidthsLogLine: ").append(report.optString("moeLayerWidthsLogLine")).append('\n');
             if(report.has("moeTailSkipBatches"))s.append("moeTailSkipBatches: ").append(num(report,"moeTailSkipBatches")).append('\n');
             if(report.has("moeTailSkipSkipped"))s.append("moeTailSkipSkipped: ").append(num(report,"moeTailSkipSkipped")).append('\n');
             if(report.has("moeTailSkipBytesNotReadMiB"))s.append("moeTailSkipBytesNotReadMiB: ").append(num(report,"moeTailSkipBytesNotReadMiB")).append('\n');

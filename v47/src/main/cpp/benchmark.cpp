@@ -270,6 +270,20 @@
 // telemetry comes from the runtime's hobbit: line parsed below.
 // RunExporter carries moe_sweep.txt for stage-2 cold-set mining.
 //
+// Build 33 adds three standalone A/B arms on the current stock DSpark arm:
+// quick_dspark_lookahead enables LLAMA_MOE_LOOKAHEAD_PREFETCH=1 (fork
+// default depth 8), quick_dspark_layerwin sets build-31 saturation-mined
+// per-layer widths at 1600 total slots with floor 32, and
+// quick_dspark_split sets LLAMA_MOE_MATMUL_SPLIT=2. Builds 21/22 tried
+// app-mined per-layer widths (1600/1920 totals) and a matmul-split arm
+// stacked on layer windows; build 23 removed all three after they improved
+// no stage. This re-test changes one variable at a time on stock; split was
+// never measured on stock alone. Lookahead has never been enabled on a
+// DSpark arm in this app: every DSpark arm shipped it "0", following the
+// vendor bridge. The new counters below only parse existing runtime lines.
+// These are DSpark arms, not tailskip or HOBBIT: no probe case, and the
+// experts path remains the original pack.
+//
 // Configuration mirrors the vendor demo defaults for this fork
 // (OpenBMB MiniCPM-V-demo-Android): 4 threads, 4096-token context,
 // image_max_slice_nums 9. Sampling is greedy (temperature 0) to match the
@@ -282,6 +296,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -795,8 +810,12 @@ static std::string mine_prewarm_table(const std::string & sweep_path, long & lin
 // log is capped (LOADER_LOG_MAX), so on a very long run the totals
 // undercount — the report flags that via moeCountersTruncated.
 struct MoeCounters {
-    long long miss = 0, hit = 0, pfRead = 0, pfHit = 0, ioCalls = 0;
+    long long miss = 0, hit = 0, pfRead = 0, pfHit = 0, pfPredict = 0, ioCalls = 0;
     double ioMiB = 0.0;
+    double prefillPreadWallMs = 0.0, prefillPmgmtMs = 0.0;
+    bool laReservedSeen = false, laBankTooSmall = false;
+    long long laDepth = 0, laReservedBegin = 0, laReservedEnd = 0;
+    std::string layerWidthsLine;
     bool lookaheadSeen = false;
     long long laArmed = 0, laHits = 0;
     double laPct = 0.0;
@@ -852,8 +871,33 @@ static MoeCounters parse_moe_counters(const std::string & log) {
             if (log_field_ll(line, "hit", v)) c.hit += v;
             if (log_field_ll(line, "pfhit", v)) c.pfHit += v;
             if (log_field_ll(line, "pfread", v)) c.pfRead += v;
+            if (log_field_ll(line, "pfpredict", v)) c.pfPredict += v;
             if (log_field_ll(line, "calls", v)) c.ioCalls += v;
             if (log_field_d(line, "readall", d)) c.ioMiB += d;
+        }
+        if (line.find("prefill #") != std::string::npos) {
+            if (log_field_d(line, "pread_wall", d)) c.prefillPreadWallMs += d;
+            if (log_field_d(line, "pmgmt", d)) c.prefillPmgmtMs += d;
+        }
+        if (line.find("lookahead-prefetch: on depth=") != std::string::npos) {
+            long long depth = 0;
+            const size_t range = line.find("reserved=[");
+            if (log_field_ll(line, "depth", depth) && range != std::string::npos) {
+                const size_t comma = line.find(',', range + 10);
+                const size_t close = comma == std::string::npos ? std::string::npos : line.find(')', comma + 1);
+                if (comma != std::string::npos && close != std::string::npos) {
+                    c.laReservedSeen = true;
+                    c.laDepth = depth;
+                    c.laReservedBegin = std::strtoll(line.c_str() + range + 10, nullptr, 10);
+                    c.laReservedEnd = std::strtoll(line.c_str() + comma + 1, nullptr, 10);
+                }
+            }
+        }
+        if (line.find("lookahead-prefetch: off, bank") != std::string::npos) c.laBankTooSmall = true;
+        if (line.find("decode-cache:") != std::string::npos && line.find("按层宽度") != std::string::npos) {
+            const size_t start = line.find("decode-cache:");
+            c.layerWidthsLine = line.substr(start);
+            while (!c.layerWidthsLine.empty() && std::isspace(static_cast<unsigned char>(c.layerWidthsLine.back()))) c.layerWidthsLine.pop_back();
         }
         if (line.find("lookahead-prefetch: armed=") != std::string::npos) {
             long long armed = 0, hits = 0;
@@ -979,6 +1023,11 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // "quick_dspark_lfu" sets LLAMA_MOE_LFU_ADMIT, and
     // "quick_dspark_pinlfu" sets both.
     // Build 27 adds tail-skip; build 32 extends its probe case to HOBBIT.
+    // Build 33 restores layer windows and matmul split as standalone
+    // stock-based arms, and adds the first DSpark lookahead-on arm.
+    const bool dspark_lookahead   = mode == "quick_dspark_lookahead";
+    const bool dspark_layerwin    = mode == "quick_dspark_layerwin";
+    const bool dspark_split       = mode == "quick_dspark_split";
     const bool dspark_io8          = mode == "quick_dspark_io8";
     const bool dspark_pin          = mode == "quick_dspark_pin";
     const bool dspark_lfu          = mode == "quick_dspark_lfu";
@@ -987,7 +1036,8 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // Build 29: HOBBIT stage-1 arm is io8-on-stock plus the native cold-tail path.
     const bool dspark_hobbit       = mode == "quick_dspark_hobbit";
     const bool dspark = mode == "quick_dspark" || dspark_io8 ||
-                        dspark_pin || dspark_lfu || dspark_pinlfu || dspark_tailskip || dspark_hobbit;
+                        dspark_pin || dspark_lfu || dspark_pinlfu || dspark_tailskip || dspark_hobbit ||
+                        dspark_lookahead || dspark_layerwin || dspark_split;
     const bool quick = mode == "quick" || lookahead_off || dspark;
     // Build 27: not const — the probe case raises the cap for its
     // own iteration (the case loop reassigns it every iteration).
@@ -1033,9 +1083,19 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
             {"moeCacheMisses", c.miss},
             {"moeCacheHitRatePct", rate},
             {"moePrefetchHits", c.pfHit},
+            {"moePrefetchPredicted", c.pfPredict},
+            {"moePrefillPreadWallMs", c.prefillPreadWallMs},
+            {"moePrefillPmgmtMs", c.prefillPmgmtMs},
             {"moeIoReadMiB", c.ioMiB},
             {"moeIoCalls", c.ioCalls},
         };
+        if (c.laReservedSeen) {
+            fields["moeLookaheadDepth"] = c.laDepth;
+            fields["moeLookaheadReservedBegin"] = c.laReservedBegin;
+            fields["moeLookaheadReservedEnd"] = c.laReservedEnd;
+        }
+        if (c.laBankTooSmall) fields["moeLookaheadBankTooSmall"] = true;
+        if (!c.layerWidthsLine.empty()) fields["moeLayerWidthsLogLine"] = c.layerWidthsLine;
         if (c.lookaheadSeen) {
             fields["moeLookaheadArmed"] = c.laArmed;
             fields["moeLookaheadHits"] = c.laHits;
@@ -1151,15 +1211,17 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // DSPARK_DECODE_WINDOW above); the other arms keep build 11's 16.
     const int decode_window = dspark ? DSPARK_DECODE_WINDOW : MOE_DECODE_WINDOW;
     setenv("LLAMA_MOE_DECODE_WINDOW", std::to_string(decode_window).c_str(), 1);
-    // Build 23: the layer-window and matmul-split settings are
-    // gone with their arms; both variables are cleared
-    // unconditionally so no stale value can leak into any run.
+    // Build 23 removed these levers after they improved no stage;
+    // build 33 restores each only in its own stock-based arm. Set
+    // or clear both explicitly so no stale value can leak into a run.
+    if (dspark_layerwin) setenv("LLAMA_MOE_LAYER_WINDOWS", "0:55,1:59,2:60,3:57,4:46,5:49,6:47,7:40,8:32,9:33,10:45,11:42,12:32,13:36,14:33,15:32,16:35,17:36,18:35,19:32,20:32,21:32,22:42,23:42,24:33,25:35,26:37,27:32,28:39,29:39,30:43,31:32,32:42,33:44,34:42,35:34,36:38,37:41,38:40,39:45", 1);
+    else                 unsetenv("LLAMA_MOE_LAYER_WINDOWS");
+    if (dspark_split) setenv("LLAMA_MOE_MATMUL_SPLIT", "2", 1);
+    else              unsetenv("LLAMA_MOE_MATMUL_SPLIT");
     // The io8 lever exists only in its own arm. It is read by
     // the slot runtime once per process, and this process exits
     // after every run, so the per-run env applies cleanly -
     // set or clear it explicitly in every arm.
-    unsetenv("LLAMA_MOE_LAYER_WINDOWS");
-    unsetenv("LLAMA_MOE_MATMUL_SPLIT");
     if (dspark_io8 || dspark_hobbit) setenv("LLAMA_MOE_IO_THREADS", "8", 1);
     else                             unsetenv("LLAMA_MOE_IO_THREADS");
     // Build 24: the item-2 admission policies live only in their
@@ -1198,7 +1260,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     // vendor iOS bridge disables MoE lookahead prediction whenever
     // DSpark is on (the two predictors would fight over the same
     // I/O), and the DSpark baseline is the lookahead-OFF arm.
-    setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH", (lookahead_off || dspark) ? "0" : "1", 1);
+    setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH", (lookahead_off || (dspark && !dspark_lookahead)) ? "0" : "1", 1);
     if (dspark) {
         // Widen the window-mode batch coverage to n_max + 1 rows so
         // a whole verify batch stays in the decode window (the slot
@@ -1206,8 +1268,8 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         // leaves it at 4, see the counters' moeWindowMaxRowsEffective).
         setenv("LLAMA_MOE_WINDOW_MAX_ROWS", std::to_string(DSPARK_WINDOW_MAX_ROWS).c_str(), 1);
     }
-    report["moeLookaheadPrefetch"] = dspark ? "off" : (lookahead_off ? "off" : "on (depth default 8)");
-    report["abArm"] = dspark_hobbit ? "dspark_hobbit" : (dspark_tailskip ? "dspark_tailskip" : (dspark_pinlfu ? "dspark_pinlfu" : (dspark_pin ? "dspark_pin" : (dspark_lfu ? "dspark_lfu" : (dspark_io8 ? "dspark_io8" : (dspark ? "dspark_on" : (lookahead_off ? "lookahead_off" : "lookahead_on")))))));
+    report["moeLookaheadPrefetch"] = (lookahead_off || (dspark && !dspark_lookahead)) ? "off" : "on (depth default 8)";
+    report["abArm"] = dspark_lookahead ? "dspark_lookahead" : (dspark_layerwin ? "dspark_layerwin" : (dspark_split ? "dspark_split" : (dspark_hobbit ? "dspark_hobbit" : (dspark_tailskip ? "dspark_tailskip" : (dspark_pinlfu ? "dspark_pinlfu" : (dspark_pin ? "dspark_pin" : (dspark_lfu ? "dspark_lfu" : (dspark_io8 ? "dspark_io8" : (dspark ? "dspark_on" : (lookahead_off ? "lookahead_off" : "lookahead_on"))))))))));
     if (dspark_io8 || dspark_hobbit) report["moeIoThreads"] = 8;
     if (dspark) {
         // Build 24: name both admission flags in every DSpark
@@ -1221,6 +1283,8 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
         report["moeTailSkip"]   = dspark_tailskip ? "on" : "off";
         // Build 29: name HOBBIT stage-1 configuration in every DSpark report.
         report["moeHobbit"] = dspark_hobbit ? "on" : "off";
+        report["moeLayerWindows"] = dspark_layerwin ? "on (total 1600 slots, floor 32)" : "off";
+        report["moeMatmulSplit"] = dspark_split ? 2 : 0;
         if (dspark_hobbit) {
             report["moeHobbitColdSetSource"] = hobbit_cold_source;
             report["moeHobbitColdExperts"] = hobbit_cold_experts;
@@ -1253,6 +1317,9 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     if (dspark_lfu || dspark_pinlfu) emit("MoE admission: LLAMA_MOE_LFU_ADMIT=1 (probationary LFU admission)");
     // Build 27: the tail-skip arm's difference, same style.
     if (dspark_tailskip) emit("MoE tail-skip: LLAMA_MOE_TAIL_SKIP=1 (verify-batch last-rank misses are zeroed, not installed)");
+    if (dspark_lookahead) emit("MoE lookahead prefetch: LLAMA_MOE_LOOKAHEAD_PREFETCH=1 (fork default depth 8) under DSpark");
+    if (dspark_layerwin) emit("MoE per-layer windows: LLAMA_MOE_LAYER_WINDOWS=0:55,1:59,2:60,3:57,4:46,5:49,6:47,7:40,8:32,9:33,10:45,11:42,12:32,13:36,14:33,15:32,16:35,17:36,18:35,19:32,20:32,21:32,22:42,23:42,24:33,25:35,26:37,27:32,28:39,29:39,30:43,31:32,32:42,33:44,34:42,35:34,36:38,37:41,38:40,39:45 (total 1600 slots, floor 32)");
+    if (dspark_split) emit("MoE matmul split: LLAMA_MOE_MATMUL_SPLIT=2 (last 2 ranks' misses deferred to overlap resident matmul)");
     if (dspark_hobbit) emit("MoE HOBBIT: LLAMA_MOE_HOBBIT=1 (native cold-tail; stage 2 production pack - " + std::to_string(hobbit_cold_experts) + " cold experts at Q2_K) + LLAMA_MOE_IO_THREADS=8");
 
     // Prewarm table selection. First choice: a table mined from the
@@ -1294,7 +1361,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_battlesbudz_minicpmv47_NativeBench
     report["moeDecodeWindow"] = decode_window;
     report["moePrewarmTable"] = prewarm_desc.empty() ? "WRITE FAILED - prewarm off" : prewarm_desc;
     emit("MoE decode window on: " + std::to_string(decode_window) +
-         " slots/layer, lookahead prefetch " + std::string((lookahead_off || dspark) ? "off" : "on") + ", prewarm table " +
+         " slots/layer, lookahead prefetch " + std::string((lookahead_off || (dspark && !dspark_lookahead)) ? "off" : "on") + ", prewarm table " +
          (prewarm_desc.empty() ? std::string("FAILED to write") : prewarm_desc));
 
     emit("Loading MiniCPM-V 4.7 main model (LES expert streaming)");
